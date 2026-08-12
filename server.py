@@ -4049,6 +4049,9 @@ def restart_helper(old_pid, preferred_port):
     args = [sys.executable, os.path.abspath(__file__),
             "--preferred-port", str(int(preferred_port)), "--no-browser"]
     if sysops.IS_WINDOWS:
+        # pythonw 无控制台：必须带 --log-to-file 重定向 stdout/stderr，
+        # 否则 print/logging 写入无效句柄，日志不可见且可能拖垮请求线程。
+        args.append("--log-to-file")
         subprocess.Popen(args, cwd=BASE_DIR, close_fds=True)
         return 0
     os.execv(sys.executable, args)

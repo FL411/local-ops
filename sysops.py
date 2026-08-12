@@ -587,12 +587,33 @@ def process_group_id(pid):
 
 # ------------------------------------------------------------------ 信号与终止
 
+# Windows 无 POSIX 信号模型：软终止使用 WM_CLOSE（taskkill 无 /F），
+# 硬杀使用 TerminateProcess。软终止后等待这个宽限期再兜底强杀，
+# 给带窗口的服务（GUI dev server）自行清理落盘的机会。
+GRACE_SOFT_STOP_SEC = 0.4
+
+
+def _wm_close_soft(pid):
+    """Windows：向带窗口进程发送 WM_CLOSE（taskkill 无 /F）。
+
+    无窗口进程（cmd/python 服务等）会返回非零并保持存活，静默跳过；
+    带窗口进程收到 WM_CLOSE 后自行退出。返回是否成功发送。
+    """
+    try:
+        r = subprocess.run(
+            ["taskkill", "/PID", str(int(pid))],
+            capture_output=True, timeout=3)
+        return r.returncode == 0
+    except Exception:
+        return False
+
 
 def signal_group(pgid, sig=signal.SIGTERM, members=None):
     """向进程组/进程树发信号。返回 (ok, error)。
 
     POSIX：os.killpg；Windows：对调用方已验证的冻结成员列表（未提供时
-    才重新扫描）逐个 terminate()/kill()。
+    才重新扫描）逐个终止。非 force 时先走 WM_CLOSE 软通道（带窗口进程
+    可自行清理），宽限后对仍存活成员执行硬杀兜底。
     """
     if IS_POSIX:
         try:
@@ -611,6 +632,11 @@ def signal_group(pgid, sig=signal.SIGTERM, members=None):
                else _group_members_windows(pgid))
     if not members:
         return True, None
+    if not force:
+        # 软终止阶段：WM_CLOSE 通道优先；无窗口进程静默失败。
+        for pid in reversed(members):
+            _wm_close_soft(pid)
+        time.sleep(GRACE_SOFT_STOP_SEC)
     errors = []
     # 完整树已冻结；从叶子到根终止，避免父进程先退出后丢失后代关联。
     for pid in reversed(members):
@@ -659,15 +685,26 @@ def kill_process(pid, force):
         except OSError as e:
             return False, "结束失败: %s" % e
     mod = _psutil()
+    if not force:
+        # 软终止阶段：WM_CLOSE 通道优先；进程若已退出则视为成功（幂等）。
+        _wm_close_soft(pid)
+        try:
+            proc = mod.Process(pid)
+        except psutil.NoSuchProcess:
+            return True, None
+    else:
+        try:
+            proc = mod.Process(pid)
+        except psutil.NoSuchProcess:
+            return False, "进程不存在"
     try:
-        proc = mod.Process(pid)
         if force:
             proc.kill()
         else:
             proc.terminate()
         return True, None
     except psutil.NoSuchProcess:
-        return False, "进程不存在"
+        return (True, None) if not force else (False, "进程不存在")
     except psutil.AccessDenied:
         return False, "没有权限结束该进程"
     except Exception as e:  # noqa: BLE001
