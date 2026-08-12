@@ -66,7 +66,7 @@ GitHub `laogou717/local-ops`(中文名"总控台")的 **macOS → Windows 移植
 - WorkBuddy 的 safe-delete(回收站)在本机部分删除失败 → 用 Python `os.remove/os.rmdir` 逐文件删
 - 烧 CPU 测试:**用独立子进程**(Python 线程死循环受 GIL 限制,双线程也只 ~100%;且 spin 线程抢 GIL 会延迟端口绑定)
 
-## 5. 当前状态(2026-08-13 03:30)
+## 5. 当前状态(2026-08-13 03:05)
 
 - **P0 待办已清**:task 批处理退出码映射与 detect_project 项目识别均已实测通过(见第 6 节勾选)。
 - **验证中发现并修复**:detect_project 生成的 Python 候选命令原硬编码 `python3`(macOS 命令),Windows 上会启动失败;已按平台改用 `python`(Windows)/`python3`(macOS),诊断文案同步平台化。`python3` 命令名问题同样影响 `command_for_script` 的 POSIX 分支(该分支 Windows 已用 `sys.executable`,正确)。
