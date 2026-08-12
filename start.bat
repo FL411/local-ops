@@ -4,11 +4,13 @@ title local-ops Console
 cd /d "%~dp0"
 
 set "PYEXE=C:\Program Files\Python312\python.exe"
-if exist "%PYEXE%" (
-  "%PYEXE%" -c "import psutil" >nul 2>nul
-  if not errorlevel 1 goto :resolve_pythonw_from_exe
-)
+if not exist "%PYEXE%" goto :try_py
+"%PYEXE%" -c "import psutil" >nul 2>nul
+if errorlevel 1 goto :try_py
+set "PY=%PYEXE%"
+goto :resolve_pythonw_from_exe
 
+:try_py
 set "PY="
 where py >nul 2>nul
 if errorlevel 1 goto :find_python
@@ -65,7 +67,7 @@ set "PYW=%PYEXE:\python.exe=\pythonw.exe%"
 if not exist "%PYW%" set "PYW=%PYEXE%"
 
 :probe
-%PY% "%~dp0launcher_check.py" status > "%TEMP%\localops_status.txt" 2>nul
+"%PYEXE%" "%~dp0launcher_check.py" status > "%TEMP%\localops_status.txt" 2>nul
 set /p LSTATUS=<"%TEMP%\localops_status.txt"
 del "%TEMP%\localops_status.txt" >nul 2>nul
 if not defined LSTATUS set "LSTATUS=STOPPED"
@@ -89,11 +91,11 @@ if "%LCHOICE%"=="3" goto :end
 goto :menu
 
 :open
-%PY% "%~dp0launcher_check.py" open %LPORT%
+"%PYEXE%" "%~dp0launcher_check.py" open %LPORT%
 goto :end
 
 :restart
-%PY% "%~dp0launcher_check.py" restart %LPORT%
+"%PYEXE%" "%~dp0launcher_check.py" restart %LPORT%
 echo Console is restarting. A browser window will open shortly.
 goto :end
 
@@ -101,7 +103,7 @@ goto :end
 exit /b 0
 
 :launch
-start "" "%PYW%" server.py --log-to-file
+"%PYW%" server.py --log-to-file
 echo local-ops started in background.
 echo Browser will open automatically.
 echo See README for log location.

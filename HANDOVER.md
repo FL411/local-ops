@@ -52,6 +52,7 @@ GitHub `laogou717/local-ops`(中文名"总控台")的 **macOS → Windows 移植
 - `signal` 模块**无 SIGKILL** → `getattr(signal, 'SIGKILL', 9)`
 - 无 `os.getuid`/`fcntl`/`os.killpg`/`os.getpgid`(都走 sysops)
 - **pyc 缓存坑(最重要)**:多解释器混用时,`__pycache__` 里旧 pyc 的 mtime 与源码同秒会被误判有效 → **改完代码必须 `rm -rf __pycache__` 再启动验证**,否则"新代码不生效"
+- **bat 执行 .py 必须显式带解释器**:`start.bat` 若以空前缀执行 `foo.py`,cmd 走 ShellExecute 按 .py 文件关联(py.exe)打开,**`> file` 输出重定向失效**(ShellExecute 新进程不继承重定向句柄)→ 读回变量为空、分支误判;关联不完整环境还会弹"选择使用什么程序打开 .py"。修复:所有 .py 调用统一 `"%PYEXE%" script.py`;启动用 `"%PYW%"` 直接调用(pythonw 是 GUI 子系统,cmd 不等待,无需 `start` 包装)
 
 ### 4.3 psutil 细节
 - argv 是列表,join 后含空格路径(如 `Microsoft VS Code\Code.exe`)不带引号 → `split()[0]` 截断成 "Microsoft" → 已有 `_win_join_cmdline()` 补引号
