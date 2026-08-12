@@ -66,12 +66,16 @@ GitHub `laogou717/local-ops`(中文名"总控台")的 **macOS → Windows 移植
 - WorkBuddy 的 safe-delete(回收站)在本机部分删除失败 → 用 Python `os.remove/os.rmdir` 逐文件删
 - 烧 CPU 测试:**用独立子进程**(Python 线程死循环受 GIL 限制,双线程也只 ~100%;且 spin 线程抢 GIL 会延迟端口绑定)
 
-## 5. 当前状态(2026-08-13 03:30)
+## 5. 当前状态(2026-08-13 03:40)
 
-- **P0+P1 待办全部清空**:task 退出码(7/7)、detect_project(6/6)、attached 认领(16/16)、favicon/图标(14/14)、前端冒烟(21/21)全部实测通过。
-- **验证中发现并修复**:detect_project 生成的 Python 候选命令原硬编码 `python3`(macOS 命令),Windows 上会启动失败;已按平台改用 `python`(Windows)/`python3`(macOS),诊断文案同步平台化。`python3` 命令名问题同样影响 `command_for_script` 的 POSIX 分支(该分支 Windows 已用 `sys.executable`,正确)。
-- **psutil 版本锁定**:`requirements-runtime-win.txt`/`start.bat`/README 统一为 `psutil>=7.2`(Python 3.14 兼容)。
-- **已知限制(既有行为,非移植引入)**:favicon 抓取只对 token 受管进程生效,`attached` 卡片不支持(favicon 接口内部用 `managed_pids` 判定 live 进程)。
+- **P0+P1+P2 全部清空**（git 提交/启动器选项/优雅停止均完成，见第 6 节）。
+- **本次验证中发现并修复**:
+  - `detect_project` Python 候选命令按平台生成(Windows `python` / macOS `python3`),测试同步引用 `PYTHON_CMD`。
+  - **restart helper bug**:Windows 重启后新实例缺 `--log-to-file`,pythonw 无控制台输出写无效句柄 → 重启后实例日志全丢(曾出现实例卡死无法诊断)。已修复并验证完整重启链路(旧实例退出→新实例起来→health 200→日志可查)。
+  - **优雅停止**:Windows 停止先 WM_CLOSE 软通道再硬杀兜底。
+  - **启动器**:新增 `launcher_check.py` + start.bat 菜单(打开/重启/取消)。
+- **测试套件 Windows 可运行性评估**(163 项):130 通过 + 1 跳过;33 项失败/错误**全部为 macOS 平台行为断言**(`/bin/bash` vs `bash`、`python3` 命令名、POSIX symlink 语义、发布检查的 Unix 路径),无新增产品缺陷。已同步 1 处与产品修复直接相关的断言(PYTHON_CMD)。**长期适配方案**:测试统一用 `sysops.IS_POSIX` 条件化,属长期维护项。
+- **已知限制(既有行为,非移植引入)**:favicon 抓取只对 token 受管进程生效,`attached` 卡片不支持。
 - 服务正在运行(pythonw,9600 端口,/api/health ok);数据目录 `%APPDATA%\总控台`。
 - 注意:用户可能通过网页「停止」停过服务 → 页面刷新会出现"连接断开,自动重连"(预期行为,重跑 start.bat 即可)。
 
@@ -92,10 +96,11 @@ GitHub `laogou717/local-ops`(中文名"总控台")的 **macOS → Windows 移植
 
 ### P2(体验/工程化)
 - [x] git 提交(Windows 移植里程碑,分逻辑提交,2026-08-13)
-- [ ] 启动器「重启/打开控制台」选项(对齐 macOS launcher 对话框,可选)
-- [ ] 优雅停止(Windows 先尝试软终止再强杀,对需落盘的进程有意义)
-- [ ] 原 2687 行 macOS 测试套件 Windows 适配(长期维护才需要)
-- [ ] `__pycache__` 清理后注意:运行服务会重新生成(正常,别慌)
+- [x] 启动器「重启/打开控制台」选项(新增 `launcher_check.py` + start.bat 菜单:已有实例时 1=打开 2=重启 3=取消)
+  - 坑:bat 菜单必须纯 ASCII + CRLF + goto 结构;探测用 /api/health 确认身份(防误判占用 9600-9609 的无关程序)
+- [x] 优雅停止(Windows 先 WM_CLOSE 软通道再硬杀兜底,force 语义不变;kill_process 非 force 幂等)
+- [~] 原 2687 行 macOS 测试套件 Windows 适配(评估完成:163 项中 130 过 + 1 跳过,33 项失败/错误均为 macOS 平台断言,**长期维护项**;已同步 PYTHON_CMD 相关断言)
+- [x] `__pycache__` 清理后注意:运行服务会重新生成(正常,别慌)
 
 ## 7. 环境备忘
 

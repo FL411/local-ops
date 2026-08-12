@@ -45,9 +45,15 @@
 
 ### Fixed
 
-- 修复 Windows 下项目识别（`detect_project`）生成 macOS 命令名的问题：Django/FastAPI/Flask/Streamlit 与静态站点兜底的 Python 启动候选现按平台使用 `python`（Windows）/ `python3`（macOS）；模块缺失诊断中的虚拟环境建议同步平台化（Windows 使用 `.venv\Scripts\pip`）。
+- 修复 Windows 下 `detect_project` 生成 macOS 命令名的问题（同下）之外：**restart helper 启动的新实例缺少 `--log-to-file`**，pythonw 无控制台场景下输出写入无效句柄，重启后实例日志不可见且无法诊断异常；新实例现带 `--log-to-file`，重启链路日志完整可查。
+- 修复 Windows 下项目识别（`detect_project`）生成 macOS 命令名的问题：Django/FastAPI/Flask/Streamlit 与静态站点兜底的 Python 启动候选现按平台使用 `python`（Windows）/ `python3`（macOS）；模块缺失诊断中的虚拟环境建议同步平台化（Windows 使用 `.venv\Scripts\pip`）。对应测试改为引用 `PYTHON_CMD` 常量跨平台断言。
 - Windows 运行时依赖锁定 **psutil >= 7.2**（Python 3.14 兼容所需），`start.bat` 自动安装与 README 安装说明同步版本约束。
 - 修复 Windows 下 `/api/state` 慢扫描与配置写入反向加锁导致总控台永久无响应的问题；状态轮询改为保留旧快照的单飞后台刷新，并缩小目标 PID 与来源祖先链扫描范围。受管进程停止改为按冻结成员列表从叶子到根终止，日志权限设置兼容无 `os.fchmod` 的 Windows Python，带空格的可执行路径不再被 `cmd.exe` 的二次转义破坏。
+
+### Changed
+
+- **Windows 优雅停止**：停止流程先走 WM_CLOSE 软通道（`taskkill` 无 `/F`，带窗口的服务可自行清理落盘），短暂宽限后对仍存活成员执行硬杀兜底；force 语义不变。`kill_process` 的非 force 分支同样先软后硬，目标已退出时视为成功（幂等）。
+- **启动器交互**：新增 `launcher_check.py`（探测实例/打开控制台/重启控制台，输出纯 ASCII）；`start.bat` 检测到已有实例时显示「打开 / 重启 / 取消」菜单，对齐 macOS launcher 行为。
 - 修复从服务监控加入启动台时只创建卡片、未认领来源进程的问题；创建与进程认领现由后端原子完成，项目命令识别完成前不能提前保存。明确认领的服务在 Next/Vite 等框架重建监听子进程、PID 变化后，会按端口、当前用户与真实项目目录唯一重新关联。
 - 修复 Candy 主题超大标题的英文粗体描边出现双重轮廓，并让英文副标题在窄屏明确换行。
 - 修复批处理脚本内取消被误报为运行成功，以及任务成功退出被诊断成“服务过早退出”。
