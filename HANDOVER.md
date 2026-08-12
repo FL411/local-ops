@@ -66,11 +66,12 @@ GitHub `laogou717/local-ops`(中文名"总控台")的 **macOS → Windows 移植
 - WorkBuddy 的 safe-delete(回收站)在本机部分删除失败 → 用 Python `os.remove/os.rmdir` 逐文件删
 - 烧 CPU 测试:**用独立子进程**(Python 线程死循环受 GIL 限制,双线程也只 ~100%;且 spin 线程抢 GIL 会延迟端口绑定)
 
-## 5. 当前状态(2026-08-13 03:05)
+## 5. 当前状态(2026-08-13 03:30)
 
-- **P0 待办已清**:task 批处理退出码映射与 detect_project 项目识别均已实测通过(见第 6 节勾选)。
+- **P0+P1 待办全部清空**:task 退出码(7/7)、detect_project(6/6)、attached 认领(16/16)、favicon/图标(14/14)、前端冒烟(21/21)全部实测通过。
 - **验证中发现并修复**:detect_project 生成的 Python 候选命令原硬编码 `python3`(macOS 命令),Windows 上会启动失败;已按平台改用 `python`(Windows)/`python3`(macOS),诊断文案同步平台化。`python3` 命令名问题同样影响 `command_for_script` 的 POSIX 分支(该分支 Windows 已用 `sys.executable`,正确)。
 - **psutil 版本锁定**:`requirements-runtime-win.txt`/`start.bat`/README 统一为 `psutil>=7.2`(Python 3.14 兼容)。
+- **已知限制(既有行为,非移植引入)**:favicon 抓取只对 token 受管进程生效,`attached` 卡片不支持(favicon 接口内部用 `managed_pids` 判定 live 进程)。
 - 服务正在运行(pythonw,9600 端口,/api/health ok);数据目录 `%APPDATA%\总控台`。
 - 注意:用户可能通过网页「停止」停过服务 → 页面刷新会出现"连接断开,自动重连"(预期行为,重跑 start.bat 即可)。
 
@@ -83,9 +84,11 @@ GitHub `laogou717/local-ops`(中文名"总控台")的 **macOS → Windows 移植
   - **修复**:Python 候选命令按平台 `python`(Win)/`python3`(macOS)。
 
 ### P1(一次冒烟覆盖)
-- [ ] `attached` 认领外部进程(端口+uid+cwd 严格校验,uid 在 Windows 恒等需注意)
-- [ ] favicon 抓取 / 图标上传
-- [ ] 前端交互:批量停止、拖拽/键盘排序、命令面板、新端口发现弹窗
+- [x] `attached` 认领外部进程(16/16 通过:创建原子认领/已有卡片认领/cwd 同步/task 422/未监听 409/重复认领 409/运行中 409)
+  - 注意:Windows venv 的 python.exe 是 shim,Popen 返回 pid ≠ 监听 pid;测试须用 psutil.net_connections 端口反查真实 pid
+- [x] favicon 抓取 / 图标上传(14/14 通过:受管服务 favicon 抓取落盘/上传/静态访问/删除)
+  - 已知限制(既有行为,非移植引入):favicon 只对 **token 受管进程**生效,`attached` 卡片会返回"应用未运行或无可用端口"
+- [x] 前端交互冒烟(21/21 通过:渲染/视图切换/命令面板/新端口发现+加入/批量停止/添加表单;Playwright Core + 系统 Chrome,隔离实例)
 
 ### P2(体验/工程化)
 - [x] git 提交(Windows 移植里程碑,分逻辑提交,2026-08-13)
