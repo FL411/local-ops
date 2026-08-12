@@ -453,6 +453,9 @@ class ProcessLifecycleHardeningTests(unittest.TestCase):
                     except OSError:
                         pass
 
+    @unittest.skipIf(
+        sys.platform == "win32",
+        "Windows terminate() is not an ignorable POSIX SIGTERM")
     def test_sigterm_timeout_retains_runtime_identity_for_retry(self):
         command = (
             "python3 -c 'import signal,time; "
@@ -852,11 +855,16 @@ class AttachConflictTests(unittest.TestCase):
 
 
 class StateCacheTests(unittest.TestCase):
-    """TTL 缓存：TTL 内复用快照、失效后立即重建、配置写入自动失效。"""
+    """TTL 缓存：单飞刷新、过期复用，并避免与配置锁互锁。"""
 
     def setUp(self):
         self._orig_cache = server._state_cache
-        server._state_cache = {"mono": 0.0, "state": None}
+        server._state_cache = {
+            "mono": 0.0,
+            "state": None,
+            "building": False,
+            "generation": 0,
+        }
 
     def tearDown(self):
         server._state_cache = self._orig_cache
@@ -867,20 +875,41 @@ class StateCacheTests(unittest.TestCase):
             return {"built": len(calls), "port": port}
         return fake_build
 
-    def test_snapshot_reused_within_ttl_and_rebuilt_after_invalidate(self):
+    def test_expired_snapshot_returns_immediately_and_refreshes_once(self):
         calls = []
         cfg = mock.Mock()
+        cfg.snapshot.return_value = {}
+        cfg.health_info.return_value = {}
+        refresh_started = threading.Event()
+        release_refresh = threading.Event()
+
+        server._state_cache.update({
+            "mono": time.monotonic() - server.STATE_CACHE_TTL - 1,
+            "state": {"built": 0, "port": 9600},
+        })
+
+        def slow_build(cfg_snapshot, port, health=None):
+            calls.append(port)
+            refresh_started.set()
+            release_refresh.wait(2)
+            return {"built": len(calls), "port": port}
+
         with mock.patch.object(
                 server, "build_state",
-                side_effect=self._snapshot_that_counts(calls)):
+                side_effect=slow_build):
             first = server.get_state_snapshot(cfg, 9600)
+            self.assertTrue(refresh_started.wait(1))
             second = server.get_state_snapshot(cfg, 9600)
-            server.invalidate_state_cache()
+            self.assertEqual(calls, [9600])
+            self.assertEqual(first, {"built": 0, "port": 9600})
+            self.assertIs(second, first)
+            release_refresh.set()
+            deadline = time.monotonic() + 2
+            while server._state_cache.get("building") and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertFalse(server._state_cache.get("building"))
             third = server.get_state_snapshot(cfg, 9600)
-        self.assertEqual(calls, [9600, 9600])
-        self.assertEqual(first, {"built": 1, "port": 9600})
-        self.assertIs(second, first)
-        self.assertEqual(third, {"built": 2, "port": 9600})
+        self.assertEqual(third, {"built": 1, "port": 9600})
 
     def test_config_update_invalidates_cache(self):
         with tempfile.TemporaryDirectory() as td:
@@ -893,8 +922,110 @@ class StateCacheTests(unittest.TestCase):
                 server.get_state_snapshot(cfg, 9600)
                 self.assertEqual(len(calls), 1)
                 cfg.update(lambda d: d.__setitem__("uiTheme", "custom"))
-                server.get_state_snapshot(cfg, 9600)
+                stale = server.get_state_snapshot(cfg, 9600)
+                self.assertEqual(stale, {"built": 1, "port": 9600})
+                deadline = time.monotonic() + 2
+                while server._state_cache.get("building") and time.monotonic() < deadline:
+                    time.sleep(0.01)
                 self.assertEqual(len(calls), 2)
+
+    def test_config_update_and_state_read_do_not_deadlock(self):
+        with tempfile.TemporaryDirectory() as td:
+            cfg = server.Config(os.path.join(td, "config.json"))
+            snapshot_called = threading.Event()
+            update_done = threading.Event()
+            state_done = threading.Event()
+            original_snapshot = cfg.snapshot
+
+            def observed_snapshot():
+                snapshot_called.set()
+                return original_snapshot()
+
+            def update_op(data):
+                self.assertTrue(snapshot_called.wait(1))
+                data["uiTheme"] = "custom"
+
+            cfg.snapshot = observed_snapshot
+            with mock.patch.object(
+                    server, "build_state",
+                    return_value={"built": 1, "port": 9600}):
+                updater = threading.Thread(
+                    target=lambda: (cfg.update(update_op), update_done.set()),
+                    daemon=True)
+                reader = threading.Thread(
+                    target=lambda: (
+                        server.get_state_snapshot(cfg, 9600), state_done.set()),
+                    daemon=True)
+                updater.start()
+                reader.start()
+                updater.join(2)
+                reader.join(2)
+
+            self.assertTrue(update_done.is_set())
+            self.assertTrue(state_done.is_set())
+
+
+class WindowsProcessSnapshotTests(unittest.TestCase):
+    def test_targeted_snapshot_skips_pid_that_exits_before_lookup(self):
+        fake_psutil = mock.Mock()
+        fake_psutil.Process.side_effect = server.sysops.psutil.NoSuchProcess(
+            pid=11716)
+        fake_psutil.process_iter.side_effect = AssertionError(
+            "targeted lookup must not scan every process")
+
+        with mock.patch.object(
+                server.sysops, "_psutil", return_value=fake_psutil):
+            snapshot = server.sysops._ps_snapshot_windows({11716})
+
+        self.assertEqual(snapshot, {})
+        fake_psutil.process_iter.assert_not_called()
+
+    def test_windows_group_stop_uses_frozen_members_leaf_first(self):
+        order = []
+        fake_psutil = mock.Mock()
+
+        def process_for(pid):
+            proc = mock.Mock()
+            proc.terminate.side_effect = lambda: order.append(pid)
+            return proc
+
+        fake_psutil.Process.side_effect = process_for
+        with mock.patch.object(server.sysops, "IS_POSIX", False), \
+                mock.patch.object(server.sysops, "_psutil",
+                                  return_value=fake_psutil), \
+                mock.patch.object(
+                    server.sysops, "_group_members_windows",
+                    side_effect=AssertionError("must use frozen members")):
+            ok, error = server.sysops.signal_group(
+                100, signal.SIGTERM, members=[100, 101, 102])
+
+        self.assertTrue(ok, error)
+        self.assertEqual(order, [102, 101, 100])
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows cmd quoting only")
+    def test_managed_spawn_accepts_quoted_executable_path(self):
+        with tempfile.TemporaryDirectory() as td:
+            log_path = os.path.join(td, "quoted-command.log")
+            script_path = os.path.join(td, "quoted_probe.py")
+            result_path = os.path.join(td, "quoted_probe.done")
+            with open(script_path, "w", encoding="utf-8") as f:
+                f.write(
+                    "from pathlib import Path\n"
+                    "Path(%r).write_text('ok', encoding='utf-8')\n"
+                    % result_path)
+            command = subprocess.list2cmdline([sys.executable, script_path])
+            env = os.environ.copy()
+            with open(log_path, "wb", buffering=0) as logf:
+                proc = server.sysops.spawn_managed(
+                    command, td, env, "console-run:test", logf)
+                code = proc.wait(timeout=10)
+
+            self.assertEqual(code, 0)
+            with open(log_path, "rb") as f:
+                output = f.read().decode("utf-8", "replace")
+            self.assertIn("console-run:test", output)
+            with open(result_path, encoding="utf-8") as f:
+                self.assertEqual(f.read(), "ok")
 
 
 if __name__ == "__main__":

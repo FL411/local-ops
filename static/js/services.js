@@ -336,7 +336,11 @@ function updateServiceRow(row, svc) {
   setText(r.pid, svc.pid ? String(svc.pid) : '—');
   if (r.ldCpuFill) {
     const pct = typeof svc.cpu === 'number' && !isNaN(svc.cpu) ? svc.cpu : 0;
-    r.ldCpuFill.style.width = pct <= 0 ? '0%' : Math.max(2, Math.min(100, pct)) + '%';
+    // 后端 CPU 为「占全部核心百分比」（Windows 任务管理器口径）；
+    // 迷你条按相对满核还原宽度，满载仍显示满条。
+    const cores = (state.data && state.data.coreCount) || 1;
+    const width = pct * cores;
+    r.ldCpuFill.style.width = width <= 0 ? '0%' : Math.max(2, Math.min(100, width)) + '%';
   }
   if (svc.port != null) {
     r.port.hidden = false;

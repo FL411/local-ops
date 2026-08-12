@@ -1,5 +1,9 @@
 * text=auto eol=lf
 
+# Windows 批处理必须 CRLF 检出（cmd 对 LF 行尾解析不可靠）
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
 *.icns binary
 *.ico binary
 *.jpg binary

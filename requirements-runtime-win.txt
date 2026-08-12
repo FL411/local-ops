@@ -1,0 +1,18 @@
+# Windows 运行时依赖
+
+macOS 平台保持「运行时零第三方依赖」（使用系统自带 ps/lsof/osascript）。
+Windows 平台需要 **psutil**（唯一运行时第三方依赖），用于进程快照、
+监听端口、工作目录与进程树管理——这些能力在 Windows 上没有等价的标准库。
+
+版本要求：**psutil >= 7.2**。7.x 才提供 Python 3.13/3.14 官方支持（本项目
+实际运行解释器为 Python 3.14）；低于 7.0 的旧版本在 3.14 下会安装或运行失败。
+
+安装方式（任选其一）：
+
+```bat
+:: 方式一：双击 start.bat，首次运行自动安装
+:: 方式二：手动安装
+python -m pip install "psutil>=7.2"
+```
+
+开发/检查工具（生成图标、品牌资源）仍见 requirements-dev.txt。
