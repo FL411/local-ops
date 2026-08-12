@@ -2,11 +2,11 @@
 
 **Preview / Alpha · 源码预览**
 
-总控台是一个面向 macOS 的本地服务与批处理任务快速启动、运行监测工具。它把常用项目命令、长期服务和一次性批处理任务集中到本地网页中，并用 Python 3 标准库提供只绑定回环地址的后端；前端是无构建、无 CDN 的原生 HTML/CSS/JavaScript。
+总控台是一个本地服务与批处理任务快速启动、运行监测工具。它把常用项目命令、长期服务和一次性批处理任务集中到本地网页中，并用 Python 3 提供只绑定回环地址的后端（macOS 仅用标准库；Windows 额外依赖 psutil）；前端是无构建、无 CDN 的原生 HTML/CSS/JavaScript。
 
-> 当前版本仍处于 Preview / Alpha 阶段，以源码预览形式提供。接口、配置格式和安装方式仍可能调整；`总控台.app` 目前不是可单独复制的自包含应用，也尚不代表经过签名、公证的最终 macOS 发行版。
+> 当前版本仍处于 Preview / Alpha 阶段，以源码预览形式提供。接口、配置格式和安装方式仍可能调整；`总控台.app`（macOS）目前不是可单独复制的自包含应用，也尚不代表经过签名、公证的最终 macOS 发行版。Windows 平台为移植版本，核心功能（服务启停、进程溯源、日志、诊断、新端口发现）已验证可用。
 
-总控台只服务当前 Mac 和当前用户，不是远程运维、多人协作或公网管理面板。它能够以当前用户权限执行保存的 shell 命令；不要将监听地址、反向代理、SSH 隧道或端口映射暴露到不受信任的网络。
+总控台只服务当前电脑和当前用户，不是远程运维、多人协作或公网管理面板。它能够以当前用户权限执行保存的 shell 命令；不要将监听地址、反向代理、SSH 隧道或端口映射暴露到不受信任的网络。
 
 ## 维护说明
 
@@ -35,16 +35,26 @@
 
 ## 系统要求
 
-- macOS 12 或更高版本。
-- Python 3.12。运行时仅使用 Python 标准库。
-- macOS 自带的 `ps`、`lsof`、`osascript` 等系统工具。
-- Safari、Chrome 或其他支持 ES Modules 的现代浏览器。
+- **macOS 12 或更高版本**：运行时仅使用 Python 标准库，依赖系统自带 `ps`、`lsof`、`osascript`。
+- **Windows 10/11**：运行时额外依赖 `psutil`（≥ 7.2，Python 3.13/3.14 兼容所需；首次运行 `start.bat` 自动安装，或 `pip install "psutil>=7.2"`）。
+- Python 3.12 或更高版本。
+- Chrome、Edge 或其他支持 ES Modules 的现代浏览器。
 
 `VERSION` 是项目版本的唯一权威来源。`Info.plist`、发行包名和发行说明应与它保持一致。
 
 ## 安装
 
-总控台以完整项目目录运行，`总控台.app` 是项目内启动器，不是可以单独复制的自包含应用。
+总控台以完整项目目录运行。macOS 的 `总控台.app` 是项目内启动器，不是可以单独复制的自包含应用；Windows 使用 `start.bat`。
+
+### Windows
+
+1. **安装 Python 3.12+**：从 <https://www.python.org/downloads/> 下载安装，安装时务必勾选 **“Add python.exe to PATH”**。
+2. **首次运行**：双击 `start.bat`。首次启动会自动安装 `psutil`（Windows 运行时依赖，仅一次），随后打开浏览器进入 `http://127.0.0.1:9600/`。
+
+   > 也可手动运行：`python -m pip install "psutil>=7.2"` 后执行 `python server.py`。
+3. 建议将脚本保存在稳定、会单独备份的自动化目录中（参见下文「批处理任务」说明）。
+
+### macOS
 
 1. **下载并解压**：将发行 zip 解压到一个你有读写权限的位置（如 `~/Applications` 或文稿下的固定目录）。解压后请保持目录结构完整，不要单独移动 `总控台.app`。
 2. **确认 Python 3.12**：在「终端」运行：
@@ -66,6 +76,21 @@
 
 ## 运行
 
+### Windows
+
+| 方式 | 操作 | 适用场景 |
+| --- | --- | --- |
+| 双击脚本 | 双击 `start.bat` | 日常使用。**后台运行**（pythonw 无窗口），自动安装依赖并启动，浏览器自动打开 |
+| 命令行 | `python server.py` | 调试、脚本化（前台运行，Ctrl+C 停止） |
+
+Windows 后台运行说明：
+
+- `start.bat` 使用 `pythonw.exe` 无窗口运行，命令窗口立即关闭，服务在后台常驻；日志写入 `%LOCALAPPDATA%\总控台\console.log`。
+- **停止总控台**：打开页面后点击顶栏「停止」（网页按钮），不影响已启动的应用；或再次双击 `start.bat` 打开已有实例。
+- 首次运行会自动安装 `psutil`（≥ 7.2，Windows 唯一运行时依赖）。
+
+### macOS
+
 启动总控台有且只有三种方式，效果相同，按习惯选择：
 
 | 方式 | 操作 | 适用场景 |
@@ -74,7 +99,7 @@
 | 双击脚本 | 双击 `start.command` | 想在 Terminal 里看实时输出 |
 | 命令行 | `python3 server.py` | 调试、脚本化或远程 SSH 启动 |
 
-命令行还有两个可选参数：
+两个平台通用的命令行参数：
 
 ```bash
 python3 server.py --no-browser        # 只启动服务，不自动打开浏览器
@@ -136,16 +161,19 @@ python3 server.py --preferred-port 9603  # 在 9600-9609 内指定优先端口
 
 ## 数据、隐私与备份
 
-运行数据与程序目录分离，默认放在 macOS 用户资料库：
+运行数据与程序目录分离。默认位置按平台区分：
 
-| 路径 | 内容 | 备份建议 |
-| --- | --- | --- |
-| `~/Library/Application Support/总控台/config.json` | 应用命令、本地路径、端口、标记和运行识别信息 | 必须 |
-| `~/Library/Application Support/总控台/config.json.bak` | 上一份已知良好的配置 | 必须 |
-| `~/Library/Application Support/总控台/icons/` | 用户上传的图标和站点图标 | 按需 |
-| `~/Library/Logs/总控台/` | 应用与总控台运行日志 | 通常不需 |
+| 平台 | 路径 | 内容 | 备份建议 |
+| --- | --- | --- | --- |
+| macOS | `~/Library/Application Support/总控台/config.json` | 应用命令、本地路径、端口、标记和运行识别信息 | 必须 |
+| macOS | `~/Library/Application Support/总控台/config.json.bak` | 上一份已知良好的配置 | 必须 |
+| macOS | `~/Library/Application Support/总控台/icons/` | 用户上传的图标和站点图标 | 按需 |
+| macOS | `~/Library/Logs/总控台/` | 应用与总控台运行日志 | 通常不需 |
+| Windows | `%APPDATA%\总控台\config.json`（及 `.bak`） | 同 macOS 的 config 两项 | 必须 |
+| Windows | `%APPDATA%\总控台\icons\` | 用户上传的图标和站点图标 | 按需 |
+| Windows | `%LOCALAPPDATA%\总控台\` | 应用与总控台运行日志 | 通常不需 |
 
-目录权限会收紧为 `0700`，配置、图标和日志文件为 `0600`。这些文件仍可能含个人路径、完整 shell 命令和日志内容；不应进入 Git，也不应随发行包或故障报告对外传播。
+目录权限会收紧为 `0700`，配置、图标和日志文件为 `0600`（Windows 上权限位检查自动跳过，改由用户账户隔离）。这些文件仍可能含个人路径、完整 shell 命令和日志内容；不应进入 Git，也不应随发行包或故障报告对外传播。
 
 ### 旧版数据首次迁移
 
@@ -210,6 +238,12 @@ python3 server.py
 - 不要在共享或不受信任的用户账户中运行。
 - 不要把 Application Support 中的 `config.json`、Library Logs 日志或故障截图未经脱敏就上传。
 - 本地回环绑定只是第一层边界，不能替代写接口的 Host/Origin/控制令牌防护。发布验收时必须执行 `RELEASE_CHECKLIST.md` 中的安全项。
+
+**Windows 平台差异**：
+
+- Windows 没有与 Unix 等价的 uid/进程组语义。受控进程识别使用「随机运行 token + 以根 PID 为锚点的进程树回溯」代替「token + PGID + UID」；`SELF_UID` 恒为 0（本机交互用户），因此「只能操作当前用户进程」的校验在 Windows 上不生效——请在**个人单用户电脑**上使用，不要在共享主机上运行。
+- 受控应用的启动命令通过 `cmd.exe /c` 执行：`service` 请使用前台命令（如 `python -m http.server`、`node server.js`）；需要 Shell 语法时同样可用（`&`、`&&` 等）。
+- 系统通知使用浏览器 Notification API（与 macOS 一致），无需额外依赖。
 
 ## 故障排查
 

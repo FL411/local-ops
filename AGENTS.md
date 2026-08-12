@@ -101,6 +101,7 @@
 ## 后端实现要点
 
 - **端口扫描**：`lsof -iTCP -sTCP:LISTEN -P -n`，按 `(pid, port)` 去重（IPv4/6 重复行）。lsof 的 COMMAND 列会截断，名称以 ps 的 comm 为准。
+- **状态快照**：`/api/state` 使用 2.2 秒 TTL 与 stale-while-revalidate；过期时立即返回上一份完整快照，后台最多一个刷新线程。缓存锁内不得读取配置或执行进程/端口扫描，`Config.update()` 必须在释放配置锁后再使缓存失效，避免锁顺序反转。
 - **进程详情**：批量 `ps -o pid=,user=,comm=,args=,%cpu=,%mem=,etime= -p <逗号分隔pid>`；只保留 `user == 当前用户`。
 - **cwd**：`lsof -a -p <逗号分隔pid> -d cwd -Fn`，解析 `n` 行。
 - **etime 解析**：`[[dd-]hh:]mm:ss` → 秒。

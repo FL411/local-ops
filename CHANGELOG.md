@@ -10,6 +10,8 @@
 
 ### Added
 
+- **Windows 平台移植**：新增跨平台系统操作层 `sysops.py`，macOS 保持零第三方依赖（ps/lsof/osascript），Windows 基于 `psutil` 实现进程快照、监听端口、工作目录与进程树管理；新增 `start.bat` 启动器与 `requirements-runtime-win.txt` 运行时依赖说明。`start.bat` 采用 `pythonw.exe` **无窗口后台运行**，日志写入 `%LOCALAPPDATA%\总控台\console.log`；新增 `--log-to-file` 命令行参数。
+- **Windows 平台优化（对齐 macOS）**：① 服务监控按系统进程名单（svchost/System/explorer 等）与 System32 目录将系统进程归入「应用后台」折叠，消除界面噪音；② 进程溯源新增 Windows 工具别名映射（Code.exe→VS Code、Cursor、WindowsTerminal/cmd/powershell→终端 等），并修复含空格路径（如 `Microsoft VS Code`）的溯源解析——psutil argv 拼接时对含空格参数补引号；③ **补全性能监控 CPU 采样**：Windows 版每进程 CPU 由恒 0 改为「跨快照 cpu_times 差分」，并按 Windows 用户习惯归一为「占全部逻辑核心的百分比」（任务管理器口径，吃满 1 核 = 100/核心数 %，多线程也不会超过 100），`/api/state` 新增 `coreCount` 供前端迷你条还原相对满核宽度；macOS 保持单核口径不变；排除 System Idle Process（pid 0）。
 - 顶栏新增 GitHub 仓库图标按钮，点击在新标签页打开项目源码仓库。
 - 增加用户/开发文档、备份恢复和升级卸载指南。
 - 布局升级为指挥台结构：左侧图标导航轨、启动台与服务监控双视图 KPI 概览卡（含 CPU/内存火花线）、右侧实时动态/实时告警与端口/资源 TOP 5 信息栏、小贴士、页头快捷操作，以及服务/任务分区筛选芯片；服务表格增加 PID、状态列与 CPU 迷你负载条。结构样式集中于 `base.css`。
@@ -43,6 +45,9 @@
 
 ### Fixed
 
+- 修复 Windows 下项目识别（`detect_project`）生成 macOS 命令名的问题：Django/FastAPI/Flask/Streamlit 与静态站点兜底的 Python 启动候选现按平台使用 `python`（Windows）/ `python3`（macOS）；模块缺失诊断中的虚拟环境建议同步平台化（Windows 使用 `.venv\Scripts\pip`）。
+- Windows 运行时依赖锁定 **psutil >= 7.2**（Python 3.14 兼容所需），`start.bat` 自动安装与 README 安装说明同步版本约束。
+- 修复 Windows 下 `/api/state` 慢扫描与配置写入反向加锁导致总控台永久无响应的问题；状态轮询改为保留旧快照的单飞后台刷新，并缩小目标 PID 与来源祖先链扫描范围。受管进程停止改为按冻结成员列表从叶子到根终止，日志权限设置兼容无 `os.fchmod` 的 Windows Python，带空格的可执行路径不再被 `cmd.exe` 的二次转义破坏。
 - 修复从服务监控加入启动台时只创建卡片、未认领来源进程的问题；创建与进程认领现由后端原子完成，项目命令识别完成前不能提前保存。明确认领的服务在 Next/Vite 等框架重建监听子进程、PID 变化后，会按端口、当前用户与真实项目目录唯一重新关联。
 - 修复 Candy 主题超大标题的英文粗体描边出现双重轮廓，并让英文副标题在窄屏明确换行。
 - 修复批处理脚本内取消被误报为运行成功，以及任务成功退出被诊断成“服务过早退出”。
