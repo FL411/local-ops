@@ -301,7 +301,18 @@ make check
 
 它会检查 Python/JavaScript/Bash/plist/JSON 语法、版本一致性、主题和资源引用、生成的图标是否同步，并显式发现和运行测试。测试数量为 0 时会失败，不会出现“0 tests 也算通过”。
 
-只运行后端测试：
+**Windows 开发环境**（无 make 时的等价命令）：
+
+```bat
+:: 提交前全量检查（等价 make check）
+python tools/check_project.py
+:: 仅语法检查（等价 make syntax）
+python tools/check_project.py --skip-tests
+:: 仅后端测试（等价 make test）
+python -m unittest discover -s tests -p "test_*.py" -v
+```
+
+只运行后端测试（macOS）：
 
 ```bash
 make test

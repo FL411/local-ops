@@ -3,33 +3,50 @@ setlocal
 title local-ops Console
 cd /d "%~dp0"
 
-set "PYEXE=C:\Program Files\Python312\python.exe"
-if not exist "%PYEXE%" goto :try_py
-"%PYEXE%" -c "import psutil" >nul 2>nul
-if errorlevel 1 goto :try_py
-set "PY=%PYEXE%"
-goto :resolve_pythonw_from_exe
+REM Probe order: py launcher (latest) -> python on PATH -> fixed path fallback.
+REM Each candidate must satisfy Python>=3.12 AND have psutil, else try next.
+set "PY="
 
 :try_py
-set "PY="
 where py >nul 2>nul
-if errorlevel 1 goto :find_python
-py -3.12 -c "import psutil" >nul 2>nul
-if errorlevel 1 goto :find_python
-set "PY=py -3.12"
+if errorlevel 1 goto :try_python
+py -3 -c "import sys,psutil;raise SystemExit(0 if sys.version_info >= (3,12) else 1)" >nul 2>nul
+if errorlevel 1 goto :try_python
+set "PY=py -3"
 goto :resolve_pythonw
 
-:find_python
+:try_python
 where python >nul 2>nul
-if errorlevel 1 goto :no_python
-python -c "import psutil" >nul 2>nul
-if errorlevel 1 goto :install_psutil
+if errorlevel 1 goto :try_fixed
+python -c "import sys,psutil;raise SystemExit(0 if sys.version_info >= (3,12) else 1)" >nul 2>nul
+if errorlevel 1 goto :try_fixed
 set "PY=python"
 goto :resolve_pythonw
 
+:try_fixed
+set "PYEXE=C:\Program Files\Python312\python.exe"
+if not exist "%PYEXE%" goto :install_psutil
+"%PYEXE%" -c "import sys,psutil;raise SystemExit(0 if sys.version_info >= (3,12) else 1)" >nul 2>nul
+if errorlevel 1 goto :install_psutil
+set "PY=%PYEXE%"
+goto :resolve_pythonw
+
 :install_psutil
+REM Here: no usable interpreter found, or version too old, or psutil missing.
+REM Distinguish old-version from missing-psutil: give a clear hint for old version.
 where py >nul 2>nul
-if errorlevel 1 goto :install_with_python
+if not errorlevel 1 goto :check_py_version
+where python >nul 2>nul
+if errorlevel 1 goto :no_python
+python -c "import sys;raise SystemExit(0 if sys.version_info >= (3,12) else 1)" >nul 2>nul
+if errorlevel 1 goto :old_python
+goto :install_with_python
+
+:check_py_version
+py -3 -c "import sys;raise SystemExit(0 if sys.version_info >= (3,12) else 1)" >nul 2>nul
+if errorlevel 1 goto :old_python
+
+:install_psutil_with_py
 echo [INFO] Installing psutil with py launcher ...
 py -3 -m pip install "psutil>=7.2"
 if errorlevel 1 goto :install_failed
@@ -42,6 +59,12 @@ python -m pip install "psutil>=7.2"
 if errorlevel 1 goto :install_failed
 set "PY=python"
 goto :resolve_pythonw
+
+:old_python
+echo [ERROR] Python 3.12 or newer is required, but found an older version.
+echo Please install Python 3.12+ from https://www.python.org/downloads/
+pause
+exit /b 1
 
 :install_failed
 echo [ERROR] psutil install failed.
