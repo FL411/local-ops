@@ -1,10 +1,12 @@
 # 总控台 (Console)
 
-本地服务监控与快速启动控制台。**零依赖**：Python 3 标准库后端（单文件）+ 无构建原生前端。推荐双击 `总控台.app` 后台运行（不显示 Terminal/Dock）；`start.command` 保留为终端调试入口。
+本地服务监控与快速启动控制台。**零依赖**（macOS：Python 3 标准库后端，无第三方依赖；Windows：唯一运行时依赖 `psutil>=7.2`，首次启动自动安装）。macOS 推荐双击 `总控台.app` 后台运行（不显示 Terminal/Dock），`start.command` 保留为终端调试入口；**Windows 双击 `start.bat`**（pythonw 无窗口后台运行，已有实例时显示「打开/重启/取消」菜单，由 `launcher_check.py` 探测/执行）。
 
 ## 结构
 
-- `server.py` — 后端（单文件，仅标准库，Python 3.12）
+- `server.py` — 后端（单文件，仅标准库，Python 3.12+）
+- `sysops.py` — **跨平台系统操作层（Windows 移植新增）**：进程/端口扫描（macOS 用 ps/lsof，Windows 用 psutil）、进程组（Windows 用进程树回溯）、文件锁（flock / msvcrt.locking）、对话框（osascript / tkinter+ctypes）、信号终止（SIGTERM / WM_CLOSE+TerminateProcess）。平台差异一律收口到本文件，server.py 不直接依赖平台 API
+- `start.bat` / `launcher_check.py` — Windows 启动器（探测实例/打开/重启，输出纯 ASCII）；`requirements-runtime-win.txt` — Windows 运行时依赖说明
 - `static/index.html` / `static/app.js`（入口）/ `static/js/{core,launchpad,services,overlays,ports,widgets}.js`（原生 ES Modules，无构建）/ `static/icons.js` — 前端（原生，禁框架/CDN/构建）；`core.js` 承载工具/API/浮层/状态/主题注册，`launchpad.js` 卡片+拖拽+诊断+启动台 KPI/分区过滤，`services.js` 表格+监控 KPI 火花线，`overlays.js` 模态+抽屉，`ports.js` 端口归一化纯函数，`widgets.js` 右侧信息栏（实时动态/告警、TOP5、小贴士、快捷操作）与导航轨状态；模块间用 `window.__poll` 共享轮询入口
 - 布局 v2：左侧 `.rail` 图标导航轨（启动台/服务监控视图切换 + 日志中心/设置中心弹层入口）+ 顶栏 + 内容/右侧信息栏双栏网格（≤1280px 侧栏下沉到底部、≤900px 导航轨隐藏）；结构样式集中在 `static/base.css` 末尾「布局 v2」段（主题令牌驱动），主题包负责视觉皮肤
 - `static/themes/` — **单一主题**：当前仅内置 `ops`（指挥台，`DEFAULT_UI_THEME` 常量指定并在清单中固定排首位）。`{id}.css` 整包样式 + `{id}.json` 清单（`id/name/author/desc/colors[]`）的注册机制保留：`GET /api/state` 返回 `themes` 与 `uiTheme`；`POST /api/ui/theme {theme}` 校验 id 后落盘。产品不提供主题选择界面（已随多主题一并移除），深浅色切换仍保留。
@@ -18,7 +20,17 @@
 
 ## 运行
 
-`python3 server.py` → 绑定 `127.0.0.1`，端口从 **9600** 起尝试，被占则 +1（最多 10 个）。启动后自动打开浏览器。`/favicon.ico` 返回统一品牌图标。双击 `总控台.app` 会先识别同目录的现有总控台，可直接打开或安全重启，不需要用户输入命令，也不会出现 Terminal 窗口。
+macOS：`python3 server.py` → 绑定 `127.0.0.1`，端口从 **9600** 起尝试，被占则 +1（最多 10 个）。启动后自动打开浏览器。`/favicon.ico` 返回统一品牌图标。双击 `总控台.app` 会先识别同目录的现有总控台，可直接打开或安全重启。
+Windows：`start.bat`（自动探测 Python ≥3.12 与 psutil，`pythonw server.py --log-to-file` 无窗口后台运行）；或手动 `python server.py`。数据目录 `%APPDATA%\总控台\config.json`（icons/ 为应用图标）、日志 `%LOCALAPPDATA%\总控台\console.log`（macOS 分别为 `~/Library/Application Support/总控台` 与 `~/Library/Logs/总控台`）。
+
+## 平台差异（Windows 移植的有意取舍）
+
+- **UID 校验失效**：Windows 无 uid，`SELF_UID` 恒 0——「只能操作当前用户进程」校验不生效，**仅限个人单用户电脑使用**。
+- **CPU 口径**：Windows 按「占全部逻辑核百分比」归一化，`/api/state` 带 `coreCount`；macOS 保持单核口径。
+- **优雅停止**：Windows 无 SIGTERM——先 WM_CLOSE 软通道（带窗口进程可清理），宽限后对无窗口服务硬杀。
+- **Shell 包装**：macOS 用 bash 双层包装；Windows 用 `cmd /c "echo <marker> & <command>"`，`service` 需前台命令，命令内**不要用单引号**（cmd 不识别）。
+- **快捷键提示**：前端 `MOD_KEY` 常量（macOS ⌘ / 其他 Ctrl）驱动提示文案；触发逻辑兼容 `metaKey || ctrlKey`。
+- 测试：macOS 专属语义用例（lsof 解析/bash 包装/chmod/symlink/发布检查）在 Windows 用 `IS_POSIX` 条件跳过；跨平台断言引用 `server.PYTHON_CMD`。
 
 ## API 契约（全部 JSON；icon 上传为原始字节）
 

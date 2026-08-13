@@ -46,6 +46,9 @@
 ### Fixed
 
 - 修复 Windows 单实例锁两处缺陷：①锁位置依赖 pid 字符串长度（先写 pid 再在其后锁 1 字节），两个实例 pid 位数不同时会锁到不同字节导致单实例失效、双实例并发写同一配置；现改为先锁固定字节 0 再写 pid。②未获锁的进程在 `write/flush` 阶段抛 `PermissionError` 且 `except` 内 `close()` 再次抛出导致崩溃；现优雅返回 None（打印"已在运行"），`close` 二次保护。并发三进程实测 1 持锁 + 2 优雅拒绝、释放后重取正常。
+- 修复 `shortHome` 只识别 macOS `/Users/` 路径的问题：Windows 的 `C:\Users\<name>` 现同样缩写为 `~`（目录显示不冗余）。
+- **测试套件 Windows 全绿**：165 项通过 + 26 项跳过（macOS 专属语义），0 失败。新增单实例锁回归测试（并发互斥+优雅拒绝+释放重取）；macOS 专属用例（lsof 解析/bash 包装/chmod 执行位/symlink/发布产物检查）按 `IS_POSIX` 条件跳过；跨平台断言引用 `PYTHON_CMD`；修复 `mock.patch.dict(os.environ)` 在 Windows 的环境块 32767 上限问题。
+- AGENTS.md 补齐 Windows 移植说明：sysops.py 跨平台层、start.bat/launcher_check.py、数据目录（`%APPDATA%`）、平台差异章节（UID 失效/CPU 口径/优雅停止/Shell 包装/快捷键提示/测试策略）。
 - 修复前端快捷键提示硬编码 macOS 符号（⌘K/⌘J/⌘V）的问题：新增平台检测常量 `MOD_KEY`（macOS 显示 ⌘、Windows/Linux 显示 Ctrl），命令面板触发器、日志中心快捷项、图标粘贴提示、小贴士与命令面板 hint 全部改为平台自适应渲染。快捷键逻辑本身已兼容两平台（`metaKey || ctrlKey`），本次仅修正提示文案。
 - 修复 `start.bat` 首个 Python 分支（固定路径 `python.exe` 且 psutil 可用）下 `%PY%` 从未赋值的问题：探测与菜单动作会以空前缀直接执行 `.py` 文件，Windows 按 `.py` 文件关联（ShellExecute）打开且输出重定向失效，实例探测误判为未运行（菜单永不出现），关联不完整时还会弹出"选择使用什么程序打开 .py"。现探测/打开/重启统一显式调用 `"%PYEXE%"`，启动改为直接调用 `"%PYW%"`（pythonw 为 GUI 子系统，cmd 不等待，无需 `start` 包装）。同步将该分支改为 goto 结构（不再使用括号块）。
 - 修复 Windows 下 `detect_project` 生成 macOS 命令名的问题（同下）之外：**restart helper 启动的新实例缺少 `--log-to-file`**，pythonw 无控制台场景下输出写入无效句柄，重启后实例日志不可见且无法诊断异常；新实例现带 `--log-to-file`，重启链路日志完整可查。

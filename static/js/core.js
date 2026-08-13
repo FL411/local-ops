@@ -54,7 +54,15 @@ export function applyModKeys() {
     n.textContent = MOD_KEY;
   });
 }
-export function shortHome(p) { return p ? p.replace(/^\/Users\/[^/]+/, '~') : ''; }
+export function shortHome(p) {
+  if (!p) return '';
+  /* macOS: /Users/name/... -> ~/... */
+  if (/^\/Users\/[^/]+/.test(p)) return p.replace(/^\/Users\/[^/]+/, '~');
+  /* Windows: C:\Users\name\... -> ~\... */
+  const m = p.match(/^([A-Za-z]:\\Users\\[^\\]+)/);
+  if (m) return '~' + p.slice(m[1].length);
+  return p;
+}
 export function truncateMiddle(s, max = 34) {
   if (!s) return '';
   if (s.length <= max) return s;
