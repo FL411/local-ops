@@ -10,18 +10,25 @@
 """
 import ctypes
 import ctypes.wintypes as wt
+import logging
 import os
 import struct
 import threading
 import zlib
 
+_log = logging.getLogger("tray")
+
 WM_APP = 0x8000
 WM_TRAY = WM_APP + 1          # 托盘回调消息（wParam=事件, lParam=命令）
 WM_TRAY_CMD = WM_APP + 2      # 主线程 → 托盘线程命令
+WM_NULL = 0x0000
 
-# 托盘回调事件
+# 托盘回调事件(V4 协议:右键点击发送 WM_CONTEXTMENU 而非 WM_RBUTTONUP)
 WM_LBUTTONUP = 0x0202
 WM_RBUTTONUP = 0x0205
+WM_CONTEXTMENU = 0x007B
+NOTIFYICON_VERSION_4 = 4
+NIM_SETVERSION = 4
 # 命令 ID（菜单与消息共用）
 CMD_OPEN = 1
 CMD_RESTART = 2
@@ -77,7 +84,7 @@ user32.AppendMenuW.restype = wt.BOOL
 user32.TrackPopupMenu.argtypes = [wt.HMENU, wt.UINT, ctypes.c_int,
                                   ctypes.c_int, ctypes.c_int, wt.HWND,
                                   ctypes.c_void_p]
-user32.TrackPopupMenu.restype = wt.BOOL
+user32.TrackPopupMenu.restype = ctypes.c_size_t
 user32.GetCursorPos.argtypes = [ctypes.c_void_p]
 user32.GetCursorPos.restype = wt.BOOL
 user32.SetForegroundWindow.argtypes = [wt.HWND]
@@ -325,6 +332,9 @@ class TrayIcon:
             if not shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(nid)):
                 self._ready.set()
                 return
+            # 明确 V4 协议:右键点击以 WM_CONTEXTMENU 回调(而非 WM_RBUTTONUP)
+            shell32.Shell_NotifyIconW(
+                NIM_SETVERSION, ctypes.byref(nid))
             self._nid = nid
             self._ready.set()
             self._message_loop()
@@ -368,18 +378,22 @@ class TrayIcon:
         return hwnd if hwnd else None
 
     def _wnd_proc(self, hwnd, msg, wparam, lparam):
-        if msg == WM_TRAY:
-            self._on_tray_event(lparam, wparam)
-            return 0
-        if msg == WM_TRAY_CMD:
-            self._on_command(wparam)
-            return 0
+        try:
+            if msg == WM_TRAY:
+                self._on_tray_event(lparam, wparam)
+                return 0
+            if msg == WM_TRAY_CMD:
+                self._on_command(wparam)
+                return 0
+        except Exception:  # noqa: BLE001 回调异常必须记录,否则被 ctypes 静默吞掉
+            _log.exception("tray window proc error msg=0x%X", msg)
         return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
 
     def _on_tray_event(self, event, _pos):
+        _log.debug("tray event: 0x%X", event)
         if event == WM_LBUTTONUP:
             self._safe(self._on_open)
-        elif event == WM_RBUTTONUP:
+        elif event in (WM_RBUTTONUP, WM_CONTEXTMENU):
             self._show_menu()
 
     def _show_menu(self):
@@ -397,6 +411,7 @@ class TrayIcon:
             pt.x, pt.y, 0, self._hwnd, None)
         user32.PostMessageW(self._hwnd, WM_NULL, 0, 0)
         user32.DestroyMenu(menu)
+        _log.debug("tray menu returned cmd=%s", cmd)
         if cmd:
             self._on_command(cmd)
 

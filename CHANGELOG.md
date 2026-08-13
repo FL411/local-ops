@@ -45,6 +45,7 @@
 
 ### Fixed
 
+- **托盘右键菜单修复**（两处）：①宿主窗口由 message-only 改为普通隐藏窗口（`TrackPopupMenu` 需要真实窗口作为宿主，message-only 无法显示菜单）；②`WM_NULL` 常量缺失导致菜单点击后 `NameError`（异常被 ctypes 回调机制静默吞掉，命令不执行）——已补常量并给窗口过程加异常日志（回调异常不再被吞）。右键事件同时兼容 V3（`WM_RBUTTONUP`）与 V4（`WM_CONTEXTMENU`）协议。
 - **系统托盘图标（Windows，纯 ctypes 零依赖）**：总控台运行时在系统托盘显示品牌图标，tooltip 显示「总控台 · 127.0.0.1:9600 · 运行中」；左键单击打开控制台，右键菜单提供「打开控制台 / 重启总控台 / 停止总控台 / 退出」。图标内嵌 PNG 解码（zlib 标准库）→ CreateIcon 生成 HICON，不依赖任何外部图标文件或第三方库；总控台停止时自动销毁（NIM_DELETE）。macOS 保持原有行为（无托盘，与上游一致）。
 - **设置中心数据/日志目录显示真实路径**：此前硬编码 macOS 路径 `~/Library/Application Support/总控台`，Windows 用户会看到错误路径。现 `/api/state` 新增 `dataDir`/`logsDir`（服务器实际路径，平台无关），设置中心动态填充。
 - **前端 fallback 命令平台化**（`overlays.js`）：旧后端兜底的 `fallbackScriptCommand` 此前硬编码 macOS 语义（python3/zsh/bash + 单引号）；现按 `IS_MAC` 分支——Windows 用 `python -- "path"`/powershell/bash + 双引号（cmd 不识别单引号），`.bat/.cmd` 直接执行。

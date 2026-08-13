@@ -1081,5 +1081,45 @@ class WindowsInstanceLockTests(unittest.TestCase):
             self.assertEqual(rc2, 0)
 
 
+@unittest.skipUnless(server.sysops.IS_WINDOWS,
+                     "Windows 专属:系统托盘(纯 ctypes)")
+class WindowsTrayTests(unittest.TestCase):
+    """回归:托盘常量/命令回调/宿主窗口(右键菜单依赖真实窗口)。"""
+
+    @unittest.skipUnless(server.sysops.IS_WINDOWS
+                         and server._tray_mod is not None,
+                         "需要 tray 模块")
+    def test_wm_null_constant_is_defined(self):
+        """曾缺 WM_NULL 常量导致菜单点击后 NameError(命令不执行)。"""
+        self.assertEqual(server._tray_mod.WM_NULL, 0)
+
+    @unittest.skipUnless(server.sysops.IS_WINDOWS
+                         and server._tray_mod is not None,
+                         "需要 tray 模块")
+    def test_menu_command_callbacks_fire(self):
+        t = server._tray_mod.TrayIcon(
+            "test", lambda: None, lambda: None, lambda: None, None)
+        calls = []
+        t = server._tray_mod.TrayIcon(
+            "test", lambda: calls.append("open"),
+            lambda: calls.append("restart"),
+            lambda: calls.append("stop"), None)
+        t._on_command(server._tray_mod.CMD_OPEN)
+        t._on_command(server._tray_mod.CMD_RESTART)
+        t._on_command(server._tray_mod.CMD_STOP)
+        self.assertEqual(calls, ["open", "restart", "stop"])
+
+    @unittest.skipUnless(server.sysops.IS_WINDOWS
+                         and server._tray_mod is not None,
+                         "需要 tray 模块")
+    def test_hidden_window_is_created(self):
+        """宿主必须是普通窗口(非 message-only),TrackPopupMenu 才能弹菜单。"""
+        t = server._tray_mod.TrayIcon("t", None, None, None, None)
+        hwnd = t._create_hidden_window()
+        self.assertIsNotNone(hwnd, "隐藏窗口创建失败")
+        if hwnd:
+            server._tray_mod.user32.DestroyWindow(hwnd)
+
+
 if __name__ == "__main__":
     unittest.main()
