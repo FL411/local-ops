@@ -68,6 +68,8 @@ user32.CreateWindowExW.argtypes = [
 user32.CreateWindowExW.restype = wt.HWND
 user32.DestroyWindow.argtypes = [wt.HWND]
 user32.DestroyWindow.restype = wt.BOOL
+user32.ShowWindow.argtypes = [wt.HWND, ctypes.c_int]
+user32.ShowWindow.restype = wt.BOOL
 user32.CreatePopupMenu.argtypes = []
 user32.CreatePopupMenu.restype = wt.HMENU
 user32.AppendMenuW.argtypes = [wt.HMENU, wt.UINT, ctypes.c_size_t, wt.LPCWSTR]
@@ -308,7 +310,7 @@ class TrayIcon:
     def _run(self):
         try:
             self._icon = self._create_hicon()
-            self._hwnd = self._create_message_window()
+            self._hwnd = self._create_hidden_window()
             if not self._hwnd or not self._icon:
                 self._ready.set()
                 return
@@ -342,7 +344,13 @@ class TrayIcon:
                 return icon
         return None
 
-    def _create_message_window(self):
+    def _create_hidden_window(self):
+        """创建普通隐藏窗口（非 message-only）。
+
+        托盘图标回调消息发给本窗口；TrackPopupMenu 需要真实窗口作为宿主，
+        message-only 窗口（HWND_MESSAGE）无法正常显示右键菜单。
+        窗口创建后不 ShowWindow，保持不可见、不占任务栏。
+        """
         wc = WNDCLASSW()
         self._wndproc_ref = WNDPROC(self._wnd_proc)  # 防 GC 回收回调
         wc.lpfnWndProc = ctypes.cast(self._wndproc_ref, ctypes.c_void_p)
@@ -353,7 +361,10 @@ class TrayIcon:
             return None
         hwnd = user32.CreateWindowExW(
             0, wc.lpszClassName, "LocalOpsTray", 0, 0, 0, 0, 0,
-            wt.HWND(-3), None, wc.hInstance, None)
+            None, None, wc.hInstance, None)
+        if hwnd:
+            # 确认不可见（防御性：创建后默认不显示，但显式隐藏更稳）
+            user32.ShowWindow(hwnd, 0)
         return hwnd if hwnd else None
 
     def _wnd_proc(self, hwnd, msg, wparam, lparam):
