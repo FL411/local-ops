@@ -117,15 +117,23 @@ def acquire_lock(path):
             lock_file.close()
             raise
         return lock_file
-    # Windows: msvcrt.locking 一次锁 1 字节
+    # Windows: msvcrt.locking 一次锁 1 字节。
+    # 先锁字节 0（固定位置）再写 pid：锁位置与 pid 字符串长度无关，
+    # 避免不同位数 pid 的实例锁到不同字节导致单实例失效。
+    # 未获锁的进程会在此抛 PermissionError，必须优雅返回 None；
+    # close 也可能因文件仍被锁定而抛错，需要二次保护。
     import msvcrt
     try:
         lock_file.seek(0)
+        msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+        lock_file.seek(0)
         lock_file.write("%d\n" % os.getpid())
         lock_file.flush()
-        msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
     except OSError:
-        lock_file.close()
+        try:
+            lock_file.close()
+        except OSError:
+            pass
         return None
     return lock_file
 
@@ -145,7 +153,10 @@ def release_lock(lock_file):
             except OSError:
                 pass
     finally:
-        lock_file.close()
+        try:
+            lock_file.close()
+        except OSError:
+            pass
 
 
 # ------------------------------------------------------------------ 进程基础
