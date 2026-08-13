@@ -1097,8 +1097,6 @@ class WindowsTrayTests(unittest.TestCase):
                          and server._tray_mod is not None,
                          "需要 tray 模块")
     def test_menu_command_callbacks_fire(self):
-        t = server._tray_mod.TrayIcon(
-            "test", lambda: None, lambda: None, lambda: None, None)
         calls = []
         t = server._tray_mod.TrayIcon(
             "test", lambda: calls.append("open"),
