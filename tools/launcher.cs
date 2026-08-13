@@ -11,7 +11,7 @@ using System.Windows.Forms;
 
 public static class Launcher
 {
-    public static int Main()
+    public static int Main(string[] args)
     {
         string root = AppDomain.CurrentDomain.BaseDirectory;
         if (!File.Exists(Path.Combine(root, "server.py")))
@@ -19,6 +19,15 @@ public static class Launcher
             MessageBox.Show("LocalOpsConsole.exe must run from the project root.",
                             "LocalOps Console", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             return 1;
+        }
+        // 参数透传:支持 --no-browser(静默启动,不自动打开浏览器)等 server 参数。
+        string extra = "";
+        foreach (string a in args)
+        {
+            if (a == "--no-browser" || a.StartsWith("--preferred-port="))
+            {
+                extra += " " + a;
+            }
         }
         string pyexe = ProbePython();
         if (string.IsNullOrEmpty(pyexe) || !File.Exists(pyexe))
@@ -31,7 +40,7 @@ public static class Launcher
         if (!File.Exists(pythonw)) pythonw = pyexe;
         Process p = new Process();
         p.StartInfo.FileName = pythonw;
-        p.StartInfo.Arguments = "server.py --log-to-file";
+        p.StartInfo.Arguments = "server.py --log-to-file" + extra;
         p.StartInfo.WorkingDirectory = root;
         p.StartInfo.UseShellExecute = false;
         p.Start();
