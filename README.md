@@ -80,8 +80,7 @@
 
 | 方式 | 操作 | 适用场景 |
 | --- | --- | --- |
-| **exe 启动器** | 双击 `tools\build_launcher.bat` 编译一次，生成 `LocalOpsConsole.exe`；之后双击 exe 启动 | **最推荐**。无窗口、无命令行、双击即用（同 macOS `.app`） |
-| 桌面快捷方式 | 双击 `tools\create_shortcut.vbs` 生成「总控台」快捷方式（带品牌图标） | 备用（生成后双击快捷方式） |
+| **exe 启动器** | 双击 `LocalOpsConsole.exe`（项目根已附带；重新编译见 `tools\build_launcher.bat`） | **推荐**。无窗口、无命令行、双击即用（同 macOS `.app`） |
 | 双击脚本 | 双击 `start.bat` | 备用。已运行时直接打开浏览器 |
 | 命令行 | `python server.py` | 调试、脚本化（前台运行，Ctrl+C 停止） |
 

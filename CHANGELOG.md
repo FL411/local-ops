@@ -77,6 +77,7 @@
 
 ### Removed
 
+- 移除已废弃的 vbs 快捷方式启动方案（`tools/create_shortcut.vbs`）：被 `LocalOpsConsole.exe` 启动器取代（体验更优、无 vbs 运行限制），Windows 启动方式收敛为「exe 启动器（推荐）/ start.bat / 命令行」三层。
 - 移除已被统一品牌图、Candy 新插画和系统字体栈替代的旧 Logo、旧插画及两份中文字体文件。
 - 移除 Apollo/Candy/8-Bit 三套 UI 主题与主题选择面板、命令面板主题切换项及 Candy 专用 hero 卡；产品收敛为单一「Ops 指挥台」主题，旧的 `uiTheme` 偏好自动回退到 ops。
 - 随主题移除不再使用的 Apollo 程序化纹理（deck/metal-brush 系列）、Candy 启动台插画与 `tools/gen_textures.py`；`ASSET_PROVENANCE.md` 与 `THIRD_PARTY_NOTICES.md` 同步核销。
