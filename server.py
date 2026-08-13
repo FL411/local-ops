@@ -4126,8 +4126,9 @@ def _run_console(preferred_port=None, open_browser=True):
 
     print("总控台已启动: http://%s:%d/  (Ctrl+C 停止)" % (HOST, port), flush=True)
     warm_state_cache(cfg, port)
-    # CLI(--no-browser)与设置中心(openBrowser)任一关闭则不自动打开浏览器
-    if open_browser and cfg.get("openBrowser", True):
+    # CLI(--no-browser)与设置中心(openBrowser)任一关闭则不自动打开浏览器。
+    # Config 无 .get()，经 snapshot() 读取（启动时单次调用，开销可忽略）。
+    if open_browser and cfg.snapshot().get("openBrowser", True):
         open_browser_later(port)
     tray_icon = None
     if sysops.IS_WINDOWS and _tray_mod is not None:

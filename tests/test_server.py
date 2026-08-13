@@ -1224,5 +1224,48 @@ class ThemeTests(unittest.TestCase):
             self.assertIsInstance(snap["apps"], list)
 
 
+class ConsoleStartupTests(unittest.TestCase):
+    """_run_console 启动路径回归。
+
+    曾因 Config 无 .get() 方法，open_browser=True 时 AttributeError 崩溃；
+    此前隔离实例测试全部带 --no-browser（短路），此路径从未被执行。
+    """
+
+    def _run_console(self, open_browser, config_open_browser=None):
+        with tempfile.TemporaryDirectory() as td:
+            cfg_path = os.path.join(td, "config.json")
+            if config_open_browser is not None:
+                cfg = server.Config(cfg_path)
+                cfg.update(
+                    lambda d: d.__setitem__("openBrowser", config_open_browser))
+            fake_server = mock.Mock()
+            with mock.patch.object(server, "CONFIG_PATH", cfg_path), \
+                    mock.patch.object(server, "DATA_DIR", td), \
+                    mock.patch.object(server, "ICONS_DIR",
+                                      os.path.join(td, "icons")), \
+                    mock.patch.object(server, "LOGS_DIR", td), \
+                    mock.patch.object(server, "PORT_START", 29600), \
+                    mock.patch.object(server, "_tray_mod", None), \
+                    mock.patch.object(server, "ConsoleServer",
+                                      lambda *a, **k: fake_server), \
+                    mock.patch.object(server, "warm_state_cache"), \
+                    mock.patch.object(server, "start_log_maintenance"), \
+                    mock.patch.object(server, "open_browser_later") as obl:
+                server._run_console(preferred_port=29600,
+                                    open_browser=open_browser)
+                return obl.call_count
+
+    def test_default_config_opens_browser(self):
+        self.assertEqual(self._run_console(open_browser=True), 1)
+
+    def test_setting_off_suppresses_browser(self):
+        self.assertEqual(
+            self._run_console(open_browser=True, config_open_browser=False), 0)
+
+    def test_cli_no_browser_suppresses_even_if_config_on(self):
+        self.assertEqual(
+            self._run_console(open_browser=False, config_open_browser=True), 0)
+
+
 if __name__ == "__main__":
     unittest.main()
