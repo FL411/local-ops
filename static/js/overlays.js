@@ -4,7 +4,7 @@
    ============================================================ */
 import { $, el, setText, setChildren, icon, escapeHtml,
   post, put, del, act, toast, openLayer, closeLayer,
-  GLYPHS, findApp, bumpMutationEpoch } from './core.js';
+  GLYPHS, findApp, bumpMutationEpoch, IS_MAC } from './core.js';
 
 /* ---------------- DOM 引用 ---------------- */
 const appModalMask = $('#appModalMask'), appModal = $('#appModal'), appModalTitle = $('#appModalTitle');
@@ -41,11 +41,20 @@ function shellQuotePath(path) {
   return "'" + String(path).replace(/'/g, "'\"'\"'") + "'";
 }
 function fallbackScriptCommand(path) {
-  const quoted = shellQuotePath(path);
-  const suffix = (String(path).match(/(\.[^./]+)$/) || [])[1]?.toLowerCase();
-  if (suffix === '.py') return 'python3 -- ' + quoted;
-  if (suffix === '.zsh') return '/bin/zsh -- ' + quoted;
-  return '/bin/bash -- ' + quoted;
+  const suffix = (String(path).match(/(\.[^./\\]+)$/) || [])[1]?.toLowerCase();
+  if (IS_MAC) {
+    const quoted = shellQuotePath(path);
+    if (suffix === '.py') return 'python3 -- ' + quoted;
+    if (suffix === '.zsh') return '/bin/zsh -- ' + quoted;
+    return '/bin/bash -- ' + quoted;
+  }
+  /* Windows:cmd 不识别单引号,用双引号;.bat/.cmd 直接执行。 */
+  const quoted = '"' + String(path).replace(/"/g, '\\"') + '"';
+  if (suffix === '.py') return 'python -- ' + quoted;
+  if (suffix === '.ps1') return 'powershell -NoProfile -ExecutionPolicy Bypass -File ' + quoted;
+  if (suffix === '.bat' || suffix === '.cmd') return quoted;
+  if (suffix === '.sh' || suffix === '.bash') return 'bash -- ' + quoted;
+  return quoted;
 }
 
 /* ============================================================
@@ -565,10 +574,11 @@ export function initAppModal({ onAddService, onAddTask }) {
       if (!r || r.canceled || !r.path) return;  // 取消或失败均静默
       const p = r.path;
       fCmd.value = r.command || fallbackScriptCommand(p);
-      const dir = p.slice(0, p.lastIndexOf('/'));
+      const lastSep = Math.max(p.lastIndexOf('/'), p.lastIndexOf('\\'));
+      const dir = lastSep >= 0 ? p.slice(0, lastSep) : '';
       if (dir && !fCwd.value.trim()) fCwd.value = dir;
       if (!fName.value.trim()) {
-        const base = p.split('/').pop().replace(/\.(command|sh|bash|zsh|py)$/i, '');
+        const base = p.split(/[\\/]/).pop().replace(/\.(command|sh|bash|zsh|py)$/i, '');
         if (base) fName.value = base;
       }
       fCmd.classList.remove('invalid');

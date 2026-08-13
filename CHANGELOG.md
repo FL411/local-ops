@@ -45,6 +45,10 @@
 
 ### Fixed
 
+- **设置中心数据/日志目录显示真实路径**：此前硬编码 macOS 路径 `~/Library/Application Support/总控台`，Windows 用户会看到错误路径。现 `/api/state` 新增 `dataDir`/`logsDir`（服务器实际路径，平台无关），设置中心动态填充。
+- **前端 fallback 命令平台化**（`overlays.js`）：旧后端兜底的 `fallbackScriptCommand` 此前硬编码 macOS 语义（python3/zsh/bash + 单引号）；现按 `IS_MAC` 分支——Windows 用 `python -- "path"`/powershell/bash + 双引号（cmd 不识别单引号），`.bat/.cmd` 直接执行。
+- **Windows 路径分割修复**：`p.lastIndexOf('/')`/`p.split('/')` 对反斜杠路径失效（目录与文件名提取错误），改为同时识别 `\` 与 `/`。
+- 新增 `core.js` `IS_MAC` 常量（`MOD_KEY` 基于它），供前端各平台分支复用。
 - 修复 Windows 单实例锁两处缺陷：①锁位置依赖 pid 字符串长度（先写 pid 再在其后锁 1 字节），两个实例 pid 位数不同时会锁到不同字节导致单实例失效、双实例并发写同一配置；现改为先锁固定字节 0 再写 pid。②未获锁的进程在 `write/flush` 阶段抛 `PermissionError` 且 `except` 内 `close()` 再次抛出导致崩溃；现优雅返回 None（打印"已在运行"），`close` 二次保护。并发三进程实测 1 持锁 + 2 优雅拒绝、释放后重取正常。
 - 修复 `shortHome` 只识别 macOS `/Users/` 路径的问题：Windows 的 `C:\Users\<name>` 现同样缩写为 `~`（目录显示不冗余）。
 - **测试套件 Windows 全绿**：165 项通过 + 26 项跳过（macOS 专属语义），0 失败。新增单实例锁回归测试（并发互斥+优雅拒绝+释放重取）；macOS 专属用例（lsof 解析/bash 包装/chmod 执行位/symlink/发布产物检查）按 `IS_POSIX` 条件跳过；跨平台断言引用 `PYTHON_CMD`；修复 `mock.patch.dict(os.environ)` 在 Windows 的环境块 32767 上限问题。

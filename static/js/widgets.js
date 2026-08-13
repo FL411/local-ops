@@ -424,6 +424,8 @@ function syncSettings() {
   setText($('#setVersion'), d.version ? 'v' + d.version : '—');
   setText($('#setPort'), d.consolePort ? ':' + d.consolePort : '—');
   setText($('#setCwd'), d.consoleCwd || '—');
+  setText($('#setDataDir'), d.dataDir || '—');
+  setText($('#setLogsDir'), d.logsDir || '—');
 }
 
 export function openSettingsCenter() {

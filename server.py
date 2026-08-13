@@ -1298,6 +1298,8 @@ def build_state(cfg, console_port, config_health=None):
         "consolePort": console_port,
         "consolePid": SELF_PID,
         "consoleCwd": BASE_DIR,
+        "dataDir": DATA_DIR,
+        "logsDir": LOGS_DIR,
         "version": APP_VERSION,
         "schemaVersion": cfg.get("schemaVersion", CURRENT_SCHEMA_VERSION),
         "degraded": bool(degraded_reasons),
