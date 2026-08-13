@@ -32,6 +32,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import sysops
 
+# Windows 系统托盘（纯 ctypes，零依赖）；非 Windows 平台跳过。
+try:
+    import tray as _tray_mod
+except ImportError:
+    _tray_mod = None
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 VERSION_PATH = os.path.join(BASE_DIR, "VERSION")
 LEGACY_DATA_DIR = os.path.join(BASE_DIR, "data")
@@ -55,6 +61,16 @@ def resolve_runtime_dir(name, default):
     if path in forbidden:
         raise RuntimeError("%s 必须指向专用子目录" % name)
     return path, True
+
+
+_TRAY_PNG = None
+if _tray_mod is not None:
+    try:
+        with open(os.path.join(BASE_DIR, "static", "assets",
+                               "favicon-32.png"), "rb") as _f:
+            _TRAY_PNG = _f.read()
+    except (OSError, IOError):
+        _TRAY_PNG = None
 
 
 DATA_DIR, DATA_DIR_OVERRIDDEN = resolve_runtime_dir(
@@ -4090,11 +4106,23 @@ def _run_console(preferred_port=None, open_browser=True):
     warm_state_cache(cfg, port)
     if open_browser:
         open_browser_later(port)
+    tray_icon = None
+    if sysops.IS_WINDOWS and _tray_mod is not None:
+        url = "http://%s:%d/" % (HOST, port)
+        tray_icon = _tray_mod.TrayIcon(
+            "总控台 · %s:%d · 运行中" % (HOST, port),
+            lambda: webbrowser.open(url),
+            lambda: schedule_console_restart(server, port),
+            lambda: schedule_console_stop(server),
+            _TRAY_PNG)
+        tray_icon.start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
+        if tray_icon is not None:
+            tray_icon.stop()
         server.server_close()
         print("已停止", flush=True)
 
