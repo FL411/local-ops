@@ -97,32 +97,8 @@ if not defined LSTATUS set "LSTATUS=STOPPED"
 if "%LSTATUS%"=="STOPPED" goto :launch
 for /f "tokens=2" %%p in ("%LSTATUS%") do set "LPORT=%%p"
 if not defined LPORT goto :launch
-
-:menu
-echo.
-echo local-ops is already running on port %LPORT%.
-echo.
-echo   1. Open console
-echo   2. Restart console
-echo   3. Cancel
-echo.
-set "LCHOICE="
-set /p "LCHOICE=Select [1/2/3]: "
-if "%LCHOICE%"=="1" goto :open
-if "%LCHOICE%"=="2" goto :restart
-if "%LCHOICE%"=="3" goto :end
-goto :menu
-
-:open
+REM Already running: open browser directly (tray owns open/restart/stop)
 "%PYEXE%" "%~dp0launcher_check.py" open %LPORT%
-goto :end
-
-:restart
-"%PYEXE%" "%~dp0launcher_check.py" restart %LPORT%
-echo Console is restarting. A browser window will open shortly.
-goto :end
-
-:end
 exit /b 0
 
 :launch
