@@ -11,13 +11,13 @@ if not exist "%CSC%" (
   exit /b 1
 )
 
-"%CSC%" /nologo /target:winexe /out:"..\LocalOpsConsole.exe" /r:System.Windows.Forms.dll launcher.cs
+"%CSC%" /nologo /target:winexe /out:"..\LocalOpsConsole.exe" /win32icon:"..\console.ico" /r:System.Windows.Forms.dll launcher.cs
 if errorlevel 1 (
   echo [ERROR] Compile failed.
   pause
   exit /b 1
 )
 
-echo OK: LocalOpsConsole.exe created in project root.
+echo OK: LocalOpsConsole.exe created in project root (with icon).
 echo Double-click it to start the console without a window.
 pause
