@@ -103,6 +103,13 @@ GitHub `laogou717/local-ops`(中文名"总控台")的 **macOS → Windows 移植
 - [~] 原 2687 行 macOS 测试套件 Windows 适配(评估完成:163 项中 130 过 + 1 跳过,33 项失败/错误均为 macOS 平台断言,**长期维护项**;已同步 PYTHON_CMD 相关断言)
 - [x] `__pycache__` 清理后注意:运行服务会重新生成(正常,别慌)
 
+### P3(潜在增强,等上游 Issue 方向确认后再评估)
+- [ ] **开机自启 + 托管服务自动启动**(2026-08-13 用户需求,已暂缓):两层——
+  ①总控台开机自启(启动文件夹放 LocalOpsConsole.exe 快捷方式或 schtasks);
+  ②config.json app 加 `autostart` 字段 + server 启动后自动拉起(仅 service,
+  需 schemaVersion 迁移,失败记日志不阻塞)。决策:原版无此功能,先对齐,
+  待上游 Issue 回应(是否接受 Windows 方向)后再决定是否作为 Windows 专属增强。
+
 ## 7. 环境备忘
 
 - 开发/验证:managed venv `C:\Users\Zhou\.workbuddy\binaries\python\envs\default`(Python 3.13.12,已装 psutil)
