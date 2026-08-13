@@ -273,7 +273,7 @@ a.icon-btn { text-decoration: none; }
   padding-top: 6px;
 }
 
-/* ⌘K 触发器 */
+/* 命令面板触发器 */
 .cmdk-trigger {
   display: flex; align-items: center; gap: 9px;
   width: 300px; height: 38px; padding: 0 10px 0 14px;

@@ -45,6 +45,15 @@ export function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c =>
     ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
+/* 快捷键修饰键的平台显示：macOS 用 ⌘，其余（Windows/Linux）用 Ctrl。
+   快捷键逻辑统一接受 metaKey/ctrlKey 两者，这里只负责"提示文案"正确。 */
+export const MOD_KEY = /Mac|iPhone|iPad|iPod/i.test(
+  navigator.platform || navigator.userAgent) ? '⌘' : 'Ctrl';
+export function applyModKeys() {
+  document.querySelectorAll('[data-mod-key]').forEach(n => {
+    n.textContent = MOD_KEY;
+  });
+}
 export function shortHome(p) { return p ? p.replace(/^\/Users\/[^/]+/, '~') : ''; }
 export function truncateMiddle(s, max = 34) {
   if (!s) return '';

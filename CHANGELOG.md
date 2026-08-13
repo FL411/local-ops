@@ -45,6 +45,7 @@
 
 ### Fixed
 
+- 修复前端快捷键提示硬编码 macOS 符号（⌘K/⌘J/⌘V）的问题：新增平台检测常量 `MOD_KEY`（macOS 显示 ⌘、Windows/Linux 显示 Ctrl），命令面板触发器、日志中心快捷项、图标粘贴提示、小贴士与命令面板 hint 全部改为平台自适应渲染。快捷键逻辑本身已兼容两平台（`metaKey || ctrlKey`），本次仅修正提示文案。
 - 修复 `start.bat` 首个 Python 分支（固定路径 `python.exe` 且 psutil 可用）下 `%PY%` 从未赋值的问题：探测与菜单动作会以空前缀直接执行 `.py` 文件，Windows 按 `.py` 文件关联（ShellExecute）打开且输出重定向失效，实例探测误判为未运行（菜单永不出现），关联不完整时还会弹出"选择使用什么程序打开 .py"。现探测/打开/重启统一显式调用 `"%PYEXE%"`，启动改为直接调用 `"%PYW%"`（pythonw 为 GUI 子系统，cmd 不等待，无需 `start` 包装）。同步将该分支改为 goto 结构（不再使用括号块）。
 - 修复 Windows 下 `detect_project` 生成 macOS 命令名的问题（同下）之外：**restart helper 启动的新实例缺少 `--log-to-file`**，pythonw 无控制台场景下输出写入无效句柄，重启后实例日志不可见且无法诊断异常；新实例现带 `--log-to-file`，重启链路日志完整可查。
 - 修复 Windows 下项目识别（`detect_project`）生成 macOS 命令名的问题：Django/FastAPI/Flask/Streamlit 与静态站点兜底的 Python 启动候选现按平台使用 `python`（Windows）/ `python3`（macOS）；模块缺失诊断中的虚拟环境建议同步平台化（Windows 使用 `.venv\Scripts\pip`）。对应测试改为引用 `PYTHON_CMD` 常量跨平台断言。

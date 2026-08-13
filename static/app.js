@@ -8,7 +8,7 @@ import { $, el, setText, setChildren, icon, escapeHtml,
   currentUiTheme, reconcilePendingUiTheme, trapLayerFocus,
   openLayer, closeLayer, activeLayer,
   currentMutationEpoch, taskNotificationsEnabled, toggleTaskNotifications,
-  localServiceUrl } from './js/core.js';
+  localServiceUrl, MOD_KEY, applyModKeys } from './js/core.js';
 import { renderLaunchpad, toggleApp, closePortDiagnostic, closeAppDiagnosis } from './js/launchpad.js';
 import { renderServices, observePortDiscovery,
   suspendPortDiscovery } from './js/services.js';
@@ -358,7 +358,7 @@ stopConsoleBtn.addEventListener('click', () => {
 });
 
 /* ============================================================
-   命令面板（⌘K）
+   命令面板（Ctrl/⌘ + K）
    ============================================================ */
 const paletteMask = $('#paletteMask'), paletteInput = $('#paletteInput');
 const paletteList = $('#paletteList');
@@ -435,7 +435,7 @@ function paletteActions() {
   items.push({
     icon: 'file-text',
     title: '打开日志中心',
-    hint: '日志 · ⌘J',
+    hint: '日志 · ' + MOD_KEY + 'J',
     run: openLogsCenter,
   });
   items.push({
@@ -560,7 +560,7 @@ paletteInput.addEventListener('keydown', e => {
 });
 paletteMask.addEventListener('mousedown', e => { if (e.target === paletteMask) closePalette(); });
 
-/* ⌘K / Ctrl+K 呼出命令面板 */
+/* Ctrl/⌘ + K 呼出命令面板 */
 document.addEventListener('keydown', e => {
   if ((e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === 'k') {
     e.preventDefault();
@@ -568,7 +568,7 @@ document.addEventListener('keydown', e => {
     else if (!activeLayer()) openPalette();
   }
 });
-/* ⌘J / Ctrl+J 呼出日志中心（⌘L 是浏览器地址栏保留键，无法拦截） */
+/* Ctrl/⌘ + J 呼出日志中心（Ctrl/⌘ + L 是浏览器地址栏保留键，无法拦截） */
 document.addEventListener('keydown', e => {
   if ((e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === 'j') {
     e.preventDefault();
@@ -606,6 +606,7 @@ setChildren($('#railIconSvc'), icon('activity', 19));
 setChildren($('#cmdkIcon'), icon('search', 14));
 setChildren($('#paletteIcon'), icon('search', 15));
 buildGlyphGrid();
+applyModKeys();
 initAppModal({ onAddService: $('#addSvcCard'), onAddTask: $('#addTaskCard') });
 initLogDrawer();
 initThemeToggle();
