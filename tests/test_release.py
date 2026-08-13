@@ -1,6 +1,7 @@
 import os
 from pathlib import Path
 import stat
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -10,6 +11,8 @@ from tools import build_release as release
 from tools import check_project as project_check
 
 
+@unittest.skipIf(sys.platform == "win32",
+                 "发布产物检查(macOS 路径/签名/归档)为 macOS 发布工作流")
 class ReleaseFixtureTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()

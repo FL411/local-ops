@@ -1028,5 +1028,58 @@ class WindowsProcessSnapshotTests(unittest.TestCase):
                 self.assertEqual(f.read(), "ok")
 
 
+@unittest.skipUnless(server.sysops.IS_WINDOWS,
+                     "Windows 专属:msvcrt 单实例锁")
+class WindowsInstanceLockTests(unittest.TestCase):
+    """回归:单实例锁必须跨进程互斥,未获锁进程优雅返回而非崩溃。
+
+    历史缺陷:锁位置依赖 pid 字符串长度(位数不同可双实例并存并发写配置);
+    并发抢锁时未获锁进程在 write/flush 抛 PermissionError 崩溃。
+    """
+
+    PROJECT_ROOT = os.path.dirname(os.path.dirname(server.__file__))
+    LOCK_PROBE = (
+        "import sys, time\n"
+        "sys.path.insert(0, %r)\n"
+        "import sysops\n"
+        "lock = sysops.acquire_lock(sys.argv[1])\n"
+        "print('LOCKED' if lock else 'DENIED', flush=True)\n"
+        "if lock:\n"
+        "    time.sleep(1.5)\n"
+        "    sysops.release_lock(lock)\n"
+    ) % PROJECT_ROOT
+
+    def _run_probe(self, lock_path, wait=False):
+        proc = subprocess.Popen(
+            [sys.executable, "-c", self.LOCK_PROBE, lock_path],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        if not wait:
+            return proc
+        out, _ = proc.communicate(timeout=20)
+        return out.strip(), proc.returncode
+
+    def test_concurrent_acquire_is_mutually_exclusive_and_graceful(self):
+        """并发 3 进程:恰 1 个持锁、其余优雅拒绝,无崩溃。"""
+        with tempfile.TemporaryDirectory() as td:
+            lock_path = os.path.join(td, "instance.lock")
+            procs = [self._run_probe(lock_path) for _ in range(3)]
+            outs = [p.communicate(timeout=20)[0].strip() for p in procs]
+            locked = sum(1 for o in outs if o == "LOCKED")
+            denied = sum(1 for o in outs if o == "DENIED")
+            self.assertEqual(locked, 1, "应恰好一个实例持锁: %s" % outs)
+            self.assertEqual(denied, 2, "其余实例应优雅拒绝: %s" % outs)
+
+    def test_reacquire_after_release_succeeds(self):
+        """释放后可重新获取(串行场景不误伤)。"""
+        with tempfile.TemporaryDirectory() as td:
+            lock_path = os.path.join(td, "instance.lock")
+            first, rc1 = self._run_probe(lock_path, wait=True)
+            self.assertEqual(first, "LOCKED")
+            self.assertEqual(rc1, 0)
+            second, rc2 = self._run_probe(lock_path, wait=True)
+            self.assertEqual(second, "LOCKED")
+            self.assertEqual(rc2, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

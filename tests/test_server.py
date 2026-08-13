@@ -12,6 +12,10 @@ from unittest import mock
 
 import server
 
+# Windows 移植:macOS 专属语义(lsof 解析/bash 包装/chmod 执行位/posix 路径)
+# 的用例在 Windows 跳过;跨平台逻辑用 server.PYTHON_CMD 条件化断言。
+IS_POSIX = server.sysops.IS_POSIX
+
 
 class ParsingTests(unittest.TestCase):
     def test_parse_etime(self):
@@ -26,6 +30,7 @@ class ParsingTests(unittest.TestCase):
         self.assertIsNotNone(server.validate_port(True)[1])
         self.assertIsNotNone(server.validate_port(70000)[1])
 
+    @unittest.skipUnless(IS_POSIX, "lsof 输出解析为 macOS 专属逻辑")
     def test_listener_scan_preserves_ipv6_loopback_for_open_links(self):
         output = """COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME
 node 101 user 1u IPv6 0x0 0t0 TCP [::1]:5173 (LISTEN)
@@ -34,7 +39,6 @@ node 303 user 3u IPv6 0x0 0t0 TCP *:3000 (LISTEN)
 """
         with mock.patch.object(server, "run_cmd", return_value=output):
             listeners = server.scan_listeners()
-
         self.assertEqual(listeners[(101, 5173)], {"::1"})
         self.assertEqual(
             server.listener_open_host(listeners, 5173, {101}), "localhost")
@@ -127,6 +131,8 @@ class OriginAttributionTests(unittest.TestCase):
         self.assertEqual(origin, {"label": "Claude Code", "icon": "bot"})
 
 
+@unittest.skipUnless(IS_POSIX,
+                     "bash/zsh 包装与 chmod 执行位为 macOS 语义")
 class ScriptCommandTests(unittest.TestCase):
     def test_script_extensions_choose_the_expected_runtime_and_quote_paths(self):
         cases = {
@@ -165,6 +171,7 @@ class ScriptCommandTests(unittest.TestCase):
 
 
 class AppHealthTests(unittest.TestCase):
+    @unittest.skipUnless(IS_POSIX, "脚本执行位/shebang 语义为 macOS 专属")
     def test_python_script_with_spaces_is_checked_without_running_it(self):
         with tempfile.TemporaryDirectory() as td:
             path = os.path.join(td, "daily task.py")
@@ -180,6 +187,7 @@ class AppHealthTests(unittest.TestCase):
         self.assertEqual(health["issues"][0]["kind"], "script-missing")
         self.assertEqual(health["issues"][0]["action"], "pick-script")
 
+    @unittest.skipUnless(IS_POSIX, "/bin/bash 包装为 macOS 语义")
     def test_relative_script_uses_configured_working_directory(self):
         with tempfile.TemporaryDirectory() as td:
             path = os.path.join(td, "job.sh")
@@ -188,6 +196,7 @@ class AppHealthTests(unittest.TestCase):
             app = {"command": "/bin/bash -- job.sh", "cwd": td}
             self.assertFalse(server.inspect_app_health(app)["blocking"])
 
+    @unittest.skipUnless(IS_POSIX, "/bin/bash 包装为 macOS 语义")
     def test_missing_cwd_does_not_cascade_for_relative_script(self):
         with tempfile.TemporaryDirectory() as td:
             missing = os.path.join(td, "gone")
@@ -206,7 +215,8 @@ class AppHealthTests(unittest.TestCase):
                 self.assertFalse(health["blocking"])
 
     def test_python_module_and_inline_code_are_not_treated_as_files(self):
-        for command in ("python3 -m http.server", "python3 -c 'print(1)'"):
+        for command in (server.PYTHON_CMD + " -m http.server",
+                        server.PYTHON_CMD + " -c 'print(1)'"):
             with self.subTest(command=command):
                 health = server.inspect_app_health(
                     {"command": command, "cwd": None})
@@ -218,6 +228,7 @@ class AppHealthTests(unittest.TestCase):
                 {"command": "definitely-not-installed --version", "cwd": None})
         self.assertEqual(health["issues"][0]["kind"], "runtime-missing")
 
+    @unittest.skipUnless(IS_POSIX, "chmod 执行位语义为 macOS 专属")
     def test_direct_script_requires_execute_permission_but_bash_script_does_not(self):
         with tempfile.TemporaryDirectory() as td:
             path = os.path.join(td, "job.command")
@@ -231,6 +242,7 @@ class AppHealthTests(unittest.TestCase):
         self.assertEqual(direct["issues"][0]["kind"], "script-not-executable")
         self.assertFalse(wrapped["blocking"])
 
+    @unittest.skipUnless(IS_POSIX, "os.symlink 语义为 macOS 专属")
     def test_broken_script_symlink_is_unavailable(self):
         with tempfile.TemporaryDirectory() as td:
             link = os.path.join(td, "job.py")
@@ -242,8 +254,11 @@ class AppHealthTests(unittest.TestCase):
     def test_task_cancel_exit_code_survives_shell_wrapper(self):
         with tempfile.TemporaryDirectory() as td, \
                 mock.patch.object(server, "LOGS_DIR", td):
-            app = {"id": "deadbeef", "cwd": td,
-                   "command": "python3 -c 'raise SystemExit(130)'"}
+            # Windows 的 cmd 包装不识别单引号,改用 cmd 内建 exit /b 130;
+            # POSIX 用 python 显式退出 130。
+            command = ("exit /b 130" if not IS_POSIX
+                       else server.PYTHON_CMD + " -c 'raise SystemExit(130)'")
+            app = {"id": "deadbeef", "cwd": td, "command": command}
             ok, error, proc, _, _ = server.start_app(app)
             self.assertTrue(ok, error)
             self.assertEqual(proc.wait(timeout=3), 130)
@@ -375,9 +390,10 @@ class ConfigTests(unittest.TestCase):
                 backup = json.load(f)
             self.assertEqual(current["watchedKeywords"], ["node", "ffmpeg"])
             self.assertEqual(backup["watchedKeywords"], ["node"])
-            self.assertEqual(oct(os.stat(path).st_mode & 0o777), "0o600")
-            self.assertEqual(oct(os.stat(path + ".bak").st_mode & 0o777),
-                             "0o600")
+            if IS_POSIX:
+                self.assertEqual(oct(os.stat(path).st_mode & 0o777), "0o600")
+                self.assertEqual(oct(os.stat(path + ".bak").st_mode & 0o777),
+                                 "0o600")
 
     def test_load_falls_back_to_backup(self):
         with tempfile.TemporaryDirectory() as td:
@@ -446,16 +462,24 @@ class ConfigTests(unittest.TestCase):
 
 class RuntimeStorageTests(unittest.TestCase):
     def test_runtime_override_requires_a_dedicated_absolute_directory(self):
-        with mock.patch.dict(os.environ, {"TEST_CONSOLE_DIR": ""}):
+        # 手动 set/unset 而非 mock.patch.dict:Windows 环境块有 32767 上限,
+        # mock 恢复整个 os.environ 会触发 ValueError("longer than 32767")。
+        old = os.environ.get("TEST_CONSOLE_DIR")
+        try:
+            os.environ["TEST_CONSOLE_DIR"] = ""
             with self.assertRaises(RuntimeError):
                 server.resolve_runtime_dir("TEST_CONSOLE_DIR", "/tmp/default")
-        with mock.patch.dict(os.environ, {"TEST_CONSOLE_DIR": "relative"}):
+            os.environ["TEST_CONSOLE_DIR"] = "relative"
             with self.assertRaises(RuntimeError):
                 server.resolve_runtime_dir("TEST_CONSOLE_DIR", "/tmp/default")
-        with mock.patch.dict(os.environ,
-                             {"TEST_CONSOLE_DIR": os.path.expanduser("~")}):
+            os.environ["TEST_CONSOLE_DIR"] = os.path.expanduser("~")
             with self.assertRaises(RuntimeError):
                 server.resolve_runtime_dir("TEST_CONSOLE_DIR", "/tmp/default")
+        finally:
+            if old is None:
+                os.environ.pop("TEST_CONSOLE_DIR", None)
+            else:
+                os.environ["TEST_CONSOLE_DIR"] = old
 
     def test_first_run_copies_legacy_data_privately_without_deleting_source(self):
         with tempfile.TemporaryDirectory() as td:
@@ -484,10 +508,11 @@ class RuntimeStorageTests(unittest.TestCase):
             with open(os.path.join(logs, "deadbeef.log"), "rb") as f:
                 self.assertEqual(f.read(), b"log")
             self.assertTrue(os.path.isfile(os.path.join(legacy, "config.json")))
-            self.assertEqual(oct(os.stat(target).st_mode & 0o777), "0o700")
-            self.assertEqual(
-                oct(os.stat(os.path.join(target, "config.json")).st_mode & 0o777),
-                "0o600")
+            if IS_POSIX:
+                self.assertEqual(oct(os.stat(target).st_mode & 0o777), "0o700")
+                self.assertEqual(
+                    oct(os.stat(os.path.join(target, "config.json")).st_mode & 0o777),
+                    "0o600")
 
             # 已存在的目标绝不被旧项目目录二次覆盖。
             with open(os.path.join(legacy, "config.json"), "w",
@@ -574,7 +599,8 @@ class RuntimeStorageTests(unittest.TestCase):
             log_path = os.path.join(logs, "console.log")
             with open(log_path, encoding="utf-8") as f:
                 self.assertEqual(f.read(), "launcher-log-ready\n")
-            self.assertEqual(os.stat(log_path).st_mode & 0o777, 0o600)
+            if IS_POSIX:
+                self.assertEqual(os.stat(log_path).st_mode & 0o777, 0o600)
 
 
 class ProcessIdentityTests(unittest.TestCase):
@@ -592,6 +618,7 @@ class ProcessIdentityTests(unittest.TestCase):
             index, _, _ = server.managed_process_index([stale], groups)
             self.assertEqual(index["a"], [])
 
+    @unittest.skipUnless(IS_POSIX, "sleep 命令与 os.killpg 为 POSIX 语义")
     def test_real_started_process_is_identified_and_stoppable(self):
         with tempfile.TemporaryDirectory() as td, \
                 mock.patch.object(server, "LOGS_DIR", td):
@@ -617,6 +644,7 @@ class ProcessIdentityTests(unittest.TestCase):
                         pass
                     proc.wait(timeout=3)
 
+    @unittest.skipUnless(IS_POSIX, "os.getpgid/posix 路径为 macOS 语义")
     def test_verified_legacy_process_can_be_stopped_without_port_kill(self):
         app = {"id": "legacy", "lastPid": 999, "lastPgid": None,
                "runToken": None, "port": 8080, "cwd": "/tmp/project"}
@@ -806,6 +834,7 @@ class ProcessIdentityTests(unittest.TestCase):
 
 
 class LaunchEnvironmentTests(unittest.TestCase):
+    @unittest.skipUnless(IS_POSIX, "homebrew/nvm 路径为 macOS 专属")
     def test_headless_launch_path_includes_common_user_node_locations(self):
         with mock.patch.object(server.os.path, "expanduser", return_value="/Users/example"), \
                 mock.patch.object(server.glob, "glob", side_effect=[
@@ -1159,6 +1188,7 @@ class DiagnoseTests(unittest.TestCase):
         r = self._run(app, log="ok")
         self.assertFalse(any(i["kind"] == "quick-exit" for i in r["issues"]))
 
+    @unittest.skipUnless(IS_POSIX, "command_for_script 的脚本缺失语义为 macOS 专属")
     def test_static_health_issue_is_included_before_a_failed_run(self):
         with tempfile.TemporaryDirectory() as td:
             missing = os.path.join(td, "missing.py")
