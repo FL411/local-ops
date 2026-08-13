@@ -400,7 +400,8 @@ class Config:
 
     DEFAULT = {"schemaVersion": CURRENT_SCHEMA_VERSION,
                "apps": [], "hidden": [], "pinned": [], "promoted": [],
-               "watchedKeywords": [], "uiTheme": DEFAULT_UI_THEME}
+               "watchedKeywords": [], "uiTheme": DEFAULT_UI_THEME,
+               "openBrowser": True}
     APP_DEFAULT = {"id": None, "name": "", "command": "", "cwd": None,
                    "port": None, "emoji": None, "glyph": None, "icon": None,
                    "favicon": None, "kind": "service", "lastPid": None,
@@ -1322,6 +1323,7 @@ def build_state(cfg, console_port, config_health=None):
         "degradedReasons": degraded_reasons,
         "configHealth": dict(config_health or {}),
         "uiTheme": cfg.get("uiTheme") or DEFAULT_UI_THEME,
+        "openBrowser": bool(cfg.get("openBrowser", True)),
         "themes": list_themes(),
         # Windows 上 CPU 为「占全部核心百分比」（任务管理器口径），
         # coreCount 供前端把迷你条还原为相对满核宽度；macOS 为 1 保持原语义。
@@ -3243,6 +3245,9 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/ui/theme":
                 self.handle_ui_theme()
                 return
+            if path == "/api/settings":
+                self.handle_settings()
+                return
             if path == "/api/pick":
                 self.handle_pick()
                 return
@@ -3336,6 +3341,23 @@ class Handler(BaseHTTPRequestHandler):
             self.send_err(404, "应用不存在")
             return
         self.send_json(diagnose_app(cfg, app))
+
+    def handle_settings(self):
+        """持久设置:目前支持 openBrowser(启动时是否自动打开浏览器)。"""
+        data, err = self.read_json_body()
+        if err:
+            self.send_err(400, err)
+            return
+        if "openBrowser" not in data:
+            self.send_err(400, "缺少 openBrowser")
+            return
+        value = data.get("openBrowser")
+        if not isinstance(value, bool):
+            self.send_err(400, "openBrowser 必须是布尔值")
+            return
+        self.server.cfg.update(
+            lambda d: d.__setitem__("openBrowser", value))
+        self.send_json({"ok": True, "openBrowser": value})
 
     def handle_ui_theme(self):
         data, err = self.read_json_body()
@@ -4104,7 +4126,8 @@ def _run_console(preferred_port=None, open_browser=True):
 
     print("总控台已启动: http://%s:%d/  (Ctrl+C 停止)" % (HOST, port), flush=True)
     warm_state_cache(cfg, port)
-    if open_browser:
+    # CLI(--no-browser)与设置中心(openBrowser)任一关闭则不自动打开浏览器
+    if open_browser and cfg.get("openBrowser", True):
         open_browser_later(port)
     tray_icon = None
     if sysops.IS_WINDOWS and _tray_mod is not None:

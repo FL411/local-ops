@@ -74,6 +74,14 @@ export function initWidgets() {
     toggleTaskNotifications();
     syncSettings();
   });
+  $('#setOpenBrowser').addEventListener('click', () => {
+    // 基于开关当前视觉状态取反(state.data 受轮询缓存竞争影响不可靠)
+    const next = !$('#setOpenBrowser').classList.contains('on');
+    act(post('/api/settings', { openBrowser: next })).then(() => {
+      if (state.data) state.data.openBrowser = next;
+      syncSettings();
+    });
+  });
   $('#setAppearance').addEventListener('click', e => {
     const tab = e.target.closest('.mini-tab');
     if (!tab) return;
@@ -415,6 +423,10 @@ function syncSettings() {
   const sw = $('#setNotify');
   sw.classList.toggle('on', on);
   sw.setAttribute('aria-checked', String(on));
+  const ob = (state.data || {}).openBrowser !== false;
+  const swOb = $('#setOpenBrowser');
+  swOb.classList.toggle('on', ob);
+  swOb.setAttribute('aria-checked', String(ob));
   const stored = localStorage.getItem('console-theme');
   const mode = stored === 'dark' ? 'dark' : stored === 'light' ? 'light' : 'auto';
   for (const tab of $('#setAppearance').querySelectorAll('.mini-tab')) {
