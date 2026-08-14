@@ -406,7 +406,8 @@ class Config:
                    "port": None, "emoji": None, "glyph": None, "icon": None,
                    "favicon": None, "kind": "service", "lastPid": None,
                    "lastPgid": None, "runToken": None,
-                   "attached": False, "lastExit": None, "createdAt": 0}
+                   "attached": False, "lastExit": None, "createdAt": 0,
+                   "lastCreateTime": None}
 
     def __init__(self, path):
         self._lock = threading.RLock()
@@ -1134,8 +1135,14 @@ def legacy_managed_pid(app, listeners=None, snap=None, cwds=None):
     if cwds is None:
         cwds = lsof_cwds(port_pids)
     matches = []
+    # PID 创建时间锚点（仅 Windows 记录）：attach 后若同 PID 的 ctime 与
+    # 记录值不同，说明原进程已退出、PID 已被新进程复用——不得认领。
+    expected_ctime = app.get("lastCreateTime")
     for pid in sorted(port_pids):
         if snap.get(pid, {}).get("uid") != SELF_UID:
+            continue
+        if (sysops.IS_WINDOWS and expected_ctime
+                and snap.get(pid, {}).get("ctime") != expected_ctime):
             continue
         actual_cwd = cwds.get(pid)
         if not actual_cwd:
@@ -2414,7 +2421,11 @@ def inspect_attach_process(cfg, app, pid):
     actual_cwd = lsof_cwds({pid}).get(pid)
     if not actual_cwd:
         return False, "无法读取进程工作目录，已取消认领", {"status": 409}
-    return True, None, {"status": 200, "cwd": actual_cwd}
+    # 记录进程创建时间（仅 Windows 提供），供后续身份校验识别 PID 复用。
+    return True, None, {
+        "status": 200, "cwd": actual_cwd,
+        "ctime": snap.get(pid, {}).get("ctime"),
+    }
 
 
 def attach_app_process(cfg, app_id, app, pid):
@@ -2446,6 +2457,8 @@ def attach_app_process(cfg, app_id, app, pid):
         target["runToken"] = None
         target["attached"] = True
         target["lastExit"] = None
+        # PID 创建时间锚点：身份校验时若同 PID 的 ctime 不同，判为 PID 复用。
+        target["lastCreateTime"] = identity.get("ctime")
         try:
             same = (isinstance(target.get("cwd"), str) and target["cwd"]
                     and os.path.realpath(target["cwd"]) == os.path.realpath(actual_cwd))

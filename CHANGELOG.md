@@ -10,6 +10,10 @@
 
 ### Added
 
+- **平台泄漏扫描器（`tools/check_platform_leaks.py`）**：借鉴上游 PR 思路，把 macOS 残留审计工具化——AST+tokenize 精确扫描后端（跳过平台分支块、`_posix`/`_windows` 函数、docstring 与注释），行规则扫描前端（跳过 `IS_MAC`/`MOD_KEY` 平台化行与 `Ctrl/⌘` 对照文案），含显式白名单（良性残留逐条注明原因）。接入测试（8 项双向验证：当前基线 0 泄漏 + 工具能检出真实泄漏），每轮改代码跑 `python tools/check_platform_leaks.py` 防 macOS 残留回归。
+- **attached 认领增加 PID 创建时间校验**：Windows 快照新增 `ctime` 字段；认领时记录 `lastCreateTime`，身份匹配（`legacy_managed_pid`）时比对——同 PID 的 ctime 不同则判为 PID 复用、拒绝认领（借鉴上游 PR 的 CAS 思想，防 PID 复用误认）。旧数据无该字段时跳过校验，向后兼容，无需 schema 迁移。
+### Added
+
 - **Windows 平台移植**：新增跨平台系统操作层 `sysops.py`，macOS 保持零第三方依赖（ps/lsof/osascript），Windows 基于 `psutil` 实现进程快照、监听端口、工作目录与进程树管理；新增 `start.bat` 启动器与 `requirements-runtime-win.txt` 运行时依赖说明。`start.bat` 采用 `pythonw.exe` **无窗口后台运行**，日志写入 `%LOCALAPPDATA%\总控台\console.log`；新增 `--log-to-file` 命令行参数。
 - **Windows 平台优化（对齐 macOS）**：① 服务监控按系统进程名单（svchost/System/explorer 等）与 System32 目录将系统进程归入「应用后台」折叠，消除界面噪音；② 进程溯源新增 Windows 工具别名映射（Code.exe→VS Code、Cursor、WindowsTerminal/cmd/powershell→终端 等），并修复含空格路径（如 `Microsoft VS Code`）的溯源解析——psutil argv 拼接时对含空格参数补引号；③ **补全性能监控 CPU 采样**：Windows 版每进程 CPU 由恒 0 改为「跨快照 cpu_times 差分」，并按 Windows 用户习惯归一为「占全部逻辑核心的百分比」（任务管理器口径，吃满 1 核 = 100/核心数 %，多线程也不会超过 100），`/api/state` 新增 `coreCount` 供前端迷你条还原相对满核宽度；macOS 保持单核口径不变；排除 System Idle Process（pid 0）。
 - 顶栏新增 GitHub 仓库图标按钮，点击在新标签页打开项目源码仓库。

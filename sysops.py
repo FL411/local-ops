@@ -353,6 +353,9 @@ def _ps_snapshot_windows(pids=None, with_uid=True):
                 "cpu": cpu_by_pid.get(pid, 0.0),
                 "mem": round(info["memory_percent"] or 0.0, 2),
                 "etime": etime,
+                # 进程创建时间戳（epoch 秒）。用于身份校验时识别 PID 复用：
+                # attach 记录后，若同 PID 的 ctime 不同则说明已被新进程占用。
+                "ctime": create_time,
             }
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess,
                 TypeError, ValueError, OSError):

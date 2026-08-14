@@ -766,6 +766,47 @@ class ProcessIdentityTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("批处理任务", error)
 
+    def test_attached_pid_reuse_rejected_by_ctime_mismatch(self):
+        """Windows 语义：attach 记录的 PID 创建时间与当前不符 → 判 PID 复用排除。
+
+        （借鉴上游 PR 的 CAS 思想；mock 强制 Windows 分支，保证 macOS 也可跑）"""
+        app = {"id": "a", "port": 3000, "cwd": "/project",
+               "kind": "service", "lastPid": 4242, "attached": True,
+               "lastCreateTime": 1000.0}
+        common = {"listeners": {(4242, 3000)},
+                  "snap": {4242: {"uid": server.SELF_UID, "ctime": 999.0}},
+                  "cwds": {4242: "/project"}}
+        with mock.patch.object(server.sysops, "IS_WINDOWS", True):
+            # ctime 不一致：原进程已退出、PID 被新进程复用 → 不得认领
+            self.assertIsNone(server.legacy_managed_pid(app, **common))
+            # ctime 一致：正常命中
+            common["snap"] = {4242: {"uid": server.SELF_UID,
+                                     "ctime": 1000.0}}
+            self.assertEqual(server.legacy_managed_pid(app, **common), 4242)
+        # POSIX 语义：不校验 ctime（无该字段语义），正常命中
+        self.assertEqual(server.legacy_managed_pid(app, **common), 4242)
+
+    def test_attach_records_last_create_time(self):
+        app = {"id": "a", "port": 8080, "kind": "service", "cwd": "/x"}
+        with mock.patch.object(server, "app_alive_sign", return_value=False), \
+                mock.patch.object(server, "scan_listeners",
+                                  return_value={(4242, 8080)}), \
+                mock.patch.object(server, "ps_snapshot",
+                                  return_value={4242: {
+                                      "uid": server.SELF_UID,
+                                      "ctime": 123456.0}}), \
+                mock.patch.object(server, "listener_app_owners",
+                                  return_value={}), \
+                mock.patch.object(server, "lsof_cwds",
+                                  return_value={4242: "/x"}):
+            with tempfile.TemporaryDirectory() as td:
+                cfg = server.Config(os.path.join(td, "config.json"))
+                cfg.update(lambda d: d.__setitem__("apps", [app]))
+                ok, error, _ = server.attach_app_process(cfg, "a", app, 4242)
+        self.assertTrue(ok, error)
+        self.assertEqual(cfg.snapshot()["apps"][0]["lastCreateTime"],
+                         123456.0)
+
     def test_task_exit_records_duration_and_unique_run_time(self):
         with tempfile.TemporaryDirectory() as td, \
                 mock.patch.object(server, "LOGS_DIR", td):
