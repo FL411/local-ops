@@ -3,7 +3,7 @@ setlocal
 title local-ops Console
 cd /d "%~dp0"
 
-REM Probe order: py launcher (latest) -> python on PATH -> fixed path fallback.
+REM Probe order: py launcher (latest) -> python on PATH.
 REM Each candidate must satisfy Python>=3.12 AND have psutil, else try next.
 set "PY="
 
@@ -17,18 +17,10 @@ goto :resolve_pythonw
 
 :try_python
 where python >nul 2>nul
-if errorlevel 1 goto :try_fixed
-python -c "import sys,psutil;raise SystemExit(0 if sys.version_info >= (3,12) else 1)" >nul 2>nul
-if errorlevel 1 goto :try_fixed
-set "PY=python"
-goto :resolve_pythonw
-
-:try_fixed
-set "PYEXE=C:\Program Files\Python312\python.exe"
-if not exist "%PYEXE%" goto :install_psutil
-"%PYEXE%" -c "import sys,psutil;raise SystemExit(0 if sys.version_info >= (3,12) else 1)" >nul 2>nul
 if errorlevel 1 goto :install_psutil
-set "PY=%PYEXE%"
+python -c "import sys,psutil;raise SystemExit(0 if sys.version_info >= (3,12) else 1)" >nul 2>nul
+if errorlevel 1 goto :install_psutil
+set "PY=python"
 goto :resolve_pythonw
 
 :install_psutil
