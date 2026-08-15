@@ -34,7 +34,7 @@
 ## 五、文档与贡献
 
 - README「Windows 平台支持矩阵」、`docs/windows-parity-check.md`、`docs/upstream-pr-map.md`。
-- 上游 Issue #1 提案已发布（账号 FL411），等维护者回应后按 PR 映射推进。
+- 上游 Issue #1 提案已发布，等维护者回应后按 PR 映射推进。
 
 ## 六、环境治理
 

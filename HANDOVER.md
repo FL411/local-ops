@@ -6,9 +6,9 @@
 
 GitHub `laogou717/local-ops`(中文名"总控台")的 **macOS → Windows 移植版**。功能:本地服务/批处理任务监控与快速启动台(网页 UI,后端 Python,零构建前端)。原版只支持 macOS(依赖 ps/lsof/osascript);本移植让它在 Windows 10/11 上完整可用。
 
-- **位置**:`D:\A_program\local-ops`(有 `.git`,shallow clone 而来)
+- **位置**:项目根目录(有 `.git`)
 - **版本**:1.0.0(VERSION 文件)
-- **macOS 原始代码备份**:`C:\Users\Zhou\WorkBuddy\2026-08-12-18-41-19\repo_analysis\local-ops`(只读参考)
+- **macOS 原始代码备份**:本地备份目录(只读参考)
 
 ## 2. 架构与核心文件
 
@@ -36,7 +36,7 @@ GitHub `laogou717/local-ops`(中文名"总控台")的 **macOS → Windows 移植
 4. **系统进程归组**:svchost/System/explorer 等 27 个 + System32 路径 → 归入「应用后台」折叠(mine 组 72→51)
 5. **进程溯源别名**:Code.exe→VS Code、Cursor、WindowsTerminal/cmd/powershell→终端 等;修复含空格路径解析
 6. **CPU 采样补全 + Windows 口径归一**:每进程 CPU 由恒 0 改为跨快照差分,并归一为「占全部逻辑核心百分比」(任务管理器口径,吃满 1 核 = 100/28 ≈ 3.6%);macOS 保持单核口径;`/api/state` 输出 `coreCount`
-7. **服务重启恢复**:重启总控台后,之前启动的应用(trading-cluster, 18888 端口)被正确重新识别 running
+7. **服务重启恢复**:重启总控台后,之前启动的应用(18888 端口)被正确重新识别 running
 
 ## 4. 关键坑(务必先看,避免重复踩)
 
@@ -112,9 +112,9 @@ GitHub `laogou717/local-ops`(中文名"总控台")的 **macOS → Windows 移植
 
 ## 7. 环境备忘
 
-- 开发/验证:managed venv `C:\Users\Zhou\.workbuddy\binaries\python\envs\default`(Python 3.13.12,已装 psutil)
-- 实际运行:`py -3` 在本机解析到 **Python 3.14**(`C:\Users\Zhou\AppData\Local\Python\pythoncore-3.14-64\pythonw.exe`),psutil 7.2.1
-- 本机 28 逻辑核(CPU 归一口径依据)
+- 开发/验证:managed venv(Python 3.13.12,已装 psutil)
+- 实际运行:`py -3` 在本机解析到 **Python 3.14**(pythonw),psutil 7.2.1
+- 本机多逻辑核(CPU 归一口径依据)
 - 测试隔离:设 `CONSOLE_DATA_DIR`/`CONSOLE_LOG_DIR` 环境变量即可不污染真实数据
 
 ## 8. 用户偏好(重要)
