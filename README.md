@@ -1,4 +1,7 @@
-# 总控台
+# 总控台（Windows 移植版）
+
+> **本仓库是 [laogou717/local-ops](https://github.com/laogou717/local-ops)（总控台）的 Windows 移植衍生版**，面向 Windows 10/11 用户：完整保留原版全部功能，并额外提供系统托盘、无窗口启动器。
+> **macOS 用户请直接使用上游仓库**，本仓库以 Windows 为使用目标。
 
 **Preview / Alpha · 源码预览**
 
@@ -56,6 +59,8 @@
 
 ### macOS
 
+> macOS 用户建议直接使用上游仓库 <https://github.com/laogou717/local-ops>。
+
 1. **下载并解压**：将发行 zip 解压到一个你有读写权限的位置（如 `~/Applications` 或文稿下的固定目录）。解压后请保持目录结构完整，不要单独移动 `总控台.app`。
 2. **确认 Python 3.12**：在「终端」运行：
 
@@ -92,6 +97,8 @@ Windows 后台运行说明：
 - 首次运行会自动安装 `psutil`（≥ 7.2，Windows 唯一运行时依赖）。
 
 ### macOS
+
+> macOS 用户建议直接使用上游仓库 <https://github.com/laogou717/local-ops>。
 
 启动总控台有且只有三种方式，效果相同，按习惯选择：
 
