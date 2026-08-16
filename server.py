@@ -117,6 +117,10 @@ LOG_BACKUPS = 3
 LOG_MAINTENANCE_SEC = 30
 STARTUP_PROBE_SEC = 0.25
 APP_STOP_TIMEOUT_SEC = 5.0
+# 开机自启：总控台启动后延迟 AUTOSTART_DELAY_SEC 再逐个拉起标记 autostart
+# 的 service，服务之间间隔 AUTOSTART_INTERVAL_SEC 避免同时启动冲突。
+AUTOSTART_DELAY_SEC = 5
+AUTOSTART_INTERVAL_SEC = 2
 RUN_TOKEN_ENV = "CONSOLE_RUN_TOKEN"
 RUN_TOKEN_ARG_PREFIX = "console-run:"
 TASK_CANCELED_EXIT_CODE = 130
@@ -407,7 +411,7 @@ class Config:
                    "favicon": None, "kind": "service", "lastPid": None,
                    "lastPgid": None, "runToken": None,
                    "attached": False, "lastExit": None, "createdAt": 0,
-                   "lastCreateTime": None}
+                   "lastCreateTime": None, "autostart": False}
 
     def __init__(self, path):
         self._lock = threading.RLock()
@@ -2850,8 +2854,15 @@ def validate_app_fields(data, partial):
         fields["kind"] = data["kind"]
     elif not partial:
         fields["kind"] = "service"
+    if "autostart" in data:
+        if not isinstance(data["autostart"], bool):
+            return None, "autostart 必须是布尔值"
+        fields["autostart"] = data["autostart"]
+    elif not partial:
+        fields["autostart"] = False
     if fields.get("kind") == "task":
         fields["port"] = None  # 批处理任务无端口语义
+        fields["autostart"] = False  # 批处理任务无开机自启意义
     return fields, None
 
 
@@ -3514,6 +3525,7 @@ class Handler(BaseHTTPRequestHandler):
                "command": fields["command"], "cwd": fields["cwd"],
                "port": fields["port"], "emoji": fields["emoji"],
                "glyph": fields["glyph"], "kind": fields["kind"],
+               "autostart": fields.get("autostart", False),
                "icon": None, "favicon": None, "lastPid": None,
                "lastPgid": None, "runToken": None,
                "attached": False, "lastExit": None,
@@ -4111,6 +4123,46 @@ def restart_helper(old_pid, preferred_port):
     return 0
 
 
+def _autostart_managed_apps(cfg):
+    """开机自启：启动标记 autostart 的 service 应用（复用启动链路）。
+
+    独立守护线程执行：延迟 AUTOSTART_DELAY_SEC 等状态就绪，随后按配置顺序
+    逐个启动 autostart=true 且未运行的 service；每个之间间隔
+    AUTOSTART_INTERVAL_SEC。失败记录日志、不阻塞总控台、不自动重试
+    （退出监视线程会记录快速失败任务的结果）。task 批处理无自启意义，跳过。
+    """
+    time.sleep(AUTOSTART_DELAY_SEC)
+    for app in (cfg.snapshot().get("apps") or []):
+        if (app.get("kind") or "service") != "service":
+            continue
+        if not app.get("autostart"):
+            continue
+        if app_alive_sign(app):
+            continue
+        health = inspect_app_health(app)
+        if health.get("blocking"):
+            issue = (health.get("issues") or [{}])[0]
+            LOG.warning("autostart 跳过 %s：%s",
+                        app.get("name"), issue.get("title", "配置不健康"))
+            continue
+        ok, err, proc, pgid, token = start_app(app)
+        if not ok:
+            LOG.warning("autostart 启动失败 %s：%s", app.get("name"), err)
+            continue
+        if not persist_started_app(cfg, app["id"], proc, pgid, token):
+            stop_pid_tree(pgid)
+            LOG.warning("autostart 取消 %s：应用已被删除", app.get("name"))
+            continue
+        LOG.info("autostart 已启动 %s", app.get("name"))
+        time.sleep(AUTOSTART_INTERVAL_SEC)
+
+
+def _start_autostart_thread(cfg):
+    """启动开机自启守护线程（随主进程退出）。"""
+    threading.Thread(target=_autostart_managed_apps, args=(cfg,),
+                     name="console-autostart", daemon=True).start()
+
+
 def _run_console(preferred_port=None, open_browser=True):
     logging.basicConfig(
         level=logging.INFO,
@@ -4143,6 +4195,8 @@ def _run_console(preferred_port=None, open_browser=True):
     # Config 无 .get()，经 snapshot() 读取（启动时单次调用，开销可忽略）。
     if open_browser and cfg.snapshot().get("openBrowser", True):
         open_browser_later(port)
+    # 开机自启：延迟拉起标记 autostart 的 service（守护线程，失败不阻塞）。
+    _start_autostart_thread(cfg)
     tray_icon = None
     if sysops.IS_WINDOWS and _tray_mod is not None:
         url = "http://%s:%d/" % (HOST, port)

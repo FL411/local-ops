@@ -10,6 +10,7 @@ import { $, el, setText, setChildren, icon, escapeHtml,
 const appModalMask = $('#appModalMask'), appModal = $('#appModal'), appModalTitle = $('#appModalTitle');
 const fName = $('#fName'), fCmd = $('#fCmd'), fCwd = $('#fCwd'), fPort = $('#fPort');
 const kindRow = $('#kindRow'), portField = $('#portField'), fCmdLabel = $('#fCmdLabel');
+const autostartField = $('#autostartField'), fAutostart = $('#fAutostart');
 const btnPickScript = $('#btnPickScript'), btnPickCwd = $('#btnPickCwd');
 const btnDetectProject = $('#btnDetectProject');
 const detectPanel = $('#detectPanel'), detectSummary = $('#detectSummary');
@@ -252,6 +253,7 @@ function setModalKind(kind) {
   });
   portField.hidden = modalKind === 'task';
   fPort.disabled = modalKind === 'task';
+  autostartField.hidden = modalKind === 'task';
   setText(fCmdLabel, modalKind === 'task' ? '执行命令' : '启动命令');
   fName.placeholder = modalKind === 'task' ? '如：每日备份' : '如：本地博客';
   fCmd.placeholder = modalKind === 'task'
@@ -263,6 +265,11 @@ function setModalKind(kind) {
 }
 kindRow.querySelectorAll('.kind-btn').forEach(b =>
   b.addEventListener('click', () => setModalKind(b.dataset.kind)));
+fAutostart.addEventListener('click', () => {
+  const on = !fAutostart.classList.contains('on');
+  fAutostart.classList.toggle('on', on);
+  fAutostart.setAttribute('aria-checked', String(on));
+});
 
 export function openAppModal(app, presetKind, focusAction = '') {
   editingAppId = app ? app.id : null;
@@ -288,6 +295,9 @@ export function openAppModal(app, presetKind, focusAction = '') {
   fCmd.value = (app && app.command) || '';
   fCwd.value = (app && app.cwd) || '';
   fPort.value = app && app.port != null ? app.port : '';
+  const autostartOn = !!(app && app.autostart);
+  fAutostart.classList.toggle('on', autostartOn);
+  fAutostart.setAttribute('aria-checked', String(autostartOn));
   [fName, fCmd, fCwd, fPort].forEach(clearFieldError);
   setModalKind(presetKind || (app && app.kind) || 'service');
   appearanceDetails.open = !!(app && (app.icon || app.glyph));
@@ -490,6 +500,7 @@ async function saveApp() {
     port,
     glyph: selectedGlyph || null,
     kind: modalKind,
+    autostart: modalKind === 'service' && fAutostart.classList.contains('on'),
   };
   const wasCreating = !editingAppId;
   const attachRequest = wasCreating && pendingAttach && modalKind === 'service'

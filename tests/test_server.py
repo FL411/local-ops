@@ -1308,5 +1308,87 @@ class ConsoleStartupTests(unittest.TestCase):
             self._run_console(open_browser=False, config_open_browser=True), 0)
 
 
+class AutostartTests(unittest.TestCase):
+    """开机自启：仅拉起 service + autostart + 未运行的应用。"""
+
+    def _cfg(self, apps):
+        cfg = mock.Mock()
+        cfg.snapshot.return_value = {"apps": apps}
+        return cfg
+
+    def test_field_defaults_false_and_backward_compatible(self):
+        self.assertIs(server.Config.APP_DEFAULT.get("autostart"), False)
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "config.json")
+            # 旧数据：app 不含 autostart 字段
+            app = {"id": "a", "name": "x", "command": "y", "kind": "service"}
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({**server.Config.DEFAULT, "apps": [app]}, f)
+            cfg = server.Config(path)
+            self.assertIs(cfg.snapshot()["apps"][0]["autostart"], False)
+
+    def test_validate_autostart_field(self):
+        fields, err = server.validate_app_fields(
+            {"name": "x", "command": "y", "autostart": True}, partial=False)
+        self.assertIsNone(err)
+        self.assertIs(fields["autostart"], True)
+        # task 强制 false
+        fields, err = server.validate_app_fields(
+            {"name": "x", "command": "y", "kind": "task",
+             "autostart": True}, partial=True)
+        self.assertIs(fields["autostart"], False)
+        # 非布尔拒绝
+        _, err = server.validate_app_fields(
+            {"autostart": "yes"}, partial=True)
+        self.assertIsNotNone(err)
+
+    def test_autostart_starts_only_eligible_services(self):
+        apps = [
+            {"id": "a", "kind": "service", "autostart": True, "name": "s1"},
+            {"id": "b", "kind": "task", "autostart": True, "name": "t1"},
+            {"id": "c", "kind": "service", "autostart": False, "name": "s2"},
+            {"id": "d", "kind": "service", "autostart": True, "name": "s3"},
+        ]
+        cfg = self._cfg(apps)
+        with mock.patch.object(server.time, "sleep"), \
+                mock.patch.object(server, "app_alive_sign",
+                                  side_effect=lambda a: a["id"] == "d"), \
+                mock.patch.object(server, "inspect_app_health",
+                                  return_value={"blocking": False}), \
+                mock.patch.object(server, "start_app",
+                                  return_value=(True, None, mock.Mock(),
+                                                123, "tok")) as start_mock, \
+                mock.patch.object(server, "persist_started_app",
+                                  return_value=True):
+            server._autostart_managed_apps(cfg)
+        started = [c.args[0]["id"] for c in start_mock.call_args_list]
+        self.assertEqual(started, ["a"])
+
+    def test_autostart_skips_blocking_health_and_does_not_raise_on_failure(self):
+        apps = [
+            {"id": "a", "kind": "service", "autostart": True, "name": "s1"},
+            {"id": "e", "kind": "service", "autostart": True, "name": "s2"},
+        ]
+        cfg = self._cfg(apps)
+        with mock.patch.object(server.time, "sleep"), \
+                mock.patch.object(server, "app_alive_sign",
+                                  return_value=False), \
+                mock.patch.object(server, "inspect_app_health",
+                                  side_effect=lambda a: (
+                                      {"blocking": True,
+                                       "issues": [{"title": "缺 cwd"}]}
+                                      if a["id"] == "a"
+                                      else {"blocking": False})), \
+                mock.patch.object(server, "start_app",
+                                  return_value=(False, "启动失败", None,
+                                                None, None)) as start_mock, \
+                mock.patch.object(server, "persist_started_app") as persist:
+            # 不应抛异常
+            server._autostart_managed_apps(cfg)
+        # a 被 health 拦截、e 启动失败——两者都不触发 persist
+        persist.assert_not_called()
+        self.assertEqual(len(start_mock.call_args_list), 1)  # 只尝试启动 e
+
+
 if __name__ == "__main__":
     unittest.main()
