@@ -3,6 +3,14 @@
 > **本仓库是 [laogou717/local-ops](https://github.com/laogou717/local-ops)（总控台）的 Windows 移植衍生版**，面向 Windows 10/11 用户：完整保留原版全部功能，并额外提供系统托盘、无窗口启动器。
 > **macOS 用户请直接使用上游仓库**，本仓库以 Windows 为使用目标。
 
+## 亮点
+
+- **系统托盘**：后台常驻品牌图标，左键打开控制台，右键菜单「打开 / 重启 / 停止 / 退出」，tooltip 实时显示运行状态——摆脱命令行窗口。
+- **无窗口 exe 启动器**：双击 `LocalOpsConsole.exe` 即可后台启动，体验等同 macOS 的 `.app`。
+- **功能完全对齐**：API 层 13 条路由 + 22 个 handler 与上游 100% 覆盖，无功能缺失。
+- **181 项测试全绿**：单实例锁、托盘、平台泄漏扫描均已回归固化。
+- **顺带修复上游缺陷**：单实例锁失效、`detect_project` 硬编码 `python3`、Windows 重启后日志丢失等。
+
 **Preview / Alpha · 源码预览**
 
 总控台是一个本地服务与批处理任务快速启动、运行监测工具。它把常用项目命令、长期服务和一次性批处理任务集中到本地网页中，并用 Python 3 提供只绑定回环地址的后端（macOS 仅用标准库；Windows 额外依赖 psutil）；前端是无构建、无 CDN 的原生 HTML/CSS/JavaScript。
