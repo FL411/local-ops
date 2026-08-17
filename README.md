@@ -7,15 +7,15 @@
 
 - **系统托盘**：后台常驻品牌图标，左键打开控制台，右键菜单「打开 / 重启 / 停止 / 退出」，tooltip 实时显示运行状态——摆脱命令行窗口。
 - **无窗口 exe 启动器**：双击 `LocalOpsConsole.exe` 即可后台启动，体验等同 macOS 的 `.app`。
-- **功能完全对齐**：API 层 13 条路由 + 22 个 handler 与上游 100% 覆盖，无功能缺失。
-- **181 项测试全绿**：单实例锁、托盘、平台泄漏扫描均已回归固化。
+- **功能完全对齐**：API 层 14 条路由 + 23 个 handler 与上游 100% 覆盖，无功能缺失。
+- **205 项测试全绿**：单实例锁、托盘、平台泄漏扫描、控制令牌与 ACL 保护均已回归固化。
 - **顺带修复上游缺陷**：单实例锁失效、`detect_project` 硬编码 `python3`、Windows 重启后日志丢失等。
 
 **Preview / Alpha · 源码预览**
 
 总控台是一个本地服务与批处理任务快速启动、运行监测工具。它把常用项目命令、长期服务和一次性批处理任务集中到本地网页中，并用 Python 3 提供只绑定回环地址的后端（macOS 仅用标准库；Windows 额外依赖 psutil）；前端是无构建、无 CDN 的原生 HTML/CSS/JavaScript。
 
-> 当前版本仍处于 Preview / Alpha 阶段，以源码预览形式提供。接口、配置格式和安装方式仍可能调整；`总控台.app`（macOS）目前不是可单独复制的自包含应用，也尚不代表经过签名、公证的最终 macOS 发行版。Windows 平台为移植版本，核心功能（服务启停、进程溯源、日志、诊断、新端口发现）已验证可用。
+> 当前版本仍处于 Preview / Alpha 阶段，以源码预览形式提供。接口、配置格式和安装方式仍可能调整。Windows 平台为移植版本，核心功能（服务启停、进程溯源、日志、诊断、新端口发现、控制令牌）已验证可用。
 
 总控台只服务当前电脑和当前用户，不是远程运维、多人协作或公网管理面板。它能够以当前用户权限执行保存的 shell 命令；不要将监听地址、反向代理、SSH 隧道或端口映射暴露到不受信任的网络。
 
@@ -46,12 +46,11 @@
 
 ## 系统要求
 
-- **macOS 12 或更高版本**：运行时仅使用 Python 标准库，依赖系统自带 `ps`、`lsof`、`osascript`。
-- **Windows 10/11**：运行时额外依赖 `psutil`（≥ 7.2，Python 3.13/3.14 兼容所需；首次运行 `start.bat` 自动安装，或 `pip install "psutil>=7.2"`）。
+- **Windows 10/11**：运行时依赖 `psutil`（≥ 7.2，Python 3.13/3.14 兼容所需；首次运行 `start.bat` 自动安装，或 `pip install "psutil>=7.2"`）。
 - Python 3.12 或更高版本。
 - Chrome、Edge 或其他支持 ES Modules 的现代浏览器。
 
-`VERSION` 是项目版本的唯一权威来源。`Info.plist`、发行包名和发行说明应与它保持一致。
+`VERSION` 是项目版本的唯一权威来源，发行包名和发行说明应与它保持一致。
 
 ## 安装
 
@@ -94,8 +93,8 @@ Windows 后台运行说明：
 两个平台通用的命令行参数：
 
 ```bash
-python3 server.py --no-browser        # 只启动服务，不自动打开浏览器
-python3 server.py --preferred-port 9603  # 在 9600-9609 内指定优先端口
+python server.py --no-browser        # 只启动服务，不自动打开浏览器
+python server.py --preferred-port 9603  # 在 9600-9609 内指定优先端口
 ```
 
 启动后程序只绑定 `127.0.0.1`，从 9600 起尝试端口，被占用则递增（最多 10 个），并自动打开浏览器。命令行参数、环境变量（`CONSOLE_DATA_DIR` / `CONSOLE_LOG_DIR`）见下文“数据、隐私与备份”。
@@ -115,6 +114,8 @@ python3 server.py --preferred-port 9603  # 在 9600-9609 内指定优先端口
 - **筛选**：每个分区右上角可按 全部/运行中/已停止/异常（任务为 全部/运行中/成功/失败/已取消）过滤，点按即时切换。
 - **排序**：鼠标拖拽，或聚焦卡片后按空格进入键盘排序（方向键移动，空格确认）。
 - **批量停止**：右侧「快捷操作」里可一键停止全部运行中的应用（有确认框，逐个安全停止，绝不按端口杀进程）。
+- **开机自启（autostart）**：编辑服务卡片时打开「开机自启」开关，总控台启动后会按配置顺序自动拉起标记的服务（仅长期服务，批处理任务无自启意义）。配合「总控台自身设为开机启动」（Windows 注册表 Run 键）即可实现开机后全部托管服务自动就绪。
+- **端口被占用时**：点启动会弹出确认框，展示占用进程的名称、PID 与命令，确认后终止该占用进程（仅限当前用户进程，后端 UID 校验兜底）并自动启动服务——一键解决端口冲突。
 
 ### 服务监控（看这台设备在跑什么）
 
@@ -124,15 +125,15 @@ python3 server.py --preferred-port 9603  # 在 9600-9609 内指定优先端口
 - **后台与已隐藏**：系统/GUI 应用进程默认折叠在「应用后台」；被隐藏的服务可随时恢复。
 - **关注的进程**：输入关键字（如 `ffmpeg`）回车，匹配进程实时列出。
 
-### 日志中心（⌘J）
+### 日志中心（Ctrl+J）
 
-导航轨「日志中心」或快捷键 ⌘J（⌘L 是浏览器保留键）：所有应用按运行中优先排列，点开任意一行看实时日志；底部固定总控台自身日志入口。
+导航轨「日志中心」或快捷键 Ctrl+J（Ctrl+L 是浏览器保留键）：所有应用按运行中优先排列，点开任意一行看实时日志；底部固定总控台自身日志入口。
 
 ### 设置中心
 
 导航轨齿轮：任务完成通知开关（系统通知，切走页面也能收到）、外观三态（自动/浅色/深色）、版本/端口/工作目录/数据目录信息。
 
-### 命令面板（⌘K）
+### 命令面板（Ctrl+K）
 
 全局搜索并执行：添加服务/任务、启动/停止/重启任意应用、打开页面、查看日志、切换视图、开关任务通知、查看总控台日志等，全键盘操作。
 
@@ -165,7 +166,7 @@ python3 server.py --preferred-port 9603  # 在 9600-9609 内指定优先端口
 | Windows | `%APPDATA%\总控台\icons\` | 用户上传的图标和站点图标 | 按需 |
 | Windows | `%LOCALAPPDATA%\总控台\` | 应用与总控台运行日志 | 通常不需 |
 
-目录权限会收紧为 `0700`，配置、图标和日志文件为 `0600`（Windows 上权限位检查自动跳过，改由用户账户隔离）。这些文件仍可能含个人路径、完整 shell 命令和日志内容；不应进入 Git，也不应随发行包或故障报告对外传播。
+目录权限会收紧为 `0700`，配置、图标和日志文件为 `0600`；Windows 上权限位检查自动跳过，改由 **TokenUser SID 收紧文件 DACL**（私有目录/文件仅当前用户可访问，发布检查会实际验证）。这些文件仍可能含个人路径、完整 shell 命令和日志内容；不应进入 Git，也不应随发行包或故障报告对外传播。
 
 ### 旧版数据首次迁移
 
@@ -181,7 +182,15 @@ python3 server.py --preferred-port 9603  # 在 9600-9609 内指定优先端口
 ```bash
 CONSOLE_DATA_DIR="/private/path/console-data" \
 CONSOLE_LOG_DIR="/private/path/console-logs" \
-python3 server.py
+python server.py
+```
+
+Windows（cmd）：
+
+```bat
+set CONSOLE_DATA_DIR=D:\path\console-data
+set CONSOLE_LOG_DIR=D:\path\console-logs
+python server.py
 ```
 
 自定义值必须是非空的绝对路径，并指向总控台专用的非符号链接子目录；不要直接填 `/`、用户主目录或项目根目录。
@@ -190,13 +199,13 @@ python3 server.py
 
 1. 不再执行新的启动、停止或编辑操作。
 2. 停止总控台。
-3. 将 `~/Library/Application Support/总控台/` 复制到受保护的备份目录。
+3. 将数据目录（macOS：`~/Library/Application Support/总控台/`；Windows：`%APPDATA%\总控台\`）复制到受保护的备份目录。
 4. 记录当前 `VERSION`，以便恢复时匹配配置格式。
 
 ### 恢复
 
-1. 确保总控台已停止，并另存当前 `~/Library/Application Support/总控台/`。
-2. 将备份中的 `config.json` 和 `icons/` 复制回对应位置，权限分别设为 `0600` 和 `0700`。
+1. 确保总控台已停止，并另存当前数据目录（macOS：`~/Library/Application Support/总控台/`；Windows：`%APPDATA%\总控台\`）。
+2. 将备份中的 `config.json` 和 `icons/` 复制回对应位置。
 3. 重新启动，逐项确认命令、工作目录和端口。
 
 如果主配置损坏，程序会验证 `config.json.bak` 并恢复主文件。如果两份都不可用，服务进入只读保护状态，不会用空配置覆盖它们。`config.json.bak` 保留的是每次修改之前的上一份良好配置，而不是主文件的同内容副本。
@@ -215,9 +224,9 @@ python3 server.py
 
 1. 如果不希望已启动的服务继续运行，先在启动台逐个停止它们。
 2. 停止总控台。
-3. 按需导出 `~/Library/Application Support/总控台/` 备份。
+3. 按需导出数据目录（macOS：`~/Library/Application Support/总控台/`；Windows：`%APPDATA%\总控台\`）备份。
 4. 将整个项目目录移到废纸篓。
-5. 确认不再需要数据后，手动删除 `~/Library/Application Support/总控台/` 和 `~/Library/Logs/总控台/`。
+5. 确认不再需要数据后，手动删除数据目录（macOS：`~/Library/Application Support/总控台/` 与 `~/Library/Logs/总控台/`；Windows：`%APPDATA%\总控台\` 与 `%LOCALAPPDATA%\总控台\`）。
 
 程序不会安装系统启动项，卸载时也不会自动删除用户数据。
 
@@ -253,6 +262,8 @@ Windows 为同一代码库的移植版本（平台差异收口在 `sysops.py` �
 | CPU 口径 | ⚠️ 差异 | 按「占全部逻辑核百分比」（任务管理器口径），`/api/state` 带 `coreCount`；macOS 为单核口径 |
 | Shell 语义 | ⚠️ 差异 | `cmd.exe /c` 包装：`service` 用前台命令，**命令内不要用单引号**（cmd 不识别） |
 | 启动器 | ✅ 等价 | `start.bat`（双击后台运行、首次自动装 psutil、已有实例时显示打开/重启/取消菜单）；运行中显示**系统托盘图标**（左键打开、右键菜单重启/停止，tooltip 显示端口与状态） |
+| 开机自启（autostart） | ✅ 新增 | 服务卡片可标记「开机自启」，总控台启动后按顺序自动拉起（延迟数秒、间隔启动、失败记日志不阻塞） |
+| 端口占用「释放并启动」 | ✅ 新增 | 端口被占用时点启动，确认框展示占用进程信息，确认后终止（仅当前用户）并自动启动 |
 
 **已知限制**（与 macOS 一致或移植固有的）：
 
@@ -264,21 +275,21 @@ Windows 为同一代码库的移植版本（平台差异收口在 `sysops.py` �
 
 ### 双击后没有界面
 
-- 确认 `python3 --version` 可用且符合要求。
-- 查看 `~/Library/Logs/总控台/console.log`。
-- 用 `python3 server.py` 从终端启动，直接查看错误。
-- 不要单独移动 `总控台.app`；它必须保持在项目根目录。
+- 确认 `python --version` 可用且为 3.12 或更高。
+- 查看 `%LOCALAPPDATA%\总控台\console.log`。
+- 用 `python server.py` 从终端启动，直接查看错误。
+- 不要单独移动 `LocalOpsConsole.exe`；它必须与 `server.py` 同目录。
 
 ### 9600 打不开
 
-程序可能已选择 9601–9609。查看终端输出或 `~/Library/Logs/总控台/console.log` 中的实际地址。服务可访问时，`GET /api/health` 会返回程序版本、配置 schema 和降级原因，且不会执行 `ps/lsof` 扫描。
+程序可能已选择 9601–9609。查看终端输出或 `%LOCALAPPDATA%\总控台\console.log` 中的实际地址。服务可访问时，`GET /api/health` 会返回程序版本、配置 schema 和降级原因，且不会执行 `ps/lsof` 扫描。
 
 ### 应用启动失败
 
 - 先打开该应用的日志和“启动诊断”。
-- 确认工作目录仍然存在、命令可在普通 shell 中运行。
-- 检查启动瞬间配置端口是否正被其他进程占用；不同项目允许保存相同的常见开发端口。
-- Finder 启动的应用不会读取你的 shell 配置；总控台会补入常用 Node/Homebrew 路径，但非标准安装仍可能需要显式绝对路径。
+- 确认工作目录仍然存在、命令可在普通 shell（`cmd.exe` / PowerShell）中运行。
+- 检查启动瞬间配置端口是否正被其他进程占用；不同项目允许保存相同的常见开发端口（也可用「释放并启动」一键解决）。
+- 通过快捷方式或托盘启动的应用可能不继承完整的用户 PATH；总控台会补入常用开发工具路径，但非标准安装仍可能需要显式绝对路径。
 
 ### 配置丢失或损坏
 
@@ -300,7 +311,7 @@ python3 -m pip install -r requirements-dev.txt
 server.py                 Python 标准库后端
 static/                   原生前端、主题、品牌、图标和字体
 tests/                    后端、前端契约、发布与交付检查
-tools/gen_brand_assets.py 从品牌主图生成 favicon 与 macOS App Icon
+tools/gen_brand_assets.py 从品牌主图生成 favicon 与图标（.ico/.png）
 tools/gen_icons.py         由 vendored SVG 生成 icons.js
 tools/check_project.py     统一的只读项目检查
 data/                      旧版运行数据（仅首次迁移源，不进 Git/发行包）
@@ -358,7 +369,7 @@ make generate-brand
 make check
 ```
 
-`static/icons.js` 是生成文件，不应手工修改。`generate-brand` 以 `static/assets/console-app-icon.png` 为主源，需要 macOS 自带的 `iconutil`。重新生成品牌图标后，只提交预期的差异，并同步更新 `ASSET_PROVENANCE.md` 的 SHA-256。
+`static/icons.js` 是生成文件，不应手工修改。`generate-brand` 以 `static/assets/console-app-icon.png` 为主源（macOS 开发环境使用系统 `iconutil`；Windows 上 `tools/gen_brand_assets.py` 直接生成 `.ico`）。重新生成品牌图标后，只提交预期的差异，并同步更新 `ASSET_PROVENANCE.md` 的 SHA-256。
 
 ## 发布
 
@@ -367,8 +378,8 @@ make check
 - 与根目录 MIT 许可证一致的版权信息，以及全部第三方素材和项目图像的来源、许可与授权凭证。
 - 干净、可追溯的 Git commit 和带签名版本 Tag。
 - 通过 `make release-check` 和人工 UI/安全/升级/回滚验收。
-- 不含任何项目内旧 `data/`、用户 Library 数据、日志、绝对路径、token 或缓存的发行包。
-- 针对目标 Mac 的签名、公证、完整性校验、全新安装和回退证据。
+- 不含任何项目内旧 `data/`、用户数据、日志、绝对路径、token 或缓存的发行包。
+- Windows 发行包（zip）解压后可直接运行：`LocalOpsConsole.exe` 无窗口启动、`start.bat` 备用；按 `RELEASE_CHECKLIST.md` 完成 Windows 全新安装与回退验证（含控制令牌只读/可写切换、ACL 冒烟检查）。
 
 ## 社区衍生版本
 
@@ -379,7 +390,7 @@ make check
 | Windows 10/11 适配（双平台运行） | 共享代码 + 平台分支收敛，不新增运行时依赖，含 Windows 专属测试与 CI | PR [#2](https://github.com/laogou717/local-ops/pull/2)（dontpanic1） |
 | Windows 11 安全优先移植（Draft） | Job Objects、签名回执、CREATE_SUSPENDED 等更严格的进程所有权模型，含打包体系 | PR [#3](https://github.com/laogou717/local-ops/pull/3)（songconmaisaix31-design） |
 | Windows 后端 `server_win.py` | 独立 Windows 后端（纯标准库），复用本仓库前端 | PR [#4](https://github.com/laogou717/local-ops/pull/4)（Hexvork） |
-| sysops.py 跨平台抽象层方案 | psutil 唯一新增依赖，macOS 分支零改动，作者已在日常使用 | [Issue #1 提案](https://github.com/laogou717/local-ops/issues/1)（FL411） |
+| sysops.py 跨平台抽象层方案（Windows 移植版） | psutil 唯一新增依赖，macOS 分支零改动；含系统托盘、无窗口启动器、开机自启、端口释放、控制令牌等 Windows 增强 | [FL411/local-ops](https://github.com/FL411/local-ops) |
 
 ## 参与贡献与安全
 
