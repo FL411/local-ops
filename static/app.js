@@ -8,7 +8,8 @@ import { $, el, setText, setChildren, icon, escapeHtml,
   currentUiTheme, reconcilePendingUiTheme, trapLayerFocus,
   openLayer, closeLayer, activeLayer,
   currentMutationEpoch, taskNotificationsEnabled, toggleTaskNotifications,
-  localServiceUrl, MOD_KEY, applyModKeys } from './js/core.js';
+  localServiceUrl, MOD_KEY, applyModKeys, controlTokenAvailable,
+  CONTROL_READONLY_TEXT } from './js/core.js';
 import { renderLaunchpad, toggleApp, closePortDiagnostic, closeAppDiagnosis } from './js/launchpad.js';
 import { renderServices, observePortDiscovery,
   suspendPortDiscovery } from './js/services.js';
@@ -238,9 +239,11 @@ function setConnected(ok, message = '') {
   }
   if (state.restartingFrom || state.stopping) return;
   const notice = stateHealthNotice(state.data);
-  banner.textContent = notice || DISCONNECTED_TEXT;
-  banner.classList.toggle('show', !!notice);
-  banner.setAttribute('aria-hidden', String(!notice));
+  const authNotice = controlTokenAvailable() ? '' : CONTROL_READONLY_TEXT;
+  const combinedNotice = [authNotice, notice].filter(Boolean).join(' ');
+  banner.textContent = combinedNotice || DISCONNECTED_TEXT;
+  banner.classList.toggle('show', !!combinedNotice);
+  banner.setAttribute('aria-hidden', String(!combinedNotice));
 }
 function render() {
   if (!state.data) return;

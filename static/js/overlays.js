@@ -4,7 +4,8 @@
    ============================================================ */
 import { $, el, setText, setChildren, icon, escapeHtml,
   post, put, del, act, toast, openLayer, closeLayer,
-  GLYPHS, findApp, bumpMutationEpoch, controlRequestHeaders, IS_MAC } from './core.js';
+  GLYPHS, findApp, bumpMutationEpoch, controlRequestHeaders,
+  controlTokenAvailable, CONTROL_READONLY_TEXT, IS_MAC } from './core.js';
 
 /* ---------------- DOM 引用 ---------------- */
 const appModalMask = $('#appModalMask'), appModal = $('#appModal'), appModalTitle = $('#appModalTitle');
@@ -531,6 +532,11 @@ async function saveApp() {
       body,
     );
     if (pendingIcon && id) {
+      if (!controlTokenAvailable()) {
+        toast(CONTROL_READONLY_TEXT);
+        await window.__poll();
+        return;
+      }
       try {
         const r = await fetch('/api/apps/' + id + '/icon', {
           method: 'POST',

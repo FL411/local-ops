@@ -226,6 +226,7 @@ class FrontendAccessibilityContractTests(unittest.TestCase):
 
     def test_mutations_use_fragment_bootstrapped_control_token(self):
         core = (ROOT / "static/js/core.js").read_text(encoding="utf-8")
+        app = (ROOT / "static/app.js").read_text(encoding="utf-8")
         overlays = (ROOT / "static/js/overlays.js").read_text(encoding="utf-8")
 
         self.assertIn("console_token", core)
@@ -233,6 +234,11 @@ class FrontendAccessibilityContractTests(unittest.TestCase):
         self.assertIn("history.replaceState", core)
         self.assertIn("export function controlRequestHeaders", core)
         self.assertIn("'X-Console-Token'", core)
+        self.assertIn("export const CONTROL_READONLY_TEXT", core)
+        self.assertIn("controlTokenAvailable", core)
+        self.assertIn("CONTROL_READONLY_TEXT", app)
+        self.assertIn("const combinedNotice", app)
+        self.assertIn("['POST', 'PUT', 'PATCH', 'DELETE'].includes(method)", core)
         self.assertIn("headers: controlRequestHeaders({ 'Content-Type': pendingIcon.type })",
                       overlays)
 

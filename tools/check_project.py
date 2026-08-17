@@ -17,6 +17,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 
@@ -98,6 +99,16 @@ def command_output(args: list[str], cwd: Path = ROOT) -> str:
             + (f"\n{tail}" if tail else "")
         )
     return output
+
+
+def load_sysops_module():
+    """从项目根目录加载平台层，兼容模块导入和脚本直接执行。"""
+    root_text = str(ROOT)
+    if root_text not in sys.path:
+        sys.path.insert(0, root_text)
+    import sysops
+
+    return sysops
 
 
 def check_required_files() -> str:
@@ -425,6 +436,39 @@ def check_shell_and_plist() -> str:
     return "2 个启动脚本 + Info.plist"
 
 
+def check_windows_acl_smoke() -> str:
+    """在临时路径上验证 Windows 私有 DACL 的实际读写能力。"""
+    if os.name != "nt":
+        return "当前平台跳过 Windows ACL 冒烟测试"
+    sysops = load_sysops_module()
+    require(sysops.IS_WINDOWS, "sysops 未识别当前 Windows 平台")
+    with tempfile.TemporaryDirectory(
+        prefix="console-acl-smoke-", ignore_cleanup_errors=True
+    ) as raw:
+        private_dir = Path(raw) / "private"
+        private_dir.mkdir()
+        sysops.protect_private_directory(str(private_dir))
+        directory_aces = sysops.windows_acl_ace_count(str(private_dir))
+        require(directory_aces is not None and directory_aces > 0,
+                "私有目录 DACL 为空")
+        require(sysops.path_owned_by_current_user(str(private_dir)),
+                "私有目录不属于当前用户")
+
+        probe = private_dir / "acl-probe.bin"
+        probe.write_bytes(b"before")
+        sysops.protect_private_file(str(probe))
+        file_aces = sysops.windows_acl_ace_count(str(probe))
+        require(file_aces is not None and file_aces > 0,
+                "私有文件 DACL 为空")
+        require(sysops.path_owned_by_current_user(str(probe)),
+                "私有文件不属于当前用户")
+        probe.write_bytes(b"after")
+        require(probe.read_bytes() == b"after",
+                "当前用户无法读写受保护文件")
+        probe.unlink()
+    return "Windows 私有目录/文件 DACL 非空且当前用户可读写"
+
+
 def check_dev_requirements() -> str:
     path = ROOT / "requirements-dev.txt"
     lines = [
@@ -645,6 +689,7 @@ def main() -> int:
         report.check("后端测试", check_tests)
         report.check("JavaScript 行为测试", check_javascript_tests)
     if args.release:
+        report.check("Windows ACL 冒烟", check_windows_acl_smoke)
         report.check("素材发布状态", check_asset_release_status)
         report.check("Git 发布边界", check_release_git)
         reviews = [

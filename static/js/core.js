@@ -143,6 +143,7 @@ export const GLYPHS = ['rocket', 'globe', 'terminal', 'server', 'database', 'bot
 const REQUEST_TIMEOUT_MS = 12000;
 const CONTROL_TOKEN_STORAGE_KEY = 'console-control-token';
 const CONTROL_TOKEN_RE = /^[A-Za-z0-9_-]{32,128}$/;
+export const CONTROL_READONLY_TEXT = '当前页面为只读模式，请通过启动器重新打开总控台。';
 
 /* 启动器把能力令牌放在 URL fragment：浏览器不会把 fragment 发送到 HTTP
    服务。首次加载后仅保留到当前标签页的 sessionStorage，并立即清理地址栏。 */
@@ -174,6 +175,8 @@ function loadControlToken() {
 }
 const controlToken = loadControlToken();
 
+export function controlTokenAvailable() { return Boolean(controlToken); }
+
 export function controlRequestHeaders(headers = {}) {
   return controlToken
     ? { ...headers, 'X-Console-Token': controlToken }
@@ -189,6 +192,9 @@ export function currentMutationEpoch() { return mutationEpoch; }
 export function bumpMutationEpoch() { mutationEpoch += 1; }
 
 async function req(method, path, body) {
+  if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(method) && !controlToken) {
+    return { ok: false, error: CONTROL_READONLY_TEXT };
+  }
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
   const opt = { method, signal: controller.signal,
@@ -202,7 +208,7 @@ async function req(method, path, body) {
     if (r.status === 204) { mutationEpoch += 1; return { ok: true }; }
     const type = r.headers.get('content-type') || '';
     const fallbackError = r.status === 401 || r.status === 403
-      ? '访问被拒绝，请从总控台页面重试'
+      ? CONTROL_READONLY_TEXT
       : 'HTTP ' + r.status;
     const data = type.includes('application/json')
       ? await r.json()

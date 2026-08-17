@@ -1,4 +1,5 @@
 import unittest
+import sys
 from unittest import mock
 
 from tools import check_project
@@ -57,6 +58,18 @@ class JavaScriptBindingCheckTests(unittest.TestCase):
             detail = check_project.check_shell_and_plist()
         self.assertIn("Windows", detail)
         command.assert_not_called()
+
+
+class WindowsAclSmokeTests(unittest.TestCase):
+    def test_non_windows_acl_smoke_is_explicitly_skipped(self):
+        with mock.patch.object(check_project.os, "name", "posix"):
+            detail = check_project.check_windows_acl_smoke()
+        self.assertIn("跳过 Windows ACL", detail)
+
+    @unittest.skipUnless(sys.platform == "win32", "仅在 Windows 执行实际 ACL 冒烟")
+    def test_windows_acl_smoke_uses_real_private_permissions(self):
+        detail = check_project.check_windows_acl_smoke()
+        self.assertIn("DACL 非空且当前用户可读写", detail)
 
 
 if __name__ == "__main__":

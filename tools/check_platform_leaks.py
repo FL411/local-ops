@@ -105,9 +105,9 @@ def _platform_block_lines_py(src):
         return skip
 
     def _add_range(node):
-        for l in range(getattr(node, "lineno", 0),
-                       getattr(node, "end_lineno", 0) + 1):
-            skip.add(l)
+        for line_number in range(getattr(node, "lineno", 0),
+                                 getattr(node, "end_lineno", 0) + 1):
+            skip.add(line_number)
 
     def _docstring_lines(node):
         body = getattr(node, "body", [])

@@ -245,6 +245,79 @@ def protect_private_directory(path):
         _protect_private_windows_dacl(path)
 
 
+def windows_acl_ace_count(path):
+    """返回 Windows 路径实际 DACL 的 ACE 数量；非 Windows 返回 None。"""
+    if not IS_WINDOWS:
+        return None
+    try:
+        import ctypes
+        import ctypes.wintypes as wt
+
+        class ACL_SIZE_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("AceCount", wt.DWORD),
+                ("AclBytesInUse", wt.DWORD),
+                ("AclBytesFree", wt.DWORD),
+            ]
+
+        advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        advapi32.GetNamedSecurityInfoW.argtypes = [
+            wt.LPWSTR,
+            wt.DWORD,
+            wt.DWORD,
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+        advapi32.GetNamedSecurityInfoW.restype = wt.DWORD
+        advapi32.GetAclInformation.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            wt.DWORD,
+            wt.DWORD,
+        ]
+        advapi32.GetAclInformation.restype = wt.BOOL
+        kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+        kernel32.LocalFree.restype = ctypes.c_void_p
+
+        dacl = ctypes.c_void_p()
+        descriptor = ctypes.c_void_p()
+        error = advapi32.GetNamedSecurityInfoW(
+            os.path.abspath(path),
+            1,  # SE_FILE_OBJECT
+            0x00000004,  # DACL_SECURITY_INFORMATION
+            None,
+            None,
+            ctypes.byref(dacl),
+            None,
+            ctypes.byref(descriptor),
+        )
+        if error:
+            raise OSError(error, "无法读取 Windows DACL")
+        try:
+            if not dacl.value:
+                return 0
+            info = ACL_SIZE_INFORMATION()
+            if not advapi32.GetAclInformation(
+                dacl,
+                ctypes.byref(info),
+                ctypes.sizeof(info),
+                2,  # AclSizeInformation
+            ):
+                raise OSError(ctypes.get_last_error(), "无法读取 Windows ACL 信息")
+            return int(info.AceCount)
+        finally:
+            if descriptor:
+                kernel32.LocalFree(descriptor)
+    except (AttributeError, OSError, TypeError, ValueError) as exc:
+        if isinstance(exc, OSError):
+            raise
+        raise OSError("无法读取 Windows DACL: %s" % exc) from exc
+
+
 # ------------------------------------------------------------------ 单实例锁
 
 

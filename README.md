@@ -255,6 +255,7 @@ python3 server.py
 - 不要在共享或不受信任的用户账户中运行。
 - 不要把 Application Support 中的 `config.json`、Library Logs 日志或故障截图未经脱敏就上传。
 - 本地回环绑定只是第一层边界。所有写接口还要求当前用户私有 `control.token` 对应的 `X-Console-Token`；启动器仅通过浏览器 URL fragment 传入令牌，前端会立即从地址栏清除。发布验收时必须执行 `RELEASE_CHECKLIST.md` 中的安全项。
+- 直接输入本地 URL 可以只读查看；页面会显示只读提示，变更请求不会在无令牌时发出。需要通过启动器或托盘的“打开控制台”进入可写页面。
 
 **Windows 平台差异**：
 
@@ -366,6 +367,13 @@ make release-check
 ```
 
 它会额外检查 Git 状态和不应进入发行范围的文件；不会代替 `RELEASE_CHECKLIST.md` 中的人工验收。
+
+在 Windows 上，`make release-check` 的等价命令还会在临时目录中真实验证私有目录/文件的 DACL 非空，以及当前用户的创建、读取、覆盖和删除权限：
+
+```bat
+python tools\build_release.py --check-only
+python tools\check_project.py --release
+```
 
 ### 重新生成资源
 
