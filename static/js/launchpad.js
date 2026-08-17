@@ -391,11 +391,12 @@ function updateAppCard(card, app) {
   card.setAttribute('aria-label', appName + '，' + stTxt);
   r.restart.hidden = !app.running || kind !== 'service';
   const blocked = !app.running &&
-    (!!app.portConflict || !!app.portOccupied || !!healthIssue);
+    (!!app.portConflict || !!healthIssue);
+  // 注意：portOccupied 不在此禁用——按钮保持可点，点击时走「释放端口并启动」确认流。
   r.primary.disabled = blocked;
   r.primary.title = app.portConflict
     ? '端口配置重复，请先编辑其中一项'
-    : app.portOccupied ? '端口已被其他进程占用；可打开端口诊断或修改当前卡片端口'
+    : app.portOccupied ? '端口已被占用；点击可释放该进程后启动'
       : healthIssue ? healthIssue.detail || healthIssue.title : '';
   const launchFailed = !app.running && !!app.lastExit
     && (isTask ? taskStatus === 'failed' : app.lastExit.code !== 0);
@@ -419,7 +420,7 @@ async function toggleApp(id, button) {
     return;
   }
   if (!app.running && app.portOccupied) {
-    toast('端口已被 PID ' + (app.portOccupiedPid || '?') + ' 占用');
+    confirmReleaseAndStart(app);
     return;
   }
   const starting = !app.running;
@@ -453,7 +454,7 @@ async function toggleApp(id, button) {
       delete button.dataset.busy;
       const latest = findApp(id);
       button.disabled = !!(latest && !latest.running &&
-        (latest.portConflict || latest.portOccupied ||
+        (latest.portConflict ||
           (latest.health && latest.health.blocking)));
     }
   }
@@ -470,6 +471,46 @@ function confirmRestartApp(app) {
       const r = await act(post('/api/apps/' + app.id + '/restart'));
       if (r && r.ok !== false) toast('已重启 ' + (app.name || '应用'));
       window.__poll();
+    },
+  });
+}
+
+function confirmReleaseAndStart(app) {
+  // 端口被外部进程占用：释放(终止)后从总控台启动。
+  // 安全边界：绝不静默杀——展示占用进程完整信息，用户显式确认后才终止，
+  // 且只允许当前用户进程（后端 /api/kill 的 UID 校验兜底）。
+  const owner = app.portOwner || {};
+  const pid = owner.pid || app.portOccupiedPid;
+  if (!pid) {
+    toast('未识别占用进程，请打开端口诊断查看');
+    return;
+  }
+  if (owner.currentUser === false) {
+    toast('占用进程不属于当前用户，无法释放');
+    return;
+  }
+  const name = owner.name || ('PID ' + pid);
+  const cmd = owner.cmd || '';
+  openConfirm({
+    title: '释放端口并启动',
+    bodyHtml: '端口 :' + escapeHtml(String(app.port)) + ' 被进程 <b>' +
+      escapeHtml(name) + '</b>（PID ' + escapeHtml(String(pid)) + '）占用。' +
+      (cmd ? '<div class="confirm-detail mono">' + escapeHtml(cmd) + '</div>' : '') +
+      '<div class="confirm-detail">确认将终止该进程，然后启动「' +
+      escapeHtml(app.name || '') + '」。</div>',
+    okText: '释放并启动',
+    onOk: async () => {
+      const kill = await act(post('/api/kill', { pid }));
+      if (kill && kill.ok !== false) {
+        // 进程终止是异步的，稍等端口释放后再启动，避免再次撞上占用
+        await new Promise(r => setTimeout(r, 900));
+        await window.__poll();
+        const start = await act(post('/api/apps/' + app.id + '/start'));
+        if (start && start.ok !== false) {
+          toast('已启动 ' + (app.name || '应用'));
+        }
+        await window.__poll();
+      }
     },
   });
 }
