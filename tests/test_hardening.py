@@ -11,6 +11,7 @@ import time
 import unittest
 from unittest import mock
 
+import launcher_check
 import server
 
 
@@ -34,9 +35,13 @@ class HttpHarness:
         self.thread.join(timeout=2)
         self.tmp.cleanup()
 
-    def request(self, method, path, body=None, headers=None):
+    def request(self, method, path, body=None, headers=None,
+                include_token=True):
         conn = http.client.HTTPConnection(server.HOST, self.port, timeout=4)
         request_headers = dict(headers or {})
+        if include_token and method in ("POST", "PUT", "DELETE"):
+            request_headers.setdefault(
+                "X-Console-Token", self.httpd.control_token)
         if body is not None and not isinstance(body, (bytes, bytearray)):
             body = body.encode("utf-8")
         conn.request(method, path, body=body, headers=request_headers)
@@ -59,24 +64,19 @@ class HttpSecurityTests(unittest.TestCase):
     def tearDown(self):
         self.h.close()
 
-    def _browser_headers(self, cookie=None, origin=None):
+    def _browser_headers(self, token=None, origin=None):
         expected = "http://127.0.0.1:%d" % self.h.port
         headers = {
             "Content-Type": "application/json",
             "Origin": expected if origin is None else origin,
             "Sec-Fetch-Site": "same-origin",
         }
-        if cookie:
-            headers["Cookie"] = cookie
+        if token:
+            headers["X-Console-Token"] = token
         return headers
 
-    def _session_cookie(self):
-        status, _, headers = self.h.request("GET", "/api/state")
-        self.assertEqual(status, 200)
-        value = headers.get("Set-Cookie", "")
-        self.assertIn("HttpOnly", value)
-        self.assertIn("SameSite=Strict", value)
-        return value.split(";", 1)[0]
+    def _control_token(self):
+        return self.h.httpd.control_token
 
     def test_dns_rebinding_host_is_rejected_without_setting_cookie(self):
         status, body, headers = self.h.request(
@@ -86,9 +86,9 @@ class HttpSecurityTests(unittest.TestCase):
         self.assertFalse(body["ok"])
         self.assertNotIn("Set-Cookie", headers)
 
-    def test_cross_origin_browser_write_is_rejected_even_with_cookie(self):
-        cookie = self._session_cookie()
-        headers = self._browser_headers(cookie, "https://attacker.example")
+    def test_cross_origin_browser_write_is_rejected_even_with_token(self):
+        token = self._control_token()
+        headers = self._browser_headers(token, "https://attacker.example")
         headers["Sec-Fetch-Site"] = "cross-site"
         status, body, _ = self.h.request(
             "POST", "/api/ui/theme", json.dumps({"theme": "ops"}), headers)
@@ -96,16 +96,16 @@ class HttpSecurityTests(unittest.TestCase):
         self.assertFalse(body["ok"])
         self.assertEqual(self.h.cfg.snapshot()["uiTheme"], "ops")
 
-    def test_same_origin_browser_write_requires_valid_http_only_session(self):
+    def test_same_origin_browser_write_requires_valid_control_token(self):
         status, _, _ = self.h.request(
             "POST", "/api/ui/theme", json.dumps({"theme": "ops"}),
-            self._browser_headers())
+            self._browser_headers(), include_token=False)
         self.assertEqual(status, 403)
 
-        cookie = self._session_cookie()
+        token = self._control_token()
         status, body, _ = self.h.request(
             "POST", "/api/ui/theme", json.dumps({"theme": "ops"}),
-            self._browser_headers(cookie))
+            self._browser_headers(token))
         self.assertEqual(status, 200)
         self.assertTrue(body["ok"])
         self.assertEqual(self.h.cfg.snapshot()["uiTheme"], "ops")
@@ -120,12 +120,17 @@ class HttpSecurityTests(unittest.TestCase):
         status, _, _ = self.h.request("GET", "/")
         self.assertEqual(status, 200)
 
-    def test_headerless_local_cli_json_remains_compatible(self):
+    def test_headerless_local_cli_json_is_rejected(self):
         status, body, _ = self.h.request(
             "POST", "/api/ui/theme", json.dumps({"theme": "ops"}),
-            {"Content-Type": "application/json"})
+            {"Content-Type": "application/json"}, include_token=False)
+        self.assertEqual(status, 403)
+        self.assertFalse(body["ok"])
+
+    def test_get_does_not_publish_control_token_cookie(self):
+        status, _, headers = self.h.request("GET", "/api/state")
         self.assertEqual(status, 200)
-        self.assertTrue(body["ok"])
+        self.assertNotIn("Set-Cookie", headers)
 
     def test_cors_preflight_is_explicitly_denied(self):
         status, _, headers = self.h.request(
@@ -135,6 +140,68 @@ class HttpSecurityTests(unittest.TestCase):
             })
         self.assertEqual(status, 403)
         self.assertNotIn("Access-Control-Allow-Origin", headers)
+
+
+class LauncherCapabilityTokenTests(unittest.TestCase):
+    def test_open_uses_fragment_token_and_restart_uses_header(self):
+        token = "a" * 43
+        with mock.patch.object(launcher_check, "_read_control_token",
+                               return_value=token), \
+                mock.patch("webbrowser.open", return_value=True) as open_browser:
+            self.assertEqual(launcher_check.main(["launcher", "open", "9600"]), 0)
+        self.assertEqual(
+            open_browser.call_args.args[0],
+            "http://127.0.0.1:9600/#console_token=" + token)
+
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        with mock.patch.object(launcher_check, "_read_control_token",
+                               return_value=token), \
+                mock.patch.object(launcher_check.urllib.request, "urlopen",
+                                  return_value=response) as urlopen:
+            self.assertEqual(launcher_check.main(["launcher", "restart", "9600"]), 0)
+        request = urlopen.call_args.args[0]
+        self.assertEqual(request.get_header("X-console-token"), token)
+
+    def test_open_and_restart_fail_closed_without_token(self):
+        with mock.patch.object(launcher_check, "_read_control_token",
+                               return_value=None), \
+                mock.patch("webbrowser.open") as open_browser, \
+                mock.patch.object(launcher_check.urllib.request, "urlopen") as urlopen:
+            self.assertEqual(launcher_check.main(["launcher", "open", "9600"]), 1)
+            self.assertEqual(launcher_check.main(["launcher", "restart", "9600"]), 1)
+        open_browser.assert_not_called()
+        urlopen.assert_not_called()
+
+
+class ControlTokenStorageTests(unittest.TestCase):
+    def test_console_reuses_a_private_persistent_control_token(self):
+        with tempfile.TemporaryDirectory() as td:
+            cfg = server.Config(os.path.join(td, "config.json"))
+            first = server.ConsoleServer((server.HOST, 0), server.Handler,
+                                         cfg, 0)
+            try:
+                token = first.control_token
+                self.assertRegex(token, r"^[A-Za-z0-9_-]{32,128}$")
+                self.assertTrue(os.path.isfile(os.path.join(td, "control.token")))
+            finally:
+                first.server_close()
+            second = server.ConsoleServer((server.HOST, 0), server.Handler,
+                                          cfg, 0)
+            try:
+                self.assertEqual(second.control_token, token)
+            finally:
+                second.server_close()
+
+    def test_existing_token_with_untrusted_owner_is_rejected(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "control.token")
+            with open(path, "w", encoding="ascii") as f:
+                f.write("a" * 43)
+            with mock.patch.object(server.sysops, "path_owned_by_current_user",
+                                   return_value=False):
+                with self.assertRaises(OSError):
+                    server.load_control_token(path)
 
 
 class AtomicAttachCreateTests(unittest.TestCase):
@@ -164,7 +231,8 @@ class AtomicAttachCreateTests(unittest.TestCase):
                 mock.patch.object(server, "scan_listeners",
                                   return_value={(4242, 3000)}), \
                 mock.patch.object(server, "ps_snapshot",
-                                  return_value={4242: {"uid": server.SELF_UID}}), \
+                                  return_value={4242: {"uid": server.SELF_UID,
+                                                       "ctime": 123456.0}}), \
                 mock.patch.object(server, "listener_app_owners",
                                   return_value={}), \
                 mock.patch.object(server, "lsof_cwds",
@@ -178,6 +246,7 @@ class AtomicAttachCreateTests(unittest.TestCase):
         apps = self.h.cfg.snapshot()["apps"]
         self.assertEqual(len(apps), 1)
         self.assertEqual(apps[0]["lastPid"], 4242)
+        self.assertEqual(apps[0]["lastCreateTime"], 123456.0)
         self.assertEqual(apps[0]["cwd"], "/actual")
         self.assertTrue(apps[0]["attached"])
 
@@ -966,6 +1035,14 @@ class StateCacheTests(unittest.TestCase):
 
 
 class WindowsProcessSnapshotTests(unittest.TestCase):
+    @unittest.skipUnless(server.sysops.IS_WINDOWS,
+                         "Windows TokenUser SID only")
+    def test_current_process_identity_is_a_sid(self):
+        self.assertRegex(server.sysops.SELF_UID or "", r"^S-1-")
+        self.assertEqual(
+            server.sysops.process_uid(os.getpid()), server.sysops.SELF_UID)
+        self.assertFalse(server.is_current_user(None))
+
     def test_targeted_snapshot_skips_pid_that_exits_before_lookup(self):
         fake_psutil = mock.Mock()
         fake_psutil.Process.side_effect = server.sysops.psutil.NoSuchProcess(

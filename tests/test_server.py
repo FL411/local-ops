@@ -170,6 +170,52 @@ class ScriptCommandTests(unittest.TestCase):
                 ["/bin/bash", "--", path])
 
 
+@unittest.skipUnless(not IS_POSIX, "Windows 脚本命令语义")
+class WindowsScriptCommandTests(unittest.TestCase):
+    def test_selected_python_script_with_spaces_is_checked(self):
+        with tempfile.TemporaryDirectory() as td:
+            folder = os.path.join(td, "script folder")
+            os.mkdir(folder)
+            path = os.path.join(folder, "daily task.py")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("print('ok')\n")
+            command = server.command_for_script(path)
+            tokens = server._simple_command_tokens(command)
+            self.assertEqual(tokens[0].casefold(), sys.executable.casefold())
+            target, direct, relative = server._script_target(tokens, td)
+            self.assertEqual(os.path.normcase(target), os.path.normcase(path))
+            self.assertFalse(direct)
+            self.assertFalse(relative)
+            self.assertFalse(server.inspect_app_health(
+                {"command": command, "cwd": td})["blocking"])
+
+            os.unlink(path)
+            health = server.inspect_app_health({"command": command, "cwd": td})
+        self.assertTrue(health["blocking"])
+        self.assertEqual(health["issues"][0]["kind"], "script-missing")
+
+    def test_batch_and_powershell_scripts_are_checked(self):
+        with tempfile.TemporaryDirectory() as td:
+            for suffix in (".bat", ".ps1"):
+                with self.subTest(suffix=suffix):
+                    path = os.path.join(td, "run task" + suffix)
+                    with open(path, "w", encoding="utf-8") as handle:
+                        handle.write("echo ok\n")
+                    command = server.command_for_script(path)
+                    tokens = server._simple_command_tokens(command)
+                    target, _, relative = server._script_target(tokens, td)
+                    self.assertEqual(os.path.normcase(target), os.path.normcase(path))
+                    self.assertFalse(relative)
+
+    def test_windows_dynamic_commands_remain_unknown(self):
+        self.assertIsNone(server._simple_command_tokens("python %SCRIPT%"))
+        self.assertIsNone(server._simple_command_tokens("python app.py && echo done"))
+
+    def test_cmd_metacharacters_in_selected_path_are_quoted(self):
+        self.assertEqual(server._quote_win(r"C:\work&tools\task.bat"),
+                         r'"C:\work&tools\task.bat"')
+
+
 class AppHealthTests(unittest.TestCase):
     @unittest.skipUnless(IS_POSIX, "脚本执行位/shebang 语义为 macOS 专属")
     def test_python_script_with_spaces_is_checked_without_running_it(self):
@@ -206,8 +252,11 @@ class AppHealthTests(unittest.TestCase):
                          ["cwd-missing"])
 
     def test_complex_or_dynamic_command_is_unknown_and_not_blocked(self):
-        for command in ("python3 job.py && echo done", "python3 '$JOB'",
-                        "python3 'unterminated"):
+        commands = ("python3 job.py && echo done", "python3 '$JOB'",
+                    "python3 'unterminated") if IS_POSIX else (
+                        "python app.py && echo done", "python %SCRIPT%",
+                        'python "unterminated')
+        for command in commands:
             with self.subTest(command=command):
                 health = server.inspect_app_health(
                     {"command": command, "cwd": None})
@@ -751,7 +800,8 @@ class ProcessIdentityTests(unittest.TestCase):
                 mock.patch.object(server, "scan_listeners",
                                   return_value={(4242, 8080)}), \
                 mock.patch.object(server, "ps_snapshot",
-                                  return_value={4242: {"uid": server.SELF_UID + 1}}):
+                                  return_value={4242: {
+                                      "uid": str(server.SELF_UID) + "-other"}}):
             ok, error, _ = server.attach_app_process(cfg, "a", app, 4242)
         self.assertFalse(ok)
         self.assertIn("不属于当前用户", error)
@@ -785,6 +835,38 @@ class ProcessIdentityTests(unittest.TestCase):
             self.assertEqual(server.legacy_managed_pid(app, **common), 4242)
         # POSIX 语义：不校验 ctime（无该字段语义），正常命中
         self.assertEqual(server.legacy_managed_pid(app, **common), 4242)
+
+    def test_attached_replacement_pid_uses_unique_sid_cwd_match(self):
+        app = {"id": "a", "port": 3000, "cwd": "/project",
+               "kind": "service", "lastPid": 4242, "attached": True,
+               "lastCreateTime": 1000.0}
+        common = {
+            "listeners": {(5252, 3000), (6262, 3000)},
+            "snap": {
+                5252: {"uid": server.SELF_UID, "ctime": 2000.0},
+                6262: {"uid": server.SELF_UID, "ctime": 3000.0},
+            },
+            "cwds": {5252: "/project", 6262: "/other"},
+        }
+        with mock.patch.object(server.sysops, "IS_WINDOWS", True):
+            self.assertEqual(server.legacy_managed_pid(app, **common), 5252)
+
+    def test_attached_pid_rotation_repair_is_compare_and_swap(self):
+        with tempfile.TemporaryDirectory() as td:
+            cfg = server.Config(os.path.join(td, "config.json"))
+            app = {**server.Config.APP_DEFAULT, "id": "a", "name": "A",
+                   "command": "x", "port": 3000, "cwd": "/project",
+                   "attached": True, "lastPid": 4242,
+                   "lastCreateTime": 1000.0}
+            cfg.update(lambda data: data["apps"].append(app))
+            repair = {"id": "a", "recordedPid": 4242, "port": 3000,
+                      "cwd": "/project", "pid": 5252, "ctime": 2000.0}
+            self.assertTrue(server.repair_attached_app_identities(cfg, [repair]))
+            repaired = cfg.snapshot()["apps"][0]
+            self.assertEqual(repaired["lastPid"], 5252)
+            self.assertEqual(repaired["lastCreateTime"], 2000.0)
+            # 已不是同一旧身份，重复刷新不能覆盖后续状态。
+            self.assertFalse(server.repair_attached_app_identities(cfg, [repair]))
 
     def test_attach_records_last_create_time(self):
         app = {"id": "a", "port": 8080, "kind": "service", "cwd": "/x"}
@@ -1041,7 +1123,7 @@ class StateTests(unittest.TestCase):
             10: {"uid": server.SELF_UID, "comm": "ffmpeg",
                  "args": "ffmpeg -i render-worker.mov",
                  "cpu": 1.0, "mem": 2.0, "etime": 3},
-            11: {"uid": server.SELF_UID + 1, "comm": "ffmpeg", "args": "ffmpeg -i b",
+            11: {"uid": str(server.SELF_UID) + "-other", "comm": "ffmpeg", "args": "ffmpeg -i b",
                  "cpu": 1.0, "mem": 2.0, "etime": 3},
         }
         with mock.patch.object(server, "ps_snapshot", return_value=snap):
@@ -1115,7 +1197,7 @@ class ConsoleRestartTests(unittest.TestCase):
                     "etime": 10},
             71002: {"uid": server.SELF_UID, "args": "python3 server.py",
                     "etime": 20},
-            71003: {"uid": server.SELF_UID + 1, "args": "python3 server.py",
+            71003: {"uid": str(server.SELF_UID) + "-other", "args": "python3 server.py",
                     "etime": 30},
             71004: {"uid": server.SELF_UID, "args": "python3 server.py --launcher",
                     "etime": 40},
@@ -1350,19 +1432,35 @@ class AutostartTests(unittest.TestCase):
             {"id": "d", "kind": "service", "autostart": True, "name": "s3"},
         ]
         cfg = self._cfg(apps)
+        fake_proc = mock.Mock(pid=123)
+        fake_proc.poll.return_value = None
         with mock.patch.object(server.time, "sleep"), \
                 mock.patch.object(server, "app_alive_sign",
                                   side_effect=lambda a: a["id"] == "d"), \
                 mock.patch.object(server, "inspect_app_health",
                                   return_value={"blocking": False}), \
                 mock.patch.object(server, "start_app",
-                                  return_value=(True, None, mock.Mock(),
+                                  return_value=(True, None, fake_proc,
                                                 123, "tok")) as start_mock, \
                 mock.patch.object(server, "persist_started_app",
                                   return_value=True):
             server._autostart_managed_apps(cfg)
         started = [c.args[0]["id"] for c in start_mock.call_args_list]
         self.assertEqual(started, ["a"])
+
+    def test_autostart_delegates_to_the_shared_start_transaction(self):
+        apps = [
+            {"id": "a", "kind": "service", "autostart": True,
+             "name": "s1"},
+            {"id": "b", "kind": "task", "autostart": True,
+             "name": "t1"},
+        ]
+        cfg = self._cfg(apps)
+        with mock.patch.object(server.time, "sleep"), \
+                mock.patch.object(server, "start_app_transaction",
+                                  return_value={"ok": True}) as start_txn:
+            server._autostart_managed_apps(cfg)
+        start_txn.assert_called_once_with(cfg, "a", require_autostart=True)
 
     def test_autostart_skips_blocking_health_and_does_not_raise_on_failure(self):
         apps = [

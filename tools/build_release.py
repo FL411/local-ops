@@ -44,7 +44,14 @@ INCLUDE = (
     "licenses",
     *REQUIRED_LICENSES,
     "server.py",
+    "sysops.py",
+    "tray.py",
     "start.command",
+    "start.bat",
+    "launcher_check.py",
+    "requirements-runtime-win.txt",
+    "LocalOpsConsole.exe",
+    "console.ico",
     "总控台.app",
     "static",
     "docs",
@@ -114,23 +121,26 @@ SEMVER_RE = re.compile(
     r"(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$"
 )
 POSIX_HOME_RE = re.compile(
-    rb"/(?:Users|home)/([^/\\\x00\r\n\t \"'<>]+)"
-    rb"(?=/|[\x00\r\n\t \"'<>]|$)"
+    rb"/(?:Users|home)/([^/\\\x00\r\n\t \"'<>`]+)"
+    rb"(?=/|[\x00\r\n\t \"'<>`]|$)"
 )
 WINDOWS_HOME_RE = re.compile(
     rb"(?i)[A-Z]:[\\/]+Users[\\/]+"
-    rb"([^/\\\x00\r\n\t \"'<>]+)(?=[\\/]|[\x00\r\n\t \"'<>]|$)"
+    rb"([^/\\\x00\r\n\t \"'<>`]+)(?=[\\/]|[\x00\r\n\t \"'<>`]|$)"
 )
 ESCAPED_POSIX_HOME_RE = re.compile(
-    rb"\\/(?:Users|home)\\/([^/\\\x00\r\n\t \"'<>]+)"
-    rb"(?=\\/|[\x00\r\n\t \"'<>]|$)"
+    rb"\\/(?:Users|home)\\/([^/\\\x00\r\n\t \"'<>`]+)"
+    rb"(?=\\/|[\x00\r\n\t \"'<>`]|$)"
 )
 PERCENT_HOME_RE = re.compile(
-    rb"(?i)%2f(?:Users|home)%2f([^%/\\\x00\r\n\t \"'<>]+)"
-    rb"(?=%2f|[\x00\r\n\t \"'<>]|$)"
+    rb"(?i)%2f(?:Users|home)%2f([^%/\\\x00\r\n\t \"'<>`]+)"
+    rb"(?=%2f|[\x00\r\n\t \"'<>`]|$)"
 )
 PLACEHOLDER_USERS = {
     b"example",
+    b"name",
+    b"username",
+    b"user",
 }
 PRIVATE_KEY_MARKERS = (
     b"-----BEGIN " + b"PRIVATE KEY-----",

@@ -254,11 +254,11 @@ python3 server.py
 - 不要将服务绑定到 `0.0.0.0`，不要通过反向代理、SSH 隧道或端口映射对外暴露。
 - 不要在共享或不受信任的用户账户中运行。
 - 不要把 Application Support 中的 `config.json`、Library Logs 日志或故障截图未经脱敏就上传。
-- 本地回环绑定只是第一层边界，不能替代写接口的 Host/Origin/控制令牌防护。发布验收时必须执行 `RELEASE_CHECKLIST.md` 中的安全项。
+- 本地回环绑定只是第一层边界。所有写接口还要求当前用户私有 `control.token` 对应的 `X-Console-Token`；启动器仅通过浏览器 URL fragment 传入令牌，前端会立即从地址栏清除。发布验收时必须执行 `RELEASE_CHECKLIST.md` 中的安全项。
 
 **Windows 平台差异**：
 
-- Windows 没有与 Unix 等价的 uid/进程组语义。受控进程识别使用「随机运行 token + 以根 PID 为锚点的进程树回溯」代替「token + PGID + UID」；`SELF_UID` 恒为 0（本机交互用户），因此「只能操作当前用户进程」的校验在 Windows 上不生效——请在**个人单用户电脑**上使用，不要在共享主机上运行。
+- Windows 没有 Unix PGID，受控进程识别使用「随机运行 token + 以根 PID 为锚点的进程树回溯」代替 PGID；进程归属则使用 TokenUser SID，无法读取 SID 的进程不会被当作当前用户。写接口还要求私有能力令牌，因此其他本地账户不能仅凭回环端口控制总控台。
 - 受控应用的启动命令通过 `cmd.exe /c` 执行：`service` 请使用前台命令（如 `python -m http.server`、`node server.js`）；需要 Shell 语法时同样可用（`&`、`&&` 等）。
 - 系统通知使用浏览器 Notification API（与 macOS 一致），无需额外依赖。
 
@@ -273,7 +273,7 @@ Windows 为同一代码库的移植版本（平台差异收口在 `sysops.py` �
 | favicon 抓取、图标上传 | ✅ 一致 | 见下方限制 |
 | 命令面板、新端口发现、设置中心 | ✅ 一致 | 快捷键显示为 `Ctrl`（macOS 为 `⌘`） |
 | 优雅停止 | ⚠️ 差异 | 无 SIGTERM：带窗口进程走 WM_CLOSE 软通道，无窗口服务只能硬杀（macOS 可被 SIGTERM 捕获落盘） |
-| 用户隔离 | ⚠️ 受限 | `SELF_UID` 恒 0，「只能操作当前用户进程」校验不生效——仅限个人单用户电脑 |
+| 用户隔离 | ✅ | Windows 以 TokenUser SID 校验进程归属；所有写接口要求当前用户私有 `control.token` 对应的能力令牌 |
 | CPU 口径 | ⚠️ 差异 | 按「占全部逻辑核百分比」（任务管理器口径），`/api/state` 带 `coreCount`；macOS 为单核口径 |
 | Shell 语义 | ⚠️ 差异 | `cmd.exe /c` 包装：`service` 用前台命令，**命令内不要用单引号**（cmd 不识别） |
 | 启动器 | ✅ 等价 | `start.bat`（双击后台运行、首次自动装 psutil、已有实例时显示打开/重启/取消菜单）；运行中显示**系统托盘图标**（左键打开、右键菜单重启/停止，tooltip 显示端口与状态） |

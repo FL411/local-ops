@@ -13,13 +13,45 @@
 避免把占用 9600-9609 的无关程序误判为控制台。
 """
 import json
+import os
 import socket
+import stat
 import sys
+import re
+import urllib.parse
 import urllib.request
 
 PORT_START = 9600
 PORT_TRIES = 10
 HEALTH_TIMEOUT = 1.0
+CONTROL_TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{32,128}\Z")
+
+
+def _control_token_path():
+    raw = (os.environ.get("CONSOLE_DATA_DIR") or "").strip()
+    if raw:
+        return os.path.join(os.path.abspath(os.path.expanduser(raw)),
+                            "control.token")
+    base = os.environ.get("APPDATA") or os.path.expanduser("~/AppData/Roaming")
+    return os.path.join(base, "总控台", "control.token")
+
+
+def _read_control_token():
+    path = _control_token_path()
+    try:
+        if not stat.S_ISREG(os.lstat(path).st_mode):
+            return None
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        with os.fdopen(os.open(path, flags), "rb") as f:
+            token = f.read(256).decode("ascii").strip()
+    except (OSError, UnicodeError):
+        return None
+    return token if CONTROL_TOKEN_RE.fullmatch(token) else None
+
+
+def _console_url(port, token):
+    return "http://127.0.0.1:%d/#console_token=%s" % (
+        port, urllib.parse.quote(token, safe="-_"))
 
 
 def _is_console(port):
@@ -64,8 +96,12 @@ def main(argv):
         if port is None:
             print("STOPPED")
             return 0
+        token = _read_control_token()
+        if not token:
+            print("TOKEN_UNAVAILABLE")
+            return 1
         import webbrowser
-        webbrowser.open("http://127.0.0.1:%d/" % port)
+        webbrowser.open(_console_url(port, token))
         print("OPENED %d" % port)
         return 0
 
@@ -73,10 +109,15 @@ def main(argv):
         if port is None:
             print("STOPPED")
             return 0
+        token = _read_control_token()
+        if not token:
+            print("TOKEN_UNAVAILABLE")
+            return 1
         req = urllib.request.Request(
             "http://127.0.0.1:%d/api/console/restart" % port,
             data=b"{}", method="POST",
-            headers={"Content-Type": "application/json"})
+            headers={"Content-Type": "application/json",
+                     "X-Console-Token": token})
         with urllib.request.urlopen(req, timeout=8) as r:
             r.read()
         print("RESTARTING %d" % port)

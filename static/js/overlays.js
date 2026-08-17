@@ -4,7 +4,7 @@
    ============================================================ */
 import { $, el, setText, setChildren, icon, escapeHtml,
   post, put, del, act, toast, openLayer, closeLayer,
-  GLYPHS, findApp, bumpMutationEpoch, IS_MAC } from './core.js';
+  GLYPHS, findApp, bumpMutationEpoch, controlRequestHeaders, IS_MAC } from './core.js';
 
 /* ---------------- DOM 引用 ---------------- */
 const appModalMask = $('#appModalMask'), appModal = $('#appModal'), appModalTitle = $('#appModalTitle');
@@ -534,7 +534,7 @@ async function saveApp() {
       try {
         const r = await fetch('/api/apps/' + id + '/icon', {
           method: 'POST',
-          headers: { 'Content-Type': pendingIcon.type },
+          headers: controlRequestHeaders({ 'Content-Type': pendingIcon.type }),
           body: pendingIcon.blob,
         });
         const j = await r.json();

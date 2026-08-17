@@ -1,4 +1,5 @@
 import unittest
+from unittest import mock
 
 from tools import check_project
 
@@ -49,6 +50,13 @@ class JavaScriptBindingCheckTests(unittest.TestCase):
     def test_project_modules_have_no_unbound_core_calls(self):
         detail = check_project.check_javascript_bindings()
         self.assertIn("公共可调用导出", detail)
+
+    def test_windows_launcher_check_does_not_invoke_macos_tools(self):
+        with mock.patch.object(check_project.os, "name", "nt"), \
+                mock.patch.object(check_project, "command_output") as command:
+            detail = check_project.check_shell_and_plist()
+        self.assertIn("Windows", detail)
+        command.assert_not_called()
 
 
 if __name__ == "__main__":

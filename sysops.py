@@ -39,16 +39,87 @@ LOG_LOCK = threading.RLock()
 # ------------------------------------------------------------------ 平台常量
 
 
-def self_uid():
-    """当前用户身份标识。
+def _windows_process_sid(pid):
+    """返回 Windows 进程 TokenUser SID 字符串；无法可靠读取时返回 None。"""
+    if not IS_WINDOWS:
+        return None
+    try:
+        import ctypes
+        import ctypes.wintypes as wt
 
-    POSIX 返回真实 uid；Windows 没有与 Unix 等价的 uid，psutil 也不暴露
-    跨进程 uid，这里统一返回 0 表示“本机交互用户”，配合本地回环边界使用。
-    单用户桌面场景可接受；多用户共享主机请改用 POSIX 平台。
-    """
+        process_query_limited_information = 0x1000
+        token_query = 0x0008
+        token_user_class = 1
+
+        class SID_AND_ATTRIBUTES(ctypes.Structure):
+            _fields_ = [("Sid", ctypes.c_void_p), ("Attributes", wt.DWORD)]
+
+        class TOKEN_USER(ctypes.Structure):
+            _fields_ = [("User", SID_AND_ATTRIBUTES)]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
+        kernel32.OpenProcess.restype = wt.HANDLE
+        kernel32.CloseHandle.argtypes = [wt.HANDLE]
+        kernel32.CloseHandle.restype = wt.BOOL
+        kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+        kernel32.LocalFree.restype = ctypes.c_void_p
+        advapi32.OpenProcessToken.argtypes = [wt.HANDLE, wt.DWORD,
+                                              ctypes.POINTER(wt.HANDLE)]
+        advapi32.OpenProcessToken.restype = wt.BOOL
+        advapi32.GetTokenInformation.argtypes = [
+            wt.HANDLE, ctypes.c_uint, ctypes.c_void_p, wt.DWORD,
+            ctypes.POINTER(wt.DWORD)]
+        advapi32.GetTokenInformation.restype = wt.BOOL
+        advapi32.ConvertSidToStringSidW.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(wt.LPWSTR)]
+        advapi32.ConvertSidToStringSidW.restype = wt.BOOL
+
+        process = kernel32.OpenProcess(
+            process_query_limited_information, False, int(pid))
+        if not process:
+            return None
+        try:
+            token = wt.HANDLE()
+            if not advapi32.OpenProcessToken(process, token_query,
+                                             ctypes.byref(token)):
+                return None
+            try:
+                size = wt.DWORD()
+                # 首次调用预期失败并返回所需缓冲区长度。
+                advapi32.GetTokenInformation(
+                    token, token_user_class, None, 0, ctypes.byref(size))
+                if not size.value:
+                    return None
+                buffer = ctypes.create_string_buffer(size.value)
+                if not advapi32.GetTokenInformation(
+                        token, token_user_class, buffer, size,
+                        ctypes.byref(size)):
+                    return None
+                token_user = ctypes.cast(
+                    buffer, ctypes.POINTER(TOKEN_USER)).contents
+                sid_text = wt.LPWSTR()
+                if not advapi32.ConvertSidToStringSidW(
+                        token_user.User.Sid, ctypes.byref(sid_text)):
+                    return None
+                try:
+                    return sid_text.value or None
+                finally:
+                    kernel32.LocalFree(ctypes.cast(sid_text, ctypes.c_void_p))
+            finally:
+                kernel32.CloseHandle(token)
+        finally:
+            kernel32.CloseHandle(process)
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+
+
+def self_uid():
+    """当前用户身份标识（POSIX uid / Windows TokenUser SID）。"""
     if IS_POSIX:
         return os.getuid()
-    return 0
+    return _windows_process_sid(os.getpid())
 
 
 SELF_UID = self_uid()
@@ -79,6 +150,99 @@ def default_logs_dir():
         return os.path.expanduser("~/Library/Logs/总控台")
     base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~/AppData/Local")
     return os.path.join(base, "总控台")
+
+
+def _protect_private_windows_dacl(path):
+    """将 Windows 路径 DACL 替换为仅当前 TokenUser SID 的受保护 ACL。"""
+    if not IS_WINDOWS:
+        return
+    sid = SELF_UID
+    if not isinstance(sid, str) or not sid:
+        raise OSError("无法读取当前 Windows 用户 SID")
+    try:
+        import ctypes
+        import ctypes.wintypes as wt
+
+        class TRUSTEE_W(ctypes.Structure):
+            _fields_ = [
+                ("pMultipleTrustee", ctypes.c_void_p),
+                ("MultipleTrusteeOperation", wt.DWORD),
+                ("TrusteeForm", wt.DWORD),
+                ("TrusteeType", wt.DWORD),
+                ("ptstrName", ctypes.c_void_p),
+            ]
+
+        class EXPLICIT_ACCESS_W(ctypes.Structure):
+            _fields_ = [
+                ("grfAccessPermissions", wt.DWORD),
+                ("grfAccessMode", wt.DWORD),
+                ("grfInheritance", wt.DWORD),
+                ("Trustee", TRUSTEE_W),
+            ]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+        kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+        kernel32.LocalFree.restype = ctypes.c_void_p
+        advapi32.ConvertStringSidToSidW.argtypes = [
+            wt.LPCWSTR, ctypes.POINTER(ctypes.c_void_p)]
+        advapi32.ConvertStringSidToSidW.restype = wt.BOOL
+        advapi32.SetEntriesInAclW.argtypes = [
+            wt.ULONG, ctypes.POINTER(EXPLICIT_ACCESS_W), ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_void_p)]
+        advapi32.SetEntriesInAclW.restype = wt.DWORD
+        advapi32.SetNamedSecurityInfoW.argtypes = [
+            wt.LPWSTR, ctypes.c_int, wt.DWORD, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+        advapi32.SetNamedSecurityInfoW.restype = wt.DWORD
+
+        sid_ptr = ctypes.c_void_p()
+        if not advapi32.ConvertStringSidToSidW(sid, ctypes.byref(sid_ptr)):
+            raise OSError(ctypes.get_last_error(), "无法解析当前 Windows 用户 SID")
+        acl_ptr = ctypes.c_void_p()
+        try:
+            access = EXPLICIT_ACCESS_W()
+            access.grfAccessPermissions = 0x10000000  # GENERIC_ALL
+            access.grfAccessMode = 1                  # GRANT_ACCESS
+            access.grfInheritance = 0                 # NO_INHERITANCE
+            access.Trustee.TrusteeForm = 0             # TRUSTEE_IS_SID
+            access.Trustee.TrusteeType = 1             # TRUSTEE_IS_USER
+            access.Trustee.ptstrName = sid_ptr
+            error = advapi32.SetEntriesInAclW(
+                1, ctypes.byref(access), None, ctypes.byref(acl_ptr))
+            if error:
+                raise OSError(error, "无法创建 Windows 私有文件 ACL")
+            try:
+                # SE_FILE_OBJECT + DACL_SECURITY_INFORMATION +
+                # PROTECTED_DACL_SECURITY_INFORMATION：移除继承和所有旧 ACE。
+                error = advapi32.SetNamedSecurityInfoW(
+                    os.path.abspath(path), 1, 0x80000004,
+                    None, None, acl_ptr, None)
+                if error:
+                    raise OSError(error, "无法设置 Windows 私有文件 ACL")
+            finally:
+                if acl_ptr:
+                    kernel32.LocalFree(acl_ptr)
+        finally:
+            kernel32.LocalFree(sid_ptr)
+    except (AttributeError, OSError, TypeError, ValueError) as exc:
+        if isinstance(exc, OSError):
+            raise
+        raise OSError("无法设置 Windows 私有文件 ACL: %s" % exc) from exc
+
+
+def protect_private_file(path):
+    """将私有文件限制为当前用户可读写。"""
+    os.chmod(path, 0o600)
+    if IS_WINDOWS:
+        _protect_private_windows_dacl(path)
+
+
+def protect_private_directory(path):
+    """将私有目录限制为当前用户可访问，阻止令牌被替换或预先放置。"""
+    os.chmod(path, 0o700)
+    if IS_WINDOWS:
+        _protect_private_windows_dacl(path)
 
 
 # ------------------------------------------------------------------ 单实例锁
@@ -207,10 +371,61 @@ def process_uid(pid):
             return int(toks[0])
         except ValueError:
             return None
-    # Windows：统一视为当前交互用户
-    if pid_alive(pid):
-        return 0
-    return None
+    return _windows_process_sid(pid)
+
+
+def _windows_path_owner_sid(path):
+    """返回文件/目录所有者 SID；无法可靠读取时返回 None。"""
+    if not IS_WINDOWS:
+        return None
+    try:
+        import ctypes
+        import ctypes.wintypes as wt
+
+        advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        advapi32.GetNamedSecurityInfoW.argtypes = [
+            wt.LPWSTR, ctypes.c_int, wt.DWORD, ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p)]
+        advapi32.GetNamedSecurityInfoW.restype = wt.DWORD
+        advapi32.ConvertSidToStringSidW.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(wt.LPWSTR)]
+        advapi32.ConvertSidToStringSidW.restype = wt.BOOL
+        kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+        kernel32.LocalFree.restype = ctypes.c_void_p
+
+        owner = ctypes.c_void_p()
+        descriptor = ctypes.c_void_p()
+        error = advapi32.GetNamedSecurityInfoW(
+            os.path.abspath(path), 1, 0x00000001, ctypes.byref(owner), None,
+            None, None, ctypes.byref(descriptor))
+        if error or not owner:
+            return None
+        try:
+            sid_text = wt.LPWSTR()
+            if not advapi32.ConvertSidToStringSidW(
+                    owner, ctypes.byref(sid_text)):
+                return None
+            try:
+                return sid_text.value or None
+            finally:
+                kernel32.LocalFree(ctypes.cast(sid_text, ctypes.c_void_p))
+        finally:
+            kernel32.LocalFree(descriptor)
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+
+
+def path_owned_by_current_user(path):
+    """路径是否明确由当前用户拥有；身份未知必须返回 False。"""
+    try:
+        if IS_POSIX:
+            return os.stat(path, follow_symlinks=False).st_uid == SELF_UID
+        owner = _windows_path_owner_sid(path)
+        return owner is not None and SELF_UID is not None and owner == SELF_UID
+    except OSError:
+        return False
 
 
 # ------------------------------------------------------------------ 进程快照
@@ -347,7 +562,9 @@ def _ps_snapshot_windows(pids=None, with_uid=True):
             create_time = info["create_time"]
             etime = int(max(0.0, now - create_time)) if create_time else 0
             snap[pid] = {
-                "uid": 0 if with_uid else -1,
+                # psutil 不提供 SID；通过 TokenUser 读取失败时保留 None，
+                # 调用方必须把未知身份当成非当前用户。
+                "uid": _windows_process_sid(pid) if with_uid else -1,
                 "comm": comm,
                 "args": args,
                 "cpu": cpu_by_pid.get(pid, 0.0),

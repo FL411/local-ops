@@ -23,6 +23,15 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 STATIC = ROOT / "static"
 INFO_PLIST = ROOT / "总控台.app" / "Contents" / "Info.plist"
+WINDOWS_RUNTIME_FILES = (
+    "sysops.py",
+    "tray.py",
+    "start.bat",
+    "launcher_check.py",
+    "requirements-runtime-win.txt",
+    "LocalOpsConsole.exe",
+    "console.ico",
+)
 SEMVER_RE = re.compile(
     r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
     r"(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?"
@@ -112,6 +121,7 @@ def check_required_files() -> str:
         "Makefile",
         "server.py",
         "start.command",
+        *WINDOWS_RUNTIME_FILES,
         "tests/test_server.py",
         "docs/screenshots/ops-launchpad.jpg",
         "docs/screenshots/ops-services.jpg",
@@ -392,6 +402,17 @@ def check_javascript_bindings() -> str:
 
 
 def check_shell_and_plist() -> str:
+    if os.name == "nt":
+        missing = [name for name in WINDOWS_RUNTIME_FILES
+                   if not (ROOT / name).is_file()]
+        require(not missing, "缺少 Windows 启动文件: " + ", ".join(missing))
+        launcher = (ROOT / "start.bat").read_text(
+            encoding="utf-8", errors="replace")
+        require("launcher_check.py" in launcher,
+                "start.bat 未调用 launcher_check.py")
+        return f"Windows {len(WINDOWS_RUNTIME_FILES)} 个启动/运行时文件"
+    if sys.platform != "darwin":
+        return "当前平台不执行 macOS 启动器语法检查"
     shell_files = (
         ROOT / "start.command",
         ROOT / "总控台.app" / "Contents" / "MacOS" / "launcher",
@@ -611,7 +632,7 @@ def main() -> int:
         ("Python 语法", check_python_syntax),
         ("JavaScript 语法", check_javascript_syntax),
         ("JavaScript 模块绑定", check_javascript_bindings),
-        ("启动脚本与 plist", check_shell_and_plist),
+        ("平台启动器", check_shell_and_plist),
         ("开发依赖锁定", check_dev_requirements),
         ("素材来源台账", check_asset_provenance),
         ("主题注册表", check_themes),

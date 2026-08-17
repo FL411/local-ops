@@ -20,7 +20,7 @@
 | 3 | 新端口发现 + 加入启动台 | ✅ | 前端冒烟（8015 新端口出现 + 加入） |
 | 4 | 运行前检查 + 修复入口 | ✅ | diagnose 测试、健康检查 |
 | 5 | 项目识别 | ✅ | detect_project 6/6 |
-| 6 | 受控进程识别（token+进程组+UID） | ✅ 等价 | Windows 用进程树回溯替代 PGID；UID 语义差异已文档化 |
+| 6 | 受控进程识别（token+进程组+UID） | ✅ 等价 | Windows 用进程树回溯替代 PGID，并以 TokenUser SID 校验当前用户 |
 | 7 | 单一 Ops 主题 + 深浅色跟随 | ✅ | 本次验证 light→dark 切换（html[data-theme]） |
 | 8 | 命令面板 + 拖拽/键盘排序 | ✅ | 命令面板冒烟；reorder API 本次验证；拖拽为 pointerdown 自定义实现 |
 
@@ -32,8 +32,9 @@
 
 ## 四、平台语义差异（非缺失，已在 README 支持矩阵文档化）
 
-UID 校验失效（单用户前提）、CPU 口径（全核百分比）、优雅停止（WM_CLOSE+硬杀）、
-Shell 包装（cmd /c，禁单引号）、快捷键显示（Ctrl vs ⌘）、数据目录（%APPDATA%）。
+CPU 口径（全核百分比）、优雅停止（WM_CLOSE+硬杀）、Shell 包装（cmd /c，禁单引号）、
+快捷键显示（Ctrl vs ⌘）、数据目录（%APPDATA%）。Windows 进程归属使用 TokenUser SID，
+本地写接口还由私有能力令牌保护，不再以“UID 校验失效”作为单用户妥协。
 
 ## 五、结论
 

@@ -27,7 +27,6 @@ import time
 import urllib.parse
 import urllib.request
 import webbrowser
-from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import sysops
@@ -82,6 +81,7 @@ STATIC_DIR = os.path.join(BASE_DIR, "static")
 THEMES_DIR = os.path.join(STATIC_DIR, "themes")
 CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
 INSTANCE_LOCK_PATH = os.path.join(DATA_DIR, "console.lock")
+CONTROL_TOKEN_PATH = os.path.join(DATA_DIR, "control.token")
 
 CURRENT_SCHEMA_VERSION = 1
 
@@ -124,6 +124,7 @@ AUTOSTART_INTERVAL_SEC = 2
 RUN_TOKEN_ENV = "CONSOLE_RUN_TOKEN"
 RUN_TOKEN_ARG_PREFIX = "console-run:"
 TASK_CANCELED_EXIT_CODE = 130
+CONTROL_TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{32,128}\Z")
 
 SELF_PID = os.getpid()
 SELF_UID = sysops.SELF_UID
@@ -132,6 +133,15 @@ LOG = logging.getLogger("console")
 LOG_LOCK = threading.RLock()
 MANUAL_STOP_LOCK = threading.RLock()
 MANUAL_STOP_TOKENS = set()
+
+
+def is_current_user(identity):
+    """严格判断进程身份是否属于当前用户。
+
+    Windows 使用 SID，POSIX 使用 uid。身份未知时必须拒绝，不能把
+    ``None == None`` 误判为同一用户。
+    """
+    return identity is not None and SELF_UID is not None and identity == SELF_UID
 
 
 def classify_task_exit(code):
@@ -206,6 +216,10 @@ def _ensure_private_dir(path):
         os.chmod(path, 0o700)
     except OSError:
         LOG.warning("无法收紧目录权限: %s", path)
+    if sysops.IS_WINDOWS:
+        # Windows chmod 不改变 DACL。数据目录可删除/替换其中的 token 文件，
+        # 因此必须在目录级别限制为当前 SID，而不只保护单个文件。
+        sysops.protect_private_directory(path)
 
 
 def _copy_private_regular_file(source, target):
@@ -322,7 +336,8 @@ def prepare_runtime_storage():
     migration = migrate_legacy_runtime_data()
     for private_dir in (DATA_DIR, ICONS_DIR, LOGS_DIR):
         _ensure_private_dir(private_dir)
-    for path in (CONFIG_PATH, CONFIG_PATH + ".bak", INSTANCE_LOCK_PATH):
+    for path in (CONFIG_PATH, CONFIG_PATH + ".bak", INSTANCE_LOCK_PATH,
+                 CONTROL_TOKEN_PATH):
         try:
             if stat.S_ISREG(os.lstat(path).st_mode):
                 os.chmod(path, 0o600)
@@ -351,6 +366,71 @@ def write_private_bytes(path, payload):
         f.flush()
         os.fsync(f.fileno())
     os.chmod(path, 0o600)
+
+
+def _read_control_token(path):
+    """读取已存在的控制令牌；文件不可信或不可读时返回 None。"""
+    try:
+        file_stat = os.lstat(path)
+        if not stat.S_ISREG(file_stat.st_mode):
+            return None
+        if not sysops.path_owned_by_current_user(path):
+            return None
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        with os.fdopen(os.open(path, flags), "rb") as f:
+            raw = f.read(256)
+        token = raw.decode("ascii").strip()
+    except (OSError, UnicodeError):
+        return None
+    return token if CONTROL_TOKEN_RE.fullmatch(token) else None
+
+
+def load_control_token(path=None):
+    """读取或首次创建受保护的本地控制能力令牌。"""
+    if path is None:
+        path = CONTROL_TOKEN_PATH
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    _ensure_private_dir(directory)
+    if not sysops.path_owned_by_current_user(directory):
+        raise OSError("控制令牌目录不属于当前用户: %s" % directory)
+    token = _read_control_token(path)
+    if token is None:
+        token = secrets.token_urlsafe(32)
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            token = _read_control_token(path)
+            if token is None:
+                raise OSError("控制令牌文件不可读或格式无效: %s" % path)
+        else:
+            with os.fdopen(fd, "wb") as f:
+                f.write((token + "\n").encode("ascii"))
+                f.flush()
+                os.fsync(f.fileno())
+    # Windows chmod 不能收紧 ACL；sysops 会以当前 SID 显式保护该文件。
+    sysops.protect_private_file(path)
+    return token
+
+
+def console_url(port, token=None):
+    """构造仅在浏览器 fragment 中携带控制令牌的本地 URL。"""
+    url = "http://%s:%d/" % (HOST, int(port))
+    if token:
+        url += "#console_token=" + urllib.parse.quote(token, safe="-_")
+    return url
+
+
+def open_console_browser(port, token_path=None):
+    """用持久化控制令牌打开现有总控台；令牌缺失时拒绝降级打开。"""
+    if token_path is None:
+        token_path = CONTROL_TOKEN_PATH
+    token = _read_control_token(token_path)
+    if not token:
+        return False
+    try:
+        return bool(webbrowser.open(console_url(port, token)))
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------- 配置
@@ -415,6 +495,10 @@ class Config:
 
     def __init__(self, path):
         self._lock = threading.RLock()
+        # 应用操作锁属于配置实例，而不是 HTTP 服务器。这样启动期的自启动
+        # 守护线程和 HTTP 请求可使用同一把锁，避免各自通过“尚未运行”检查。
+        self._app_locks = {}
+        self._app_locks_guard = threading.Lock()
         self._path = path
         self._writable = True
         self._recovered_from_backup = False
@@ -516,6 +600,10 @@ class Config:
         with self._lock:
             return json.loads(json.dumps(self._data, ensure_ascii=False))
 
+    @property
+    def path(self):
+        return self._path
+
     def health_info(self):
         with self._lock:
             return {
@@ -545,6 +633,19 @@ class Config:
         # 若两把锁反向获取，配置写入与状态轮询可能永久互相等待。
         invalidate_state_cache()
         return result
+
+    def try_app_operation(self, app_id):
+        """非阻塞取得单个应用的操作锁，避免并发启停/编辑竞争。"""
+        with self._app_locks_guard:
+            # RLock 允许 restart 在已持有锁时复用统一启动事务；不同线程仍会
+            # 被非阻塞地拒绝，不会排队后基于过期状态继续执行。
+            lock = self._app_locks.setdefault(app_id, threading.RLock())
+        return lock if lock.acquire(blocking=False) else None
+
+    def forget_app_lock(self, app_id):
+        """应用删除后回收其操作锁（调用方应仍持有该锁）。"""
+        with self._app_locks_guard:
+            self._app_locks.pop(app_id, None)
 
     @staticmethod
     def _write_atomic(path, payload):
@@ -953,7 +1054,7 @@ def build_services(cfg, groups=None):
     snap = ps_snapshot({pid for pid, _ in listeners}, with_uid=True)
     mine_pids = [pid for pid, _ in listeners
                  if pid != SELF_PID and pid in snap
-                 and snap[pid].get("uid") == SELF_UID]
+                 and is_current_user(snap[pid].get("uid"))]
     cwds = lsof_cwds(mine_pids)
     origin_table = origin_snapshot(mine_pids)
 
@@ -970,7 +1071,7 @@ def build_services(cfg, groups=None):
         if pid == SELF_PID:
             continue
         info = snap.get(pid)
-        if not info or info.get("uid") != SELF_UID:
+        if not info or not is_current_user(info.get("uid")):
             continue
         comm = info.get("comm") or ""
         args = info.get("args") or comm
@@ -1016,7 +1117,7 @@ def build_watched(keywords):
     snap = ps_snapshot(None, with_uid=True)
     result = []
     for pid, info in sorted(snap.items()):
-        if pid == SELF_PID or info.get("uid") != SELF_UID:
+        if pid == SELF_PID or not is_current_user(info.get("uid")):
             continue
         name = os.path.basename(info.get("comm") or "") or "?"
         if name in ("ps", "lsof"):
@@ -1096,7 +1197,7 @@ def managed_process_index(apps, groups=None):
         marker = RUN_TOKEN_ARG_PREFIX + token if token else None
         current_user = sorted(
             pid for pid in candidates.get(app.get("id"), set())
-            if snap.get(pid, {}).get("uid") == SELF_UID)
+            if is_current_user(snap.get(pid, {}).get("uid")))
         controller_found = bool(marker and any(
             marker in snap.get(pid, {}).get("args", "") for pid in current_user))
         # 随机标记在进程组的常驻外层 shell 上；校验后整组均为受控后代。
@@ -1139,13 +1240,15 @@ def legacy_managed_pid(app, listeners=None, snap=None, cwds=None):
     if cwds is None:
         cwds = lsof_cwds(port_pids)
     matches = []
-    # PID 创建时间锚点（仅 Windows 记录）：attach 后若同 PID 的 ctime 与
-    # 记录值不同，说明原进程已退出、PID 已被新进程复用——不得认领。
+    # PID 创建时间锚点（仅 Windows 记录）：只有仍在验证原 PID 时才比较。
+    # 已认领服务允许监听子进程换 PID，新 PID 只要端口、SID、cwd 唯一匹配
+    # 就应重新关联；把它拿去和旧 PID 的 ctime 比较会错误地全部排除。
     expected_ctime = app.get("lastCreateTime")
     for pid in sorted(port_pids):
-        if snap.get(pid, {}).get("uid") != SELF_UID:
+        if not is_current_user(snap.get(pid, {}).get("uid")):
             continue
-        if (sysops.IS_WINDOWS and expected_ctime
+        if (sysops.IS_WINDOWS and expected_ctime is not None
+                and pid == recorded_pid
                 and snap.get(pid, {}).get("ctime") != expected_ctime):
             continue
         actual_cwd = cwds.get(pid)
@@ -1186,7 +1289,7 @@ def listener_app_owners(apps, listeners, snap, cwds, groups=None):
     }
 
 
-def build_apps(cfg, listeners, groups=None):
+def build_apps(cfg, listeners, groups=None, attached_repairs=None):
     """token 校验通过或严格命中旧版身份的进程才算 running。
 
     多张卡片可共享配置端口；只有当前真实监听者不属于本卡片时才返回
@@ -1221,6 +1324,19 @@ def build_apps(cfg, listeners, groups=None):
                 (verified_owner.get(legacy_pid) or {}).get("id") != app.get("id")):
             legacy_pid = None
         live = managed_live or ([legacy_pid] if legacy_pid else [])
+        if (attached_repairs is not None and legacy_pid
+                and app.get("attached") and not app.get("runToken")
+                and legacy_pid != app.get("lastPid")):
+            # 仅在已认领卡片命中唯一替代监听 PID 时修复身份。调用方会在
+            # 状态快照构建结束后再原子写入，避免在扫描过程中持有配置锁。
+            attached_repairs.append({
+                "id": app.get("id"),
+                "recordedPid": app.get("lastPid"),
+                "port": app.get("port"),
+                "cwd": app.get("cwd"),
+                "pid": legacy_pid,
+                "ctime": (listener_snap.get(legacy_pid) or {}).get("ctime"),
+            })
         lp = app.get("lastPid")
         pid = lp if lp in live else (live[0] if live else None)
         port = app.get("port")
@@ -1243,7 +1359,7 @@ def build_apps(cfg, listeners, groups=None):
                 "cwd": owner_cwd,
                 "project": project_name(owner_cwd),
                 "uid": owner_info.get("uid"),
-                "currentUser": owner_info.get("uid") == SELF_UID,
+                "currentUser": is_current_user(owner_info.get("uid")),
                 "uptimeSec": owner_info.get("etime"),
                 "appId": owner_app.get("id") if owner_app else None,
                 "appName": owner_app.get("name") if owner_app else None,
@@ -1287,6 +1403,40 @@ def build_apps(cfg, listeners, groups=None):
     return apps
 
 
+def repair_attached_app_identities(cfg, repairs):
+    """持久化已认领服务的唯一替代监听 PID。
+
+    ``build_apps`` 使用的是配置快照。落盘前再次确认卡片仍处于同一旧身份，
+    避免状态刷新与用户手动认领、启动或编辑发生竞争时覆盖较新的操作。
+    """
+    if not repairs:
+        return False
+
+    def op(data):
+        changed = False
+        for repair in repairs:
+            target = find_app(data, repair.get("id"))
+            if (not target or not target.get("attached")
+                    or target.get("runToken")
+                    or target.get("lastPid") != repair.get("recordedPid")
+                    or target.get("port") != repair.get("port")
+                    or target.get("cwd") != repair.get("cwd")):
+                continue
+            if (target.get("lastPid") != repair.get("pid")
+                    or target.get("lastCreateTime") != repair.get("ctime")):
+                target["lastPid"] = repair.get("pid")
+                target["lastCreateTime"] = repair.get("ctime")
+                changed = True
+        return changed
+
+    try:
+        return bool(cfg.update(op))
+    except OSError as exc:
+        # 身份展示仍基于本轮可信快照；只是在只读配置等故障时无法修复锚点。
+        LOG.warning("无法持久化已认领服务的 PID 重关联: %s", exc)
+        return False
+
+
 def build_state(cfg, console_port, config_health=None):
     degraded_reasons = []
     # 一次 pgid 快照供 build_services / build_apps 共享，避免每轮两次全量 ps。
@@ -1308,7 +1458,8 @@ def build_state(cfg, console_port, config_health=None):
         watched = []
         degraded_reasons.append({"component": "watched"})
     try:
-        apps = build_apps(cfg, listeners, groups)
+        attached_repairs = []
+        apps = build_apps(cfg, listeners, groups, attached_repairs)
     except Exception:
         LOG.exception("构建启动台状态失败")
         apps = []
@@ -1318,7 +1469,7 @@ def build_state(cfg, console_port, config_health=None):
             {"component": "version", "error": VERSION_LOAD_ERROR})
     for issue in (config_health or {}).get("issues", []):
         degraded_reasons.append({"component": "config", "error": issue})
-    return {
+    state = {
         "services": services,
         "watched": watched,
         "apps": apps,
@@ -1340,6 +1491,10 @@ def build_state(cfg, console_port, config_health=None):
         # coreCount 供前端把迷你条还原为相对满核宽度；macOS 为 1 保持原语义。
         "coreCount": sysops.core_count(),
     }
+    # 仅在有可修复身份时附带内部字段；_refresh_state 在序列化前取走它。
+    if "attached_repairs" in locals() and attached_repairs:
+        state["_attachedRepairs"] = attached_repairs
+    return state
 
 
 # ---------------------------------------------------------------- 状态快照缓存
@@ -1384,6 +1539,8 @@ def _refresh_state(cfg, console_port, generation, raise_errors=False):
         cfg_snapshot = cfg.snapshot()
         config_health = cfg.health_info()
         state = build_state(cfg_snapshot, console_port, config_health)
+        attached_repairs = state.pop("_attachedRepairs", [])
+        repair_attached_app_identities(cfg, attached_repairs)
     except Exception:
         _finish_state_refresh(None, generation)
         if raise_errors:
@@ -1563,7 +1720,7 @@ def kill_process(pid, force):
     uid = process_uid(pid)
     if uid is None:
         return False, "进程不存在"
-    if uid != SELF_UID:
+    if not is_current_user(uid):
         return False, "只能结束当前用户的进程"
     return sysops.kill_process(pid, force)
 
@@ -1738,6 +1895,7 @@ def persist_started_app(cfg, app_id, proc, pgid, token):
             target["lastPgid"] = pgid
             target["runToken"] = token
             target["attached"] = False
+            target["lastCreateTime"] = None
             # 批处理任务运行时先保留上一次结果；自然退出或手动停止后再原子覆盖。
             if (target.get("kind") or "service") != "task":
                 target["lastExit"] = None
@@ -1747,6 +1905,73 @@ def persist_started_app(cfg, app_id, proc, pgid, token):
     if saved:
         watch_app_exit(cfg, app_id, proc, token, started_at)
     return saved
+
+
+def start_app_transaction(cfg, app_id, require_autostart=False):
+    """执行唯一的受控启动事务并返回 ``{ok, status, ...}``。
+
+    手动启动、重启后的再次启动和开机自启动都必须经过这里。锁覆盖读取
+    状态、健康检查、端口检查、派生进程及身份落盘，避免两个调用方各自
+    通过旧快照后重复启动。
+    """
+    lock = cfg.try_app_operation(app_id)
+    if lock is None:
+        return {"ok": False, "status": 409,
+                "error": "该应用正在执行其他操作，请稍后重试"}
+    try:
+        current = find_app(cfg.snapshot(), app_id)
+        if current is None:
+            return {"ok": False, "status": 404, "error": "应用不存在"}
+        if require_autostart and (
+                (current.get("kind") or "service") != "service"
+                or not current.get("autostart")):
+            return {"ok": False, "status": 409,
+                    "error": "应用已不符合开机自启动条件"}
+        if app_alive_sign(current):
+            return {"ok": False, "status": 409, "error": "应用已在运行"}
+        health = inspect_app_health(current)
+        if health.get("blocking"):
+            issue = (health.get("issues") or [{}])[0]
+            return {
+                "ok": False,
+                "status": 422,
+                "error": "%s：%s" % (
+                    issue.get("title", "配置不健康"),
+                    issue.get("detail", "请检查应用配置")),
+                "health": health,
+            }
+        port = current.get("port")
+        occupied = ([(pid, listening_port) for pid, listening_port
+                     in scan_listeners() if listening_port == port]
+                    if port else [])
+        if occupied:
+            return {
+                "ok": False,
+                "status": 409,
+                "error": "端口 %d 已被 PID %d 占用" %
+                         (port, occupied[0][0]),
+            }
+        ok, error, proc, pgid, token = start_app(current)
+        if not ok:
+            return {"ok": False, "status": 500, "error": error}
+        if not persist_started_app(cfg, app_id, proc, pgid, token):
+            stop_pid_tree(pgid)
+            return {"ok": False, "status": 409,
+                    "error": "应用已被删除，已取消启动"}
+        # 一次性任务的正常形态就是快速退出，不能把成功任务误判成启动失败。
+        if (current.get("kind") or "service") == "task":
+            return {"ok": True, "status": 200, "pid": proc.pid}
+        deadline = time.monotonic() + STARTUP_PROBE_SEC
+        code = proc.poll()
+        while code is None and time.monotonic() < deadline:
+            time.sleep(0.025)
+            code = proc.poll()
+        if code is not None:
+            return {"ok": False, "status": 422,
+                    "error": startup_failure_message(app_id, code)}
+        return {"ok": True, "status": 200, "pid": proc.pid}
+    finally:
+        lock.release()
 
 
 def clear_app_runtime(cfg, app_id, expected_token=None, last_exit=None):
@@ -1761,6 +1986,7 @@ def clear_app_runtime(cfg, app_id, expected_token=None, last_exit=None):
         target["lastPgid"] = None
         target["runToken"] = None
         target["attached"] = False
+        target["lastCreateTime"] = None
         if last_exit is not None:
             target["lastExit"] = last_exit
         return True
@@ -1810,11 +2036,11 @@ def command_for_script(path):
 
 
 def _quote_win(path):
-    """Windows 命令行安全引用（处理空格与双引号）。"""
+    """Windows 命令行安全引用（覆盖 CMD 的分隔和控制字符）。"""
     path = str(path)
     if '"' in path:
         path = path.replace('"', '\\"')
-    if " " in path:
+    if any(char.isspace() or char in "&|<>()^!" for char in path):
         return '"%s"' % path
     return path
 
@@ -1832,10 +2058,44 @@ SHELL_BUILTINS = {
 }
 
 
+def _simple_windows_command_tokens(command):
+    """解析无 CMD 元字符展开的简单 Windows 命令。
+
+    这里只服务于静态健康检查，不尝试实现完整的 ``cmd.exe`` 语法。路径选择器
+    生成的直接脚本、``python.exe -- script.py`` 与 ``powershell -File`` 都由
+    此解析器覆盖；任何变量、重定向、管道或转义语义一律降级为 unknown。
+    """
+    tokens = []
+    current = []
+    quoted = False
+    for char in command.strip():
+        if char == '"':
+            quoted = not quoted
+            continue
+        if not quoted and char in "|&;<>()%^!":
+            return None
+        if char.isspace() and not quoted:
+            if current:
+                tokens.append("".join(current))
+                current = []
+            continue
+        current.append(char)
+    if quoted:
+        return None
+    if current:
+        tokens.append("".join(current))
+    if any(any(char in token for char in ("$", "*", "?", "[", "]", "`"))
+           for token in tokens):
+        return None
+    return tokens
+
+
 def _simple_command_tokens(command):
     """解析无管道/重定向/展开的简单命令；不确定时返回 None。"""
     if not isinstance(command, str) or not command.strip():
         return []
+    if sysops.IS_WINDOWS:
+        return _simple_windows_command_tokens(command)
     try:
         lexer = shlex.shlex(
             command, posix=True, punctuation_chars="|&;<>()")
@@ -1863,6 +2123,17 @@ def _resolve_command_path(value, cwd):
     return os.path.normpath(os.path.join(cwd, value))
 
 
+def _command_path_is_absolute(value):
+    expanded = os.path.expanduser(value)
+    if os.path.isabs(expanded):
+        return True
+    return bool(sysops.IS_WINDOWS and re.match(r"^[A-Za-z]:[\\/]", expanded))
+
+
+def _looks_like_command_path(value):
+    return "/" in value or (sysops.IS_WINDOWS and "\\" in value)
+
+
 def _script_target(tokens, cwd):
     """提取 (路径, 是否直接执行, 原路径是否相对)，否则返回空。"""
     if not tokens:
@@ -1874,19 +2145,19 @@ def _script_target(tokens, cwd):
     if index >= len(tokens):
         return None, False, False
     executable = tokens[index]
-    base = os.path.basename(executable)
+    base = os.path.basename(executable).casefold()
     args = tokens[index + 1:]
 
-    if re.fullmatch(r"py(?:thon(?:\d+(?:\.\d+)*)?)?", base):
+    if re.fullmatch(r"py(?:thon(?:\d+(?:\.\d+)*)?)?(?:\.exe)?", base):
         if "-m" in args or "-c" in args:
             return None, False, False
         if args and args[0] == "--":
             args = args[1:]
         candidate = next((arg for arg in args if not arg.startswith("-")), None)
         if candidate and (os.path.splitext(candidate)[1].lower() in SCRIPT_SUFFIXES
-                          or "/" in candidate):
+                          or _looks_like_command_path(candidate)):
             return (_resolve_command_path(candidate, cwd), False,
-                    not os.path.isabs(os.path.expanduser(candidate)))
+                    not _command_path_is_absolute(candidate))
         return None, False, False
 
     if base in {"bash", "sh", "zsh"}:
@@ -1898,15 +2169,32 @@ def _script_target(tokens, cwd):
             args = args[1:]
         candidate = next((arg for arg in args if not arg.startswith("-")), None)
         if candidate and (os.path.splitext(candidate)[1].lower() in SCRIPT_SUFFIXES
-                          or "/" in candidate):
+                          or _looks_like_command_path(candidate)):
             return (_resolve_command_path(candidate, cwd), False,
-                    not os.path.isabs(os.path.expanduser(candidate)))
+                    not _command_path_is_absolute(candidate))
+        return None, False, False
+
+    if sysops.IS_WINDOWS and base in {
+            "powershell", "powershell.exe", "pwsh", "pwsh.exe"}:
+        if any(arg.casefold() in {
+                "-command", "-c", "-encodedcommand", "-encodedcommands"}
+               for arg in args):
+            return None, False, False
+        candidate = None
+        for index, arg in enumerate(args):
+            if arg.casefold() in {"-file", "/file"} and index + 1 < len(args):
+                candidate = args[index + 1]
+                break
+        if candidate and (os.path.splitext(candidate)[1].lower() in SCRIPT_SUFFIXES
+                          or _looks_like_command_path(candidate)):
+            return (_resolve_command_path(candidate, cwd), False,
+                    not _command_path_is_absolute(candidate))
         return None, False, False
 
     suffix = os.path.splitext(executable)[1].lower()
-    if suffix in SCRIPT_SUFFIXES or "/" in executable:
+    if suffix in SCRIPT_SUFFIXES or _looks_like_command_path(executable):
         return (_resolve_command_path(executable, cwd), True,
-                not os.path.isabs(os.path.expanduser(executable)))
+                not _command_path_is_absolute(executable))
     return None, False, False
 
 
@@ -1975,7 +2263,7 @@ def inspect_app_health(app):
     executable = tokens[index] if tokens and index < len(tokens) else ""
     executable_base = os.path.basename(executable)
     if executable and not direct and executable_base not in SHELL_BUILTINS:
-        if "/" in executable:
+        if _looks_like_command_path(executable):
             runtime = _resolve_command_path(executable, cwd)
             runtime_ok = os.path.isfile(runtime) and os.access(runtime, os.X_OK)
         else:
@@ -2277,7 +2565,7 @@ def _current_user_group_members(pgid):
         return []
     snap = ps_snapshot(members, with_uid=True)
     return sorted(pid for pid in members
-                  if snap.get(pid, {}).get("uid") == SELF_UID)
+                  if is_current_user(snap.get(pid, {}).get("uid")))
 
 
 def resolve_app_stop_target(app, listeners=None):
@@ -2336,7 +2624,7 @@ def stop_target_alive(target, expected_uid=None):
         return False
     if expected_uid is None:
         expected_uid = process_uid(target["id"])
-    return expected_uid == SELF_UID
+    return is_current_user(expected_uid)
 
 
 def stop_app_and_wait(app, timeout=APP_STOP_TIMEOUT_SEC, listeners=None):
@@ -2416,7 +2704,7 @@ def inspect_attach_process(cfg, app, pid):
     if (pid, port) not in listeners:
         return False, "PID %d 并未监听端口 %d，进程可能已退出" % (pid, port), {"status": 409}
     snap = ps_snapshot({pid}, with_uid=True)
-    if snap.get(pid, {}).get("uid") != SELF_UID:
+    if not is_current_user(snap.get(pid, {}).get("uid")):
         return False, "该进程不属于当前用户，不能认领", {"status": 403}
     cfg_now = cfg.snapshot()
     owners = listener_app_owners(cfg_now.get("apps") or [], listeners, snap, None)
@@ -2872,7 +3160,7 @@ def serialized_app_operation(fn):
     """Reject overlapping mutations for one app instead of racing/queueing."""
     @functools.wraps(fn)
     def wrapped(self, app_id, *args, **kwargs):
-        lock = self.server.try_app_operation(app_id)
+        lock = self.server.cfg.try_app_operation(app_id)
         if lock is None:
             self.send_err(409, "该应用正在执行其他操作，请稍后重试")
             return None
@@ -2887,13 +3175,15 @@ class ConsoleServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, addr, handler_cls, cfg, port):
+    def __init__(self, addr, handler_cls, cfg, port, control_token=None):
+        if control_token is None:
+            token_path = os.path.join(
+                os.path.dirname(os.path.abspath(cfg.path)), "control.token")
+            control_token = load_control_token(token_path)
         super().__init__(addr, handler_cls)
         self.cfg = cfg
         self.console_port = self.server_address[1]
-        self.control_token = secrets.token_urlsafe(32)
-        self._app_locks = {}
-        self._app_locks_guard = threading.Lock()
+        self.control_token = control_token
         self._console_action_guard = threading.Lock()
         self._console_action = None
         self._console_helper_pid = None
@@ -2905,16 +3195,6 @@ class ConsoleServer(ThreadingHTTPServer):
                                          ConnectionResetError)):
             return
         super().handle_error(request, client_address)
-
-    def try_app_operation(self, app_id):
-        with self._app_locks_guard:
-            lock = self._app_locks.setdefault(app_id, threading.Lock())
-        return lock if lock.acquire(blocking=False) else None
-
-    def forget_app_lock(self, app_id):
-        """应用删除后回收其操作锁（调用方应已持有该锁）。"""
-        with self._app_locks_guard:
-            self._app_locks.pop(app_id, None)
 
     def reserve_console_action(self, action):
         with self._console_action_guard:
@@ -2995,15 +3275,10 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, UnicodeError):
             return False
 
-    def _has_control_cookie(self):
-        try:
-            cookie = SimpleCookie()
-            cookie.load(self.headers.get("Cookie") or "")
-            morsel = cookie.get("console_session")
-            return bool(morsel and secrets.compare_digest(
-                morsel.value, self.server.control_token))
-        except (KeyError, TypeError, ValueError):
-            return False
+    def _has_control_token(self):
+        values = self.headers.get_all("X-Console-Token") or []
+        return (len(values) == 1
+                and secrets.compare_digest(values[0], self.server.control_token))
 
     def _deny_request(self, status, message):
         # Do not consume attacker-controlled bodies. Closing after the bounded
@@ -3023,10 +3298,9 @@ class Handler(BaseHTTPRequestHandler):
     def authorize_request(self, mutating=False, content_kind=None):
         """Enforce the loopback browser trust boundary.
 
-        Browser writes require exact same-origin metadata plus the HttpOnly
-        session cookie issued by this process. Headerless local CLI clients stay
-        compatible, but JSON/image Content-Type rules keep those paths
-        unavailable to simple cross-site HTML forms.
+        所有写请求都必须携带只保存在当前用户私有文件中的能力令牌。浏览器
+        从启动 URL fragment 读取令牌，fragment 不会发给服务器或 Referer；
+        Origin/Sec-Fetch-Site 校验继续阻断跨站请求。
         """
         host = self._parsed_request_host()
         if host is None or not self._request_host_allowed():
@@ -3040,8 +3314,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._deny_request(403, "拒绝跨站控制请求")
         if origin and not self._same_origin(origin, host):
             return self._deny_request(403, "请求 Origin 不是当前控制台")
-        if (site or origin) and not self._has_control_cookie():
-            return self._deny_request(403, "控制会话已失效，请刷新页面")
+        if not self._has_control_token():
+            return self._deny_request(403, "控制凭据缺失或已失效，请通过启动器重新打开总控台")
 
         if self.headers.get("Transfer-Encoding"):
             return self._deny_request(400, "不支持 Transfer-Encoding 请求体")
@@ -3067,8 +3341,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._deny_request(413, "请求体过大")
         return True
 
-    def _send(self, body, status=200, ctype="text/plain; charset=utf-8",
-              set_cookie=True):
+    def _send(self, body, status=200, ctype="text/plain; charset=utf-8"):
         self.send_response(status)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
@@ -3083,11 +3356,6 @@ class Handler(BaseHTTPRequestHandler):
             "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; "
             "form-action 'self'; connect-src 'self'; img-src 'self' data: blob:; "
             "font-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'")
-        if set_cookie and self._request_host_allowed():
-            self.send_header(
-                "Set-Cookie",
-                "console_session=%s; Path=/; HttpOnly; SameSite=Strict" %
-                self.server.control_token)
         self.end_headers()
         if body:
             try:
@@ -3195,7 +3463,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(PLACEHOLDER_HTML.encode("utf-8"), 200,
                            "text/html; charset=utf-8")
             else:
-                self._send(b"404 Not Found", 404, set_cookie=False)
+                self._send(b"404 Not Found", 404)
             return
         ctype = STATIC_TYPES.get(os.path.splitext(full)[1].lower(),
                                  "application/octet-stream")
@@ -3203,9 +3471,9 @@ class Handler(BaseHTTPRequestHandler):
             with open(full, "rb") as f:
                 data = f.read()
         except OSError:
-            self._send(b"404 Not Found", 404, set_cookie=False)
+            self._send(b"404 Not Found", 404)
             return
-        self._send(data, 200, ctype, set_cookie=False)
+        self._send(data, 200, ctype)
 
     def serve_icon(self, path):
         name = os.path.basename(urllib.parse.unquote(path[len("/icons/"):]))
@@ -3215,16 +3483,16 @@ class Handler(BaseHTTPRequestHandler):
             return
         full = os.path.join(ICONS_DIR, name)
         if not os.path.isfile(full):
-            self._send(b"404 Not Found", 404, set_cookie=False)
+            self._send(b"404 Not Found", 404)
             return
         ctype = STATIC_TYPES.get(ext, "application/octet-stream")
         try:
             with open(full, "rb") as f:
                 data = f.read()
         except OSError:
-            self._send(b"404 Not Found", 404, set_cookie=False)
+            self._send(b"404 Not Found", 404)
             return
-        self._send(data, 200, ctype, set_cookie=False)
+        self._send(data, 200, ctype)
 
     def handle_logs(self, app_id, query):
         _, app = self._get_app_or_404(app_id)
@@ -3529,7 +3797,7 @@ class Handler(BaseHTTPRequestHandler):
                "icon": None, "favicon": None, "lastPid": None,
                "lastPgid": None, "runToken": None,
                "attached": False, "lastExit": None,
-               "createdAt": int(time.time())}
+               "lastCreateTime": None, "createdAt": int(time.time())}
         cwd_updated = False
         if attach_pid is not None:
             ok, error, identity = inspect_attach_process(
@@ -3550,6 +3818,7 @@ class Handler(BaseHTTPRequestHandler):
                 cwd_updated = True
             app["cwd"] = actual_cwd
             app["lastPid"] = attach_pid
+            app["lastCreateTime"] = identity.get("ctime")
             app["attached"] = True
 
         attach_conflict = [False]
@@ -3644,52 +3913,10 @@ class Handler(BaseHTTPRequestHandler):
         self.server.cfg.update(op)
         self.send_json({"ok": True})
 
-    @serialized_app_operation
     def handle_app_start(self, app_id):
-        _, app = self._get_app_or_404(app_id)
-        if app is None:
-            return
-        if app_alive_sign(app):
-            self.send_json({"ok": False, "error": "应用已在运行"})
-            return
-        health = inspect_app_health(app)
-        if health["blocking"]:
-            issue = health["issues"][0]
-            self.send_json({
-                "ok": False,
-                "error": "%s：%s" % (issue["title"], issue["detail"]),
-                "health": health,
-            }, 422)
-            return
-        port = app.get("port")
-        occupied = [(pid, p) for pid, p in scan_listeners() if p == port] if port else []
-        if occupied:
-            self.send_json({"ok": False, "error": "端口 %d 已被 PID %d 占用" %
-                            (port, occupied[0][0])}, 409)
-            return
-        ok, err, proc, pgid, token = start_app(app)
-        if not ok:
-            self.send_json({"ok": False, "error": err})
-            return
-        if not persist_started_app(self.server.cfg, app_id, proc, pgid, token):
-            stop_pid_tree(pgid)
-            self.send_json({"ok": False, "error": "应用已被删除，已取消启动"}, 409)
-            return
-        # 一次性任务的正常形态就是快速退出，不能沿用服务的启动探测逻辑把
-        # `echo`、清缓存等成功任务误判成“启动失败”。退出线程会独立记录结果。
-        if (app.get("kind") or "service") == "task":
-            self.send_json({"ok": True, "pid": proc.pid})
-            return
-        deadline = time.monotonic() + STARTUP_PROBE_SEC
-        code = proc.poll()
-        while code is None and time.monotonic() < deadline:
-            time.sleep(0.025)
-            code = proc.poll()
-        if code is not None:
-            self.send_json({"ok": False,
-                            "error": startup_failure_message(app_id, code)}, 422)
-            return
-        self.send_json({"ok": True, "pid": proc.pid})
+        result = start_app_transaction(self.server.cfg, app_id)
+        status = result.pop("status", 200)
+        self.send_json(result, status)
 
     @serialized_app_operation
     def handle_app_stop(self, app_id):
@@ -3751,28 +3978,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_err(409, error or "旧进程停止失败，已取消重启")
             return
 
-        port = app.get("port")
-        occupied = [(pid, p) for pid, p in scan_listeners() if p == port] if port else []
-        if occupied:
-            self.send_err(409, "端口 %d 已被 PID %d 占用，旧应用已停止" %
-                          (port, occupied[0][0]))
-            return
-
-        latest = self.server.cfg.snapshot()
-        current = find_app(latest, app_id)
-        if not current:
-            self.send_err(404, "应用已被删除")
-            return
-        ok, err, proc, pgid, new_token = start_app(current)
-        if not ok:
-            self.send_err(500, err)
-            return
-        if not persist_started_app(
-                self.server.cfg, app_id, proc, pgid, new_token):
-            stop_pid_tree(pgid)
-            self.send_err(409, "应用已被删除，已取消重启")
-            return
-        self.send_json({"ok": True, "pid": proc.pid})
+        result = start_app_transaction(self.server.cfg, app_id)
+        status = result.pop("status", 200)
+        self.send_json(result, status)
 
     @serialized_app_operation
     def handle_icon_upload(self, app_id):
@@ -3831,7 +4039,7 @@ class Handler(BaseHTTPRequestHandler):
             if not (m and m.group(2) is None):
                 self.send_err(404, "接口不存在")
                 return
-            operation_lock = self.server.try_app_operation(m.group(1))
+            operation_lock = self.server.cfg.try_app_operation(m.group(1))
             if operation_lock is None:
                 self.send_err(409, "该应用正在执行其他操作，请稍后重试")
                 return
@@ -3943,7 +4151,7 @@ class Handler(BaseHTTPRequestHandler):
         if not self.server.cfg.update(op):
             self.send_err(404, "应用不存在")
             return
-        self.server.forget_app_lock(app_id)
+        self.server.cfg.forget_app_lock(app_id)
 
         for ext in ICON_EXTS:
             for fname in (app_id + ext, "fav-" + app_id + ext):
@@ -3983,11 +4191,11 @@ class Handler(BaseHTTPRequestHandler):
 
 # ---------------------------------------------------------------- 启动
 
-def open_browser_later(port, delay=0.8):
+def open_browser_later(port, token, delay=0.8):
     def _open():
         try:
             time.sleep(delay)
-            webbrowser.open("http://%s:%d/" % (HOST, port))
+            webbrowser.open(console_url(port, token))
         except Exception:
             pass
     threading.Thread(target=_open, daemon=True).start()
@@ -3999,7 +4207,7 @@ def find_console_instances():
     candidates = []
     for pid, info in snap.items():
         args = info.get("args") or ""
-        if (pid == SELF_PID or info.get("uid") != SELF_UID
+        if (pid == SELF_PID or not is_current_user(info.get("uid"))
                 or "server.py" not in args
                 or "--restart-helper" in args):
             continue
@@ -4057,7 +4265,8 @@ def launcher_main():
     if choice == "打开控制台":
         ports = [p for item in instances for p in item["ports"]]
         port = min(ports) if ports else PORT_START
-        webbrowser.open("http://%s:%d/" % (HOST, port))
+        if not open_console_browser(port):
+            _launcher_alert("无法读取本地控制凭据，请重启总控台后再打开。")
         return
     if choice != "重新启动":
         return
@@ -4066,7 +4275,7 @@ def launcher_main():
     preferred = min(preferred_ports) if preferred_ports else PORT_START
     targets = [item["pid"] for item in instances]
     for pid in targets:
-        if process_uid(pid) == SELF_UID:
+        if is_current_user(process_uid(pid)):
             sysops.kill_process(pid, force=False)
     deadline = time.monotonic() + 8.0
     while time.monotonic() < deadline and any(pid_alive(pid) for pid in targets):
@@ -4124,7 +4333,7 @@ def restart_helper(old_pid, preferred_port):
 
 
 def _autostart_managed_apps(cfg):
-    """开机自启：启动标记 autostart 的 service 应用（复用启动链路）。
+    """开机自启：启动标记 autostart 的 service 应用（复用统一启动事务）。
 
     独立守护线程执行：延迟 AUTOSTART_DELAY_SEC 等状态就绪，随后按配置顺序
     逐个启动 autostart=true 且未运行的 service；每个之间间隔
@@ -4137,21 +4346,14 @@ def _autostart_managed_apps(cfg):
             continue
         if not app.get("autostart"):
             continue
-        if app_alive_sign(app):
-            continue
-        health = inspect_app_health(app)
-        if health.get("blocking"):
-            issue = (health.get("issues") or [{}])[0]
-            LOG.warning("autostart 跳过 %s：%s",
-                        app.get("name"), issue.get("title", "配置不健康"))
-            continue
-        ok, err, proc, pgid, token = start_app(app)
-        if not ok:
-            LOG.warning("autostart 启动失败 %s：%s", app.get("name"), err)
-            continue
-        if not persist_started_app(cfg, app["id"], proc, pgid, token):
-            stop_pid_tree(pgid)
-            LOG.warning("autostart 取消 %s：应用已被删除", app.get("name"))
+        result = start_app_transaction(
+            cfg, app.get("id"), require_autostart=True)
+        if not result.get("ok"):
+            # 应用已运行或被用户关闭自启动不属于异常，其他原因保留日志以便诊断。
+            if result.get("error") not in (
+                    "应用已在运行", "应用已不符合开机自启动条件"):
+                LOG.warning("autostart 跳过 %s：%s",
+                            app.get("name"), result.get("error", "启动失败"))
             continue
         LOG.info("autostart 已启动 %s", app.get("name"))
         time.sleep(AUTOSTART_INTERVAL_SEC)
@@ -4171,6 +4373,7 @@ def _run_console(preferred_port=None, open_browser=True):
         _ensure_private_dir(private_dir)
     start_log_maintenance()
     cfg = Config(CONFIG_PATH)
+    control_token = load_control_token(os.path.join(DATA_DIR, "control.token"))
 
     server, port = None, None
     candidates = list(range(PORT_START, PORT_START + PORT_TRIES))
@@ -4179,7 +4382,7 @@ def _run_console(preferred_port=None, open_browser=True):
         candidates.insert(0, preferred_port)
     for p in candidates:
         try:
-            server = ConsoleServer((HOST, p), Handler, cfg, p)
+            server = ConsoleServer((HOST, p), Handler, cfg, p, control_token)
             port = p
             break
         except OSError:
@@ -4194,12 +4397,12 @@ def _run_console(preferred_port=None, open_browser=True):
     # CLI(--no-browser)与设置中心(openBrowser)任一关闭则不自动打开浏览器。
     # Config 无 .get()，经 snapshot() 读取（启动时单次调用，开销可忽略）。
     if open_browser and cfg.snapshot().get("openBrowser", True):
-        open_browser_later(port)
+        open_browser_later(port, server.control_token)
     # 开机自启：延迟拉起标记 autostart 的 service（守护线程，失败不阻塞）。
     _start_autostart_thread(cfg)
     tray_icon = None
     if sysops.IS_WINDOWS and _tray_mod is not None:
-        url = "http://%s:%d/" % (HOST, port)
+        url = console_url(port, server.control_token)
         tray_icon = _tray_mod.TrayIcon(
             "总控台 · %s:%d · 运行中" % (HOST, port),
             lambda: webbrowser.open(url),
@@ -4279,7 +4482,7 @@ def main(preferred_port=None, open_browser=True, log_to_file=False):
             instances = find_console_instances()
             ports = [port for item in instances for port in item.get("ports", [])]
             if ports:
-                webbrowser.open("http://%s:%d/" % (HOST, min(ports)))
+                open_console_browser(min(ports))
         return False
     try:
         _run_console(preferred_port, open_browser)

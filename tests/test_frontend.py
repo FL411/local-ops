@@ -224,6 +224,18 @@ class FrontendAccessibilityContractTests(unittest.TestCase):
         self.assertIn("const isTask = modalKind === 'task'", overlays)
         self.assertIn("const stopVerb = isTask ? '中止任务' : '停止服务'", overlays)
 
+    def test_mutations_use_fragment_bootstrapped_control_token(self):
+        core = (ROOT / "static/js/core.js").read_text(encoding="utf-8")
+        overlays = (ROOT / "static/js/overlays.js").read_text(encoding="utf-8")
+
+        self.assertIn("console_token", core)
+        self.assertIn("sessionStorage.setItem(CONTROL_TOKEN_STORAGE_KEY", core)
+        self.assertIn("history.replaceState", core)
+        self.assertIn("export function controlRequestHeaders", core)
+        self.assertIn("'X-Console-Token'", core)
+        self.assertIn("headers: controlRequestHeaders({ 'Content-Type': pendingIcon.type })",
+                      overlays)
+
     def test_new_port_discovery_is_session_scoped_and_actionable(self):
         html = (ROOT / "static/index.html").read_text(encoding="utf-8")
         services = (ROOT / "static/js/services.js").read_text(encoding="utf-8")

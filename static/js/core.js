@@ -141,6 +141,44 @@ export const GLYPHS = ['rocket', 'globe', 'terminal', 'server', 'database', 'bot
 
 /* ---------------- API ---------------- */
 const REQUEST_TIMEOUT_MS = 12000;
+const CONTROL_TOKEN_STORAGE_KEY = 'console-control-token';
+const CONTROL_TOKEN_RE = /^[A-Za-z0-9_-]{32,128}$/;
+
+/* 启动器把能力令牌放在 URL fragment：浏览器不会把 fragment 发送到 HTTP
+   服务。首次加载后仅保留到当前标签页的 sessionStorage，并立即清理地址栏。 */
+function loadControlToken() {
+  let token = '';
+  try {
+    const hash = window.location.hash.startsWith('#')
+      ? window.location.hash.slice(1) : '';
+    const params = new URLSearchParams(hash);
+    const candidate = params.get('console_token');
+    if (candidate && CONTROL_TOKEN_RE.test(candidate)) {
+      sessionStorage.setItem(CONTROL_TOKEN_STORAGE_KEY, candidate);
+      token = candidate;
+    }
+    if (params.has('console_token')) {
+      params.delete('console_token');
+      const suffix = params.toString();
+      history.replaceState(null, '', window.location.pathname +
+        window.location.search + (suffix ? '#' + suffix : ''));
+    }
+    if (!token) {
+      const stored = sessionStorage.getItem(CONTROL_TOKEN_STORAGE_KEY) || '';
+      if (CONTROL_TOKEN_RE.test(stored)) token = stored;
+    }
+  } catch (e) {
+    token = '';
+  }
+  return token;
+}
+const controlToken = loadControlToken();
+
+export function controlRequestHeaders(headers = {}) {
+  return controlToken
+    ? { ...headers, 'X-Console-Token': controlToken }
+    : { ...headers };
+}
 
 /* 变更代际：每次写操作成功后 +1。轮询响应到达时若代际已变，说明数据
    是操作生效前发出的旧快照，前端会丢弃并立即补一轮，避免旧状态回退。 */
@@ -153,9 +191,10 @@ export function bumpMutationEpoch() { mutationEpoch += 1; }
 async function req(method, path, body) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-  const opt = { method, signal: controller.signal };
+  const opt = { method, signal: controller.signal,
+    headers: controlRequestHeaders() };
   if (body !== undefined) {
-    opt.headers = { 'Content-Type': 'application/json' };
+    opt.headers['Content-Type'] = 'application/json';
     opt.body = JSON.stringify(body);
   }
   try {
@@ -535,4 +574,3 @@ export function applyUiTheme(name, persist = false) {
   });
   return queued;
 }
-

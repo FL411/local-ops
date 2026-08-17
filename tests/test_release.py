@@ -189,6 +189,35 @@ class ProjectReleaseManifestTests(unittest.TestCase):
         self.assertIn("licenses/Geist-OFL-1.1.txt", names)
         self.assertIn("licenses/Lucide-LICENSE.txt", names)
 
+    def test_windows_runtime_and_launchers_are_in_payload(self):
+        names = {
+            path.relative_to(release.ROOT).as_posix()
+            for path in release.iter_release_files()
+        }
+        required = {
+            "sysops.py",
+            "tray.py",
+            "start.bat",
+            "launcher_check.py",
+            "requirements-runtime-win.txt",
+            "LocalOpsConsole.exe",
+            "console.ico",
+        }
+        self.assertTrue(required.issubset(names))
+
+
+class ReleaseLeakPolicyTests(unittest.TestCase):
+    def test_documented_placeholder_users_are_not_treated_as_leaks(self):
+        for value in (b"/Users/name/project", b"/Users/username/project",
+                      b"/Users/user/project", b"/Users/`"):
+            with self.subTest(value=value):
+                self.assertIsNone(release.find_path_leak(value))
+
+    def test_non_placeholder_user_path_remains_a_release_blocker(self):
+        path = b"C:" + b"\\" + b"Users" + b"\\realperson\\project"
+        self.assertIsNotNone(
+            release.find_path_leak(path))
+
 
 class AssetProvenanceGateTests(unittest.TestCase):
     def write_provenance(self, text):

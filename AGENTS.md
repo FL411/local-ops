@@ -5,7 +5,7 @@
 ## 结构
 
 - `server.py` — 后端（单文件，仅标准库，Python 3.12+）
-- `sysops.py` — **跨平台系统操作层（Windows 移植新增）**：进程/端口扫描（macOS 用 ps/lsof，Windows 用 psutil）、进程组（Windows 用进程树回溯）、文件锁（flock / msvcrt.locking）、对话框（osascript / tkinter+ctypes）、信号终止（SIGTERM / WM_CLOSE+TerminateProcess）。平台差异一律收口到本文件，server.py 不直接依赖平台 API
+- `sysops.py` — **跨平台系统操作层（Windows 移植新增）**：进程/端口扫描（macOS 用 ps/lsof，Windows 用 psutil）、进程组（Windows 用进程树回溯）、进程归属（uid / TokenUser SID）、文件锁（flock / msvcrt.locking）、对话框（osascript / tkinter+ctypes）、信号终止（SIGTERM / WM_CLOSE+TerminateProcess）。平台差异一律收口到本文件，server.py 不直接依赖平台 API
 - `start.bat` / `launcher_check.py` — Windows 启动器（探测实例/打开/重启，输出纯 ASCII）；`requirements-runtime-win.txt` — Windows 运行时依赖说明
 - `static/index.html` / `static/app.js`（入口）/ `static/js/{core,launchpad,services,overlays,ports,widgets}.js`（原生 ES Modules，无构建）/ `static/icons.js` — 前端（原生，禁框架/CDN/构建）；`core.js` 承载工具/API/浮层/状态/主题注册，`launchpad.js` 卡片+拖拽+诊断+启动台 KPI/分区过滤，`services.js` 表格+监控 KPI 火花线，`overlays.js` 模态+抽屉，`ports.js` 端口归一化纯函数，`widgets.js` 右侧信息栏（实时动态/告警、TOP5、小贴士、快捷操作）与导航轨状态；模块间用 `window.__poll` 共享轮询入口
 - 布局 v2：左侧 `.rail` 图标导航轨（启动台/服务监控视图切换 + 日志中心/设置中心弹层入口）+ 顶栏 + 内容/右侧信息栏双栏网格（≤1280px 侧栏下沉到底部、≤900px 导航轨隐藏）；结构样式集中在 `static/base.css` 末尾「布局 v2」段（主题令牌驱动），主题包负责视觉皮肤
@@ -21,11 +21,11 @@
 ## 运行
 
 macOS：`python3 server.py` → 绑定 `127.0.0.1`，端口从 **9600** 起尝试，被占则 +1（最多 10 个）。启动后自动打开浏览器。`/favicon.ico` 返回统一品牌图标。双击 `总控台.app` 会先识别同目录的现有总控台，可直接打开或安全重启。
-Windows：`start.bat`（自动探测 Python ≥3.12 与 psutil，`pythonw server.py --log-to-file` 无窗口后台运行）；或手动 `python server.py`。数据目录 `%APPDATA%\总控台\config.json`（icons/ 为应用图标）、日志 `%LOCALAPPDATA%\总控台\console.log`（macOS 分别为 `~/Library/Application Support/总控台` 与 `~/Library/Logs/总控台`）。
+Windows：`start.bat`（自动探测 Python ≥3.12 与 psutil，`pythonw server.py --log-to-file` 无窗口后台运行）；或手动 `python server.py`。数据目录 `%APPDATA%\总控台\config.json`（icons/ 为应用图标；`control.token` 为仅当前用户可读的本地控制能力令牌）、日志 `%LOCALAPPDATA%\总控台\console.log`（macOS 分别为 `~/Library/Application Support/总控台` 与 `~/Library/Logs/总控台`）。
 
 ## 平台差异（Windows 移植的有意取舍）
 
-- **UID 校验失效**：Windows 无 uid，`SELF_UID` 恒 0——「只能操作当前用户进程」校验不生效，**仅限个人单用户电脑使用**。
+- **进程归属与本地控制**：Windows 用 TokenUser SID 代替 Unix uid；身份未知的进程不视为当前用户。所有写接口还要求 `X-Console-Token`，令牌存于私有 `control.token`，启动器仅通过浏览器 URL fragment 传入（不进入 HTTP 请求或 Referer）。
 - **CPU 口径**：Windows 按「占全部逻辑核百分比」归一化，`/api/state` 带 `coreCount`；macOS 保持单核口径。
 - **优雅停止**：Windows 无 SIGTERM——先 WM_CLOSE 软通道（带窗口进程可清理），宽限后对无窗口服务硬杀。
 - **Shell 包装**：macOS 用 bash 双层包装；Windows 用 `cmd /c "echo <marker> & <command>"`，`service` 需前台命令，命令内**不要用单引号**（cmd 不识别）。
@@ -33,6 +33,8 @@ Windows：`start.bat`（自动探测 Python ≥3.12 与 psutil，`pythonw server
 - 测试：macOS 专属语义用例（lsof 解析/bash 包装/chmod/symlink/发布检查）在 Windows 用 `IS_POSIX` 条件跳过；跨平台断言引用 `server.PYTHON_CMD`。
 
 ## API 契约（全部 JSON；icon 上传为原始字节）
+
+- 所有 `POST` / `PUT` / `DELETE` 请求均需携带 `X-Console-Token`；令牌由启动器和前端自动处理，手工 API 客户端应从当前用户的数据目录读取，禁止把令牌写入日志或命令历史。
 
 ### `GET /api/state` — 前端唯一轮询接口
 ```json
