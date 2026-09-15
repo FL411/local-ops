@@ -279,6 +279,19 @@ class FrontendAccessibilityContractTests(unittest.TestCase):
         self.assertIn("两张卡片也可以保存相同端口", launchpad)
         self.assertIn("openAppModal(app)", launchpad)
 
+    def test_launchpad_running_service_open_page_contract(self):
+        launchpad = (ROOT / "static/js/launchpad.js").read_text(encoding="utf-8")
+        css = (ROOT / "static/themes/ops.css").read_text(encoding="utf-8")
+
+        self.assertIn("iconBtn('arrow-up-right', '打开页面', 'open')", launchpad)
+        self.assertIn("r.open.hidden = !openable", launchpad)
+        self.assertIn("window.open(localServiceUrl(a, p), '_blank', 'noopener,noreferrer')", launchpad)
+        self.assertIn("setChildren(r.stPort, portTxtNode, iconNode, actionLabel)", launchpad)
+        self.assertIn(".st-port.clickable", css)
+        self.assertIn(".st-port-icon", css)
+        self.assertIn(".st-port-act", css)
+        self.assertIn(".ibtn.open", css)
+
     def test_create_actions_stay_in_launchpad_and_global_palette(self):
         html = (ROOT / "static/index.html").read_text(encoding="utf-8")
         app = (ROOT / "static/app.js").read_text(encoding="utf-8")
