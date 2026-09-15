@@ -90,7 +90,7 @@ Windows：`start.bat`（自动探测 Python ≥3.12 与 psutil，`pythonw server
 ### 启动台应用
 - `POST /api/apps` `{name, command, cwd?, port?, emoji?, glyph?, kind?, attachPid?}` → app 对象（`kind` 缺省 `service`；`task` 强制 port=null；服务监控来源可带 `attachPid`，后端先校验 PID/端口/UID/cwd，再将卡片与运行身份一次写入，失败不创建半成品卡片）
 - `POST /api/pick` `{what: "dir"|"script"}` → `{ok, path}` / `{ok, canceled:true}`（osascript 弹 macOS 原生目录/文件选择框；取消不是错误）
-- `POST /api/project/detect` `{cwd}` → `{ok, cwd, name, files, candidates:[{command,label,source,port,kind,detail}]}`（只读分析项目根目录，不执行项目代码；识别 package.json scripts 与包管理器锁文件、Hexo/Hugo/Jekyll、Django/FastAPI/Flask/Streamlit、Docker Compose、Go、Rust、常用启动脚本及纯静态站点。Hexo 无 scripts 时仍返回 `hexo s` 服务与 `hexo cl` 任务）
+- `POST /api/project/detect` `{cwd}` → `{ok, cwd, name, files, candidates:[{command,label,source,port,kind,detail}]}`（只读分析项目根目录，不执行项目代码；识别 package.json scripts 与包管理器锁文件（`uv.lock` 优先于 `poetry.lock`，后者生成 `poetry run` 候选）、Hexo/Hugo/Jekyll、Django/FastAPI/Flask/Streamlit、Docker Compose、Go、Rust、常用启动脚本及纯静态站点。Hexo 无 scripts 时仍返回 `hexo s` 服务与 `hexo cl` 任务）
 - `POST /api/apps/reorder` `{ids: [...]}` → `{ok}`（按 ids 重排 apps 数组；Python sort 稳定，未涉及的 id 相对顺序不变，服务/任务两区可独立拖拽排序互不干扰）
 - `PUT /api/apps/{id}`（部分更新同字段，可带 `stopBeforeUpdate:true`）→ app 对象；运行中修改 command/cwd/port/kind 时，缺少该标记返回 `{ok:false, requiresStop:true}`，带标记则安全停止后原子保存
 - `DELETE /api/apps/{id}` → `{ok}`（先停止再删，连同图标/日志）

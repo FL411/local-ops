@@ -369,15 +369,41 @@ a.icon-btn { text-decoration: none; }
 }
 .st-text.fail { color: var(--red); font-weight: 700; }
 .st-port {
+  display: inline-flex; align-items: center; gap: 3.5px;
   font-family: var(--font-mono); font-size: 10px; font-weight: 700;
   padding: 1px 7px; border-radius: 5px;
   border: 1px solid var(--line-2); color: var(--ink-2);
   background: var(--card);
   transition: all 0.12s ease;
+  line-height: 1.4;
+  vertical-align: middle;
 }
-.st-port.clickable { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, var(--line-2)); cursor: pointer; }
+.st-port.clickable {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--line-2));
+  background: color-mix(in srgb, var(--accent) 8%, var(--card));
+  cursor: pointer;
+}
 .st-port.clickable:hover { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
-.st-port.diagnostic { color: var(--red); border-color: color-mix(in srgb, var(--red) 50%, var(--line-2)); cursor: pointer; }
+.st-port.clickable:hover .st-port-icon { transform: translate(1px, -1px); }
+.st-port-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: transform 0.12s ease;
+}
+.st-port-act {
+  font-family: var(--font-system, -apple-system, BlinkMacSystemFont, sans-serif);
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+.st-port.diagnostic {
+  color: var(--red);
+  border-color: color-mix(in srgb, var(--red) 50%, var(--line-2));
+  background: color-mix(in srgb, var(--red) 8%, var(--card));
+  cursor: pointer;
+}
 .st-port.diagnostic:hover { background: var(--red); border-color: var(--red); color: #fff; }
 .st-up { margin-left: auto; font-family: var(--font-mono); font-size: 9.5px; color: var(--ink-4); }
 .task-history {
@@ -424,6 +450,18 @@ a.icon-btn { text-decoration: none; }
   content: ''; position: absolute; top: 2px; right: 2px;
   width: 6px; height: 6px; border-radius: 50%; background: var(--red);
 }
+.ibtn.open {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 40%, var(--line-2));
+  background: color-mix(in srgb, var(--accent) 10%, var(--card));
+}
+.ibtn.open:hover {
+  color: var(--on-accent);
+  border-color: var(--accent);
+  background: var(--accent);
+}
+.ibtn.open svg { transition: transform 0.12s ease; }
+.ibtn.open:hover svg { transform: translate(1px, -1px); }
 
 /* 按钮 */
 .btn {

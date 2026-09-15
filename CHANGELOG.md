@@ -10,6 +10,8 @@
 
 ### Added
 
+- **启动台「打开页面」**：运行中且可打开端口的服务卡片增加明确的「打开页面」按钮；端口徽章可点「打开」（对齐上游 #7）。
+- **Poetry 项目识别**：检测到 `poetry.lock` 时，Django/FastAPI/Flask/Streamlit 候选启动命令使用 `poetry run`；`uv.lock` 仍优先（对齐上游 #8，Windows 仍走 `PYTHON_CMD`）。
 - **平台泄漏扫描器（`tools/check_platform_leaks.py`）**：借鉴上游 PR 思路，把 macOS 残留审计工具化——AST+tokenize 精确扫描后端（跳过平台分支块、`_posix`/`_windows` 函数、docstring 与注释），行规则扫描前端（跳过 `IS_MAC`/`MOD_KEY` 平台化行与 `Ctrl/⌘` 对照文案），含显式白名单（良性残留逐条注明原因）。接入测试（8 项双向验证：当前基线 0 泄漏 + 工具能检出真实泄漏），每轮改代码跑 `python tools/check_platform_leaks.py` 防 macOS 残留回归。
 - **attached 认领增加 PID 创建时间校验**：Windows 快照新增 `ctime` 字段；认领时记录 `lastCreateTime`，身份匹配（`legacy_managed_pid`）时比对——同 PID 的 ctime 不同则判为 PID 复用、拒绝认领（借鉴上游 PR 的 CAS 思想，防 PID 复用误认）。旧数据无该字段时跳过校验，向后兼容，无需 schema 迁移。
 - **托管服务开机自启（autostart）**：应用卡片可标记「开机自启」（编辑表单开关，仅长期服务；批处理任务无自启意义）。总控台启动后延迟数秒，按配置顺序自动拉起所有标记了自启、且尚未运行的服务（复用启动链路与健康检查），服务之间间隔启动避免冲突；启动失败仅记录日志、不阻塞总控台、不自动重试。配合总控台自身的开机自启（注册表 Run 键）即可打通「开机 → 总控台 → 全部托管服务」的自动启动，无需手动逐个点击。
