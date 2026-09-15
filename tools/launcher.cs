@@ -52,19 +52,24 @@ public static class Launcher
         string[] commands = { "py -3", "python" };
         foreach (string cmd in commands)
         {
-            int sp = cmd.IndexOf(' ');
-            string file = cmd.Substring(0, sp);
-            string args = cmd.Substring(sp + 1) + " -c \"import sys;print(sys.executable)\"";
             try
             {
+                int sp = cmd.IndexOf(' ');
+                string file = (sp < 0) ? cmd : cmd.Substring(0, sp);
+                string prefix = (sp < 0) ? "" : (cmd.Substring(sp + 1) + " ");
+                // Require Python 3.12+ so a WindowsApps stub or old install is skipped.
+                string args = prefix + "-c \"import sys;print(sys.executable) if sys.version_info >= (3,12) else None\"";
                 ProcessStartInfo psi = new ProcessStartInfo(file, args);
                 psi.UseShellExecute = false;
                 psi.RedirectStandardOutput = true;
+                psi.RedirectStandardError = true;
                 psi.CreateNoWindow = true;
                 using (Process p = Process.Start(psi))
                 {
                     string outText = p.StandardOutput.ReadToEnd().Trim();
-                    if (p.WaitForExit(5000) && outText.Length > 0 && File.Exists(outText))
+                    p.StandardError.ReadToEnd();
+                    if (p.WaitForExit(5000) && outText.Length > 0
+                        && outText != "None" && File.Exists(outText))
                         return outText;
                 }
             }
