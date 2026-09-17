@@ -1248,6 +1248,136 @@ class WindowsProcessSnapshotTests(unittest.TestCase):
 
 @unittest.skipUnless(server.sysops.IS_WINDOWS,
                      "Windows 专属:msvcrt 单实例锁")
+class ConsoleSelfHealTests(unittest.TestCase):
+    def test_orphan_without_port_is_stale(self):
+        self.assertEqual(
+            server.console_instance_status({"pid": 9, "ports": []}, 1),
+            "stale")
+
+    def test_healthy_instance_is_left_alone(self):
+        health = {"ok": True}
+        state = {"apps": [{"id": "abcd1234"}]}
+        with mock.patch.object(server, "_http_json_localhost",
+                               side_effect=[health, state]):
+            self.assertEqual(
+                server.console_instance_status(
+                    {"pid": 11, "ports": [9600]}, 1),
+                "healthy")
+        with mock.patch.object(server, "find_console_instances",
+                               return_value=[{"pid": 11, "ports": [9600]}]):
+            with mock.patch.object(server, "console_instance_status",
+                                   return_value="healthy"):
+                with mock.patch.object(server, "_reap_console_pids") as reap:
+                    self.assertFalse(server.reap_stale_console_processes())
+                    reap.assert_not_called()
+
+    def test_empty_state_with_disk_apps_is_stale(self):
+        health = {"ok": True}
+        state = {"apps": []}
+        with mock.patch.object(server, "_http_json_localhost",
+                               side_effect=[health, state]):
+            self.assertEqual(
+                server.console_instance_status(
+                    {"pid": 11, "ports": [9600]}, 1),
+                "stale")
+
+    def test_empty_state_with_empty_disk_is_healthy(self):
+        health = {"ok": True}
+        state = {"apps": []}
+        with mock.patch.object(server, "_http_json_localhost",
+                               side_effect=[health, state]):
+            self.assertEqual(
+                server.console_instance_status(
+                    {"pid": 11, "ports": [9600]}, 0),
+                "healthy")
+
+    def test_health_timeout_is_stale(self):
+        with mock.patch.object(server, "_http_json_localhost",
+                               return_value=None):
+            self.assertEqual(
+                server.console_instance_status(
+                    {"pid": 11, "ports": [9600]}, 0),
+                "stale")
+
+    def test_reap_stale_kills_only_unhealthy(self):
+        instances = [
+            {"pid": 21, "ports": [9600]},
+            {"pid": 22, "ports": []},
+        ]
+
+        def status(item, disk_app_count=0):
+            return "healthy" if item["pid"] == 21 else "stale"
+
+        with mock.patch.object(server, "find_console_instances",
+                               return_value=instances):
+            with mock.patch.object(server, "_disk_configured_app_count",
+                                   return_value=1):
+                with mock.patch.object(server, "console_instance_status",
+                                       side_effect=status):
+                    with mock.patch.object(server, "_reap_console_pids",
+                                           return_value=[]) as reap:
+                        self.assertTrue(server.reap_stale_console_processes())
+                        reap.assert_called_once_with([22], force=True)
+
+    def test_restore_apps_from_disk_when_memory_empty(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "config.json")
+            payload = {
+                "schemaVersion": 1,
+                "apps": [{
+                    "id": "abcd1234", "name": "demo",
+                    "command": "python app.py",
+                    "cwd": td, "port": 8000, "kind": "service",
+                }],
+                "hidden": [], "pinned": [], "promoted": [],
+                "watchedKeywords": [], "uiTheme": "ops",
+                "openBrowser": True,
+            }
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh)
+            cfg = server.Config(path)
+            cfg._data["apps"] = []
+            self.assertTrue(cfg.restore_apps_from_disk_if_empty())
+            self.assertEqual(cfg.snapshot()["apps"][0]["id"], "abcd1234")
+            self.assertFalse(cfg.restore_apps_from_disk_if_empty())
+
+    def test_restore_does_not_invent_apps_when_disk_empty(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "config.json")
+            cfg = server.Config(path)
+            cfg._data["apps"] = []
+            self.assertFalse(cfg.restore_apps_from_disk_if_empty())
+            self.assertEqual(cfg.snapshot()["apps"], [])
+
+    def test_reap_skips_self_and_foreign_uids(self):
+        alive = {101}
+
+        def fake_alive(pid):
+            return pid in alive
+
+        def fake_kill(pid, force=False):
+            alive.discard(pid)
+
+        with mock.patch.object(server, "SELF_PID", 100):
+            with mock.patch.object(server, "pid_alive", side_effect=fake_alive):
+                with mock.patch.object(
+                        server, "process_uid",
+                        side_effect=lambda pid: 1 if pid == 101 else 2):
+                    with mock.patch.object(
+                            server, "is_current_user",
+                            side_effect=lambda uid: uid == 1):
+                        with mock.patch.object(
+                                server.sysops, "kill_process",
+                                side_effect=fake_kill) as kill:
+                            leftover = server._reap_console_pids(
+                                [100, 101, 102], force=True)
+                            killed = [c.args[0] for c in kill.call_args_list]
+                            self.assertNotIn(100, killed)
+                            self.assertIn(101, killed)
+                            self.assertNotIn(102, killed)
+                            self.assertEqual(leftover, [])
+
+
 class WindowsInstanceLockTests(unittest.TestCase):
     """回归:单实例锁必须跨进程互斥,未获锁进程优雅返回而非崩溃。
 

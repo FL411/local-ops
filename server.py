@@ -595,6 +595,41 @@ class Config:
             self._health_issues.append("配置恢复/迁移落盘失败: %s" % e)
             LOG.exception("配置恢复/迁移落盘失败")
 
+
+    def restore_apps_from_disk_if_empty(self):
+        """内存应用列表为空但磁盘仍有卡片时，只把 apps 从文件读回。
+
+        与 update() 共用 _lock：删光卡片的落盘会先完成，随后读到的也是空列表，
+        不会把用户刚删除的卡片救回来。
+        """
+        with self._lock:
+            if self._data.get("apps"):
+                return False
+            try:
+                with open(self._path, "r", encoding="utf-8") as f:
+                    raw = json.load(f)
+            except (OSError, UnicodeError, json.JSONDecodeError,
+                    TypeError, ValueError):
+                return False
+            if not isinstance(raw, dict) or not isinstance(raw.get("apps"), list):
+                return False
+            restored = []
+            for item in raw["apps"]:
+                if not isinstance(item, dict) or not item.get("id"):
+                    continue
+                app = dict(self.APP_DEFAULT)
+                for key in app:
+                    if key in item:
+                        app[key] = item[key]
+                restored.append(app)
+            if not restored:
+                return False
+            self._data["apps"] = restored
+            LOG.warning(
+                "restored %d apps from disk (in-memory list was empty)",
+                len(restored))
+            return True
+
     def snapshot(self):
         """返回配置的深拷贝（数据均为 JSON 可序列化）。"""
         with self._lock:
@@ -1535,6 +1570,9 @@ def _finish_state_refresh(state, generation):
 
 def _refresh_state(cfg, console_port, generation, raise_errors=False):
     try:
+        restore = getattr(cfg, "restore_apps_from_disk_if_empty", None)
+        if callable(restore):
+            restore()
         # Config 锁与缓存锁绝不同时持有。
         cfg_snapshot = cfg.snapshot()
         config_health = cfg.health_info()
@@ -4239,6 +4277,111 @@ def find_console_instances():
     return sorted(result, key=lambda item: (item["ports"] or [65536], item["pid"]))
 
 
+def _disk_configured_app_count(path=None):
+    """Count app cards in the on-disk config without mutating memory."""
+    path = path or CONFIG_PATH
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+        return 0
+    if not isinstance(raw, dict) or not isinstance(raw.get("apps"), list):
+        return 0
+    return sum(1 for item in raw["apps"]
+               if isinstance(item, dict) and item.get("id"))
+
+
+def _http_json_localhost(port, path, timeout):
+    url = "http://127.0.0.1:%d%s" % (int(port), path)
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except Exception:
+        return None
+
+
+def console_instance_status(item, disk_app_count=0):
+    """Classify a same-project console process: healthy / stale.
+
+    stale = no listen port, health/state probe failed, or /api/state has
+    zero apps while the config file still has cards (in-memory desync).
+    Never classifies by port occupancy of unknown processes.
+    """
+    ports = [p for p in (item.get("ports") or []) if isinstance(p, int)]
+    if not ports:
+        return "stale"
+    port = min(ports)
+    health = _http_json_localhost(port, "/api/health", 2.0)
+    if not isinstance(health, dict) or not health.get("ok"):
+        return "stale"
+    state = _http_json_localhost(port, "/api/state", 4.0)
+    if not isinstance(state, dict):
+        return "stale"
+    apps = state.get("apps")
+    live_count = len(apps) if isinstance(apps, list) else 0
+    if live_count == 0 and disk_app_count > 0:
+        return "stale"
+    return "healthy"
+
+
+def _reap_console_pids(pids, force=False):
+    """Stop current-user console PIDs; skip self. Soft then optional hard."""
+    targets = []
+    for pid in pids:
+        try:
+            pid = int(pid)
+        except (TypeError, ValueError):
+            continue
+        if pid <= 0 or pid == SELF_PID:
+            continue
+        if not is_current_user(process_uid(pid)):
+            continue
+        targets.append(pid)
+    if not targets:
+        return []
+    for pid in targets:
+        sysops.kill_process(pid, force=False)
+    deadline = time.monotonic() + 8.0
+    while time.monotonic() < deadline and any(pid_alive(pid) for pid in targets):
+        time.sleep(0.1)
+    if force:
+        for pid in [p for p in targets if pid_alive(p)]:
+            sysops.kill_process(pid, force=True)
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline and any(pid_alive(pid) for pid in targets):
+            time.sleep(0.05)
+    return [pid for pid in targets if pid_alive(pid)]
+
+
+def reap_stale_console_processes():
+    """Kill same-project leftover/unhealthy console processes.
+
+    Only current-user processes whose cwd is this project and whose command
+    contains server.py. Returns True if any stale process was reaped.
+    """
+    instances = find_console_instances()
+    if not instances:
+        return False
+    disk_apps = _disk_configured_app_count()
+    stale_pids = []
+    healthy = 0
+    for item in instances:
+        if console_instance_status(item, disk_apps) == "healthy":
+            healthy += 1
+        else:
+            stale_pids.append(item["pid"])
+    if not stale_pids:
+        return False
+    print("发现残留或异常总控台进程，正在清理: %s" %
+          ", ".join(str(pid) for pid in stale_pids), flush=True)
+    LOG.warning("reaping stale console pids %s", stale_pids)
+    survivors = _reap_console_pids(stale_pids, force=True)
+    if survivors:
+        LOG.warning("stale console still alive: %s", survivors)
+        return False
+    return True
+
+
 def _launcher_dialog(message):
     return sysops.launcher_dialog(message)
 
@@ -4376,6 +4519,8 @@ def _run_console(preferred_port=None, open_browser=True):
         _ensure_private_dir(private_dir)
     start_log_maintenance()
     cfg = Config(CONFIG_PATH)
+    cfg.restore_apps_from_disk_if_empty()
+    print("已加载 %d 个应用卡片" % len(cfg.snapshot().get("apps") or []), flush=True)
     control_token = load_control_token(os.path.join(DATA_DIR, "control.token"))
 
     server, port = None, None
@@ -4480,7 +4625,10 @@ def main(preferred_port=None, open_browser=True, log_to_file=False):
               flush=True)
     instance_lock = acquire_instance_lock()
     if instance_lock is None:
-        print("总控台已在运行（同一数据目录只允许一个实例）。", flush=True)
+        if reap_stale_console_processes():
+            instance_lock = acquire_instance_lock()
+    if instance_lock is None:
+        print("总控台已在运行：同一数据目录只允许一个实例。", flush=True)
         if open_browser:
             instances = find_console_instances()
             ports = [port for item in instances for port in item.get("ports", [])]
@@ -4488,6 +4636,12 @@ def main(preferred_port=None, open_browser=True, log_to_file=False):
                 open_console_browser(min(ports))
         return False
     try:
+        leftovers = find_console_instances()
+        if leftovers:
+            pids = [item["pid"] for item in leftovers]
+            print("发现残留总控台进程，正在清理: %s" %
+                  ", ".join(str(pid) for pid in pids), flush=True)
+            _reap_console_pids(pids, force=True)
         _run_console(preferred_port, open_browser)
         return True
     finally:
