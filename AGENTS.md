@@ -21,7 +21,7 @@
 ## 运行
 
 macOS：`python3 server.py` → 绑定 `127.0.0.1`，端口从 **9600** 起尝试，被占则 +1（最多 10 个）。启动后自动打开浏览器。`/favicon.ico` 返回统一品牌图标。双击 `总控台.app` 会先识别同目录的现有总控台，可直接打开或安全重启。
-Windows：`start.bat` 或 `LocalOpsConsole.exe`（自动探测 Python ≥3.12，并用 `ensure-runtime` 把 psutil 装进**当前解释器**，再 `pythonw server.py --log-to-file` 无窗口后台运行）；或手动 `python server.py`。数据目录 `%APPDATA%\总控台\config.json`（icons/ 为应用图标；`control.token` 为仅当前用户可读的本地控制能力令牌）、日志 `%LOCALAPPDATA%\总控台\console.log`（macOS 分别为 `~/Library/Application Support/总控台` 与 `~/Library/Logs/总控台`）。
+Windows：`start.bat` 或 `LocalOpsConsole.exe`（自动探测 Python ≥3.12，并用 `ensure-runtime` 把 psutil 装进**当前解释器**，再 `pythonw server.py --log-to-file` 无窗口后台运行）。启动时自检同一项目的残留/异常总控台进程（无端口、探活失败、或内存卡片空而磁盘仍有配置则清理后重拉）；健康实例仍只打开浏览器。或手动 `python server.py`。数据目录 `%APPDATA%\总控台\config.json`（icons/ 为应用图标；`control.token` 为仅当前用户可读的本地控制能力令牌）、日志 `%LOCALAPPDATA%\总控台\console.log`（macOS 分别为 `~/Library/Application Support/总控台` 与 `~/Library/Logs/总控台`）。
 
 ## 平台差异（Windows 移植的有意取舍）
 

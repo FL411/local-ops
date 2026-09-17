@@ -364,6 +364,10 @@ def acquire_lock(path):
         lock_file.seek(0)
         msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
         lock_file.seek(0)
+        try:
+            lock_file.truncate()
+        except OSError:
+            pass
         lock_file.write("%d\n" % os.getpid())
         lock_file.flush()
     except OSError:
