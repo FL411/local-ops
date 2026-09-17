@@ -16,6 +16,10 @@
 - **attached 认领增加 PID 创建时间校验**：Windows 快照新增 `ctime` 字段；认领时记录 `lastCreateTime`，身份匹配（`legacy_managed_pid`）时比对——同 PID 的 ctime 不同则判为 PID 复用、拒绝认领（借鉴上游 PR 的 CAS 思想，防 PID 复用误认）。旧数据无该字段时跳过校验，向后兼容，无需 schema 迁移。
 - **托管服务开机自启（autostart）**：应用卡片可标记「开机自启」（编辑表单开关，仅长期服务；批处理任务无自启意义）。总控台启动后延迟数秒，按配置顺序自动拉起所有标记了自启、且尚未运行的服务（复用启动链路与健康检查），服务之间间隔启动避免冲突；启动失败仅记录日志、不阻塞总控台、不自动重试。配合总控台自身的开机自启（注册表 Run 键）即可打通「开机 → 总控台 → 全部托管服务」的自动启动，无需手动逐个点击。
 - **端口占用时「释放并启动」**：服务端口被外部进程占用导致无法启动时，点击启动会弹出确认框，展示占用进程的名称、PID 与命令，用户显式确认后终止该占用进程（仅限当前用户进程，后端 UID 校验兜底）并自动启动服务——打通「端口冲突 → 一键解决」。严格遵循项目"绝不凭端口静默杀进程"的安全边界：绝不自动杀、必须二次确认、展示完整进程信息。
+### Fixed
+
+- **启动后服务监控降级（psutil 只装到 user-site）**：`start.bat` 用 `python.exe` 探测 `import psutil`，用户目录安装会被当成成功；`LocalOpsConsole.exe` 则完全不安装。随后 `pythonw` 看不到 user-site，页面提示「降级运行：服务监控数据可能不完整」。现由 `launcher_check.py ensure-runtime` 按 `python -s`（与 pythonw 一致）探测，并把 `psutil>=7.2` 装进**当前解释器**（失败时 `--target` 到 realpath 后的 site-packages，兼容 uv junction）。`start.bat` 与 exe 共用这条路径。
+
 ### Added
 
 - **Windows 平台移植**：新增跨平台系统操作层 `sysops.py`，macOS 保持零第三方依赖（ps/lsof/osascript），Windows 基于 `psutil` 实现进程快照、监听端口、工作目录与进程树管理；新增 `start.bat` 启动器与 `requirements-runtime-win.txt` 运行时依赖说明。`start.bat` 采用 `pythonw.exe` **无窗口后台运行**，日志写入 `%LOCALAPPDATA%\总控台\console.log`；新增 `--log-to-file` 命令行参数。

@@ -6,6 +6,7 @@
 非 ASCII 输出会乱码并破坏分支判断）：
 
     python launcher_check.py status          -> RUNNING <port> | STOPPED
+    python launcher_check.py ensure-runtime  -> OK | ERROR ...
     python launcher_check.py open <port>     -> 打开浏览器
     python launcher_check.py restart <port>  -> POST /api/console/restart
 
@@ -16,8 +17,10 @@ import json
 import os
 import socket
 import stat
+import subprocess
 import sys
 import re
+import sysconfig
 import urllib.parse
 import urllib.request
 
@@ -81,8 +84,67 @@ def find_console_port():
     return None
 
 
+PSUTIL_SPEC = "psutil>=7.2"
+
+
+def _psutil_importable_without_user_site():
+    """Match pythonw: user-site packages may be invisible."""
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-s", "-c", "import psutil"],
+            capture_output=True, timeout=15)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return completed.returncode == 0
+
+
+def _install_psutil():
+    pip = [sys.executable, "-m", "pip", "install", PSUTIL_SPEC]
+    try:
+        completed = subprocess.run(
+            pip, capture_output=True, text=True, timeout=90)
+    except (OSError, subprocess.TimeoutExpired):
+        completed = None
+    if (completed is not None and completed.returncode == 0
+            and _psutil_importable_without_user_site()):
+        return True
+    target = os.path.realpath(sysconfig.get_path("purelib"))
+    try:
+        completed = subprocess.run(
+            pip + ["--target", target],
+            capture_output=True, text=True, timeout=90)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return completed.returncode == 0 and _psutil_importable_without_user_site()
+
+
+def ensure_runtime():
+    # pythonw may not see user-site; require psutil under sys.prefix.
+    if sys.version_info < (3, 12):
+        print("ERROR Python 3.12+ required")
+        return 1
+    if sys.platform != "win32":
+        print("OK")
+        return 0
+    if _psutil_importable_without_user_site():
+        print("OK")
+        return 0
+    print("INFO installing %s into this interpreter" % PSUTIL_SPEC)
+    if not _install_psutil():
+        print("ERROR psutil install failed")
+        print('Run: python -m pip install "psutil>=7.2"')
+        return 1
+    if not _psutil_importable_without_user_site():
+        print("ERROR psutil is not visible to pythonw")
+        return 1
+    print("OK")
+    return 0
+
+
 def main(argv):
     action = argv[1] if len(argv) > 1 else "status"
+    if action == "ensure-runtime":
+        return ensure_runtime()
     port = None
     if len(argv) > 2:
         try:

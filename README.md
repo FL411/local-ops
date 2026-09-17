@@ -46,7 +46,7 @@
 
 ## 系统要求
 
-- **Windows 10/11**：运行时依赖 `psutil`（≥ 7.2，Python 3.13/3.14 兼容所需；首次运行 `start.bat` 自动安装，或 `pip install "psutil>=7.2"`）。
+- **Windows 10/11**：运行时依赖 `psutil`（≥ 7.2，Python 3.13/3.14 兼容所需；首次运行 `start.bat` 或 `LocalOpsConsole.exe` 会安装到**当前解释器**，或手动 `pip install "psutil>=7.2"`）。
 - Python 3.12 或更高版本。
 - Chrome、Edge 或其他支持 ES Modules 的现代浏览器。
 
@@ -59,7 +59,7 @@
 ### Windows
 
 1. **安装 Python 3.12+**：从 <https://www.python.org/downloads/> 下载安装，安装时务必勾选 **“Add python.exe to PATH”**。
-2. **首次运行**：双击 `start.bat`。首次启动会自动安装 `psutil`（Windows 运行时依赖，仅一次），随后打开浏览器进入 `http://127.0.0.1:9600/`。
+2. **首次运行**：双击 `LocalOpsConsole.exe` 或 `start.bat`。首次启动会把 `psutil` 装进当前 Python（给 `pythonw` 用，不只是 user-site），随后打开浏览器进入 `http://127.0.0.1:9600/`。
 
    > 也可手动运行：`python -m pip install "psutil>=7.2"` 后执行 `python server.py`。
 3. 建议将脚本保存在稳定、会单独备份的自动化目录中（参见下文「批处理任务」说明）。
@@ -84,7 +84,7 @@ Windows 后台运行说明：
 - 启动使用 `pythonw.exe` 无窗口运行，服务在后台常驻，**系统托盘显示品牌图标**（左键打开控制台，右键菜单可打开/重启/停止/退出）；日志写入 `%LOCALAPPDATA%\总控台\console.log`。
 - **静默启动（不自动打开浏览器）**：命令行运行 `LocalOpsConsole.exe --no-browser`，或给快捷方式的目标后追加 ` --no-browser`——后台 + 托盘启动，浏览器由你主动打开（点托盘图标或手动访问 `http://127.0.0.1:9600/`）。
 - **停止总控台**：打开页面后点击顶栏「停止」（网页按钮，不影响已启动的应用）；或托盘右键「停止总控台」。
-- 首次运行会自动安装 `psutil`（≥ 7.2，Windows 唯一运行时依赖）。
+- 首次运行时，`start.bat` 与 `LocalOpsConsole.exe` 都会把 `psutil`（≥ 7.2）装进**当前解释器**的 site-packages，确保 `pythonw` 能导入（仅装到 user-site 会降级运行）。
 
 ### macOS
 
@@ -269,7 +269,7 @@ Windows 为同一代码库的移植版本（平台差异收口在 `sysops.py` �
 
 - favicon 抓取只对 token 受管进程生效，`attached` 认领的卡片会返回"应用未运行或无可用端口"（上游既有行为，两平台相同）。
 - 优雅停止对无窗口服务无效（只能硬杀），涉及落盘的服务建议定期保存。
-- 运行要求：Windows 10/11 + Python 3.12+；唯一运行时依赖 `psutil>=7.2`（`start.bat` 首次启动自动安装，要求联网）。
+- 运行要求：Windows 10/11 + Python 3.12+；唯一运行时依赖 `psutil>=7.2`（`start.bat` / `LocalOpsConsole.exe` 首次启动安装到当前解释器，要求联网）。
 
 ## 故障排查
 

@@ -400,9 +400,15 @@ def release_lock(lock_file):
 
 
 def _psutil():
+    global psutil
     if psutil is None:
-        raise RuntimeError(
-            "Windows 平台需要 psutil：pip install psutil（或用 start.bat 自动安装）")
+        try:
+            import psutil as _mod
+        except ImportError:
+            raise RuntimeError(
+                "Windows 平台需要 psutil：pip install psutil"
+                "（或用 start.bat / LocalOpsConsole.exe 自动安装）")
+        psutil = _mod
     return psutil
 
 
