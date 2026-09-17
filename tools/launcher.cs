@@ -7,6 +7,7 @@
 using System;
 using System.Diagnostics;
 using System.IO;
+using System.Text;
 using System.Windows.Forms;
 
 public static class Launcher
@@ -36,6 +37,8 @@ public static class Launcher
                             "LocalOps Console", MessageBoxButtons.OK, MessageBoxIcon.Error);
             return 1;
         }
+        if (!EnsureRuntime(pyexe, root))
+            return 1;
         string pythonw = pyexe.Replace("python.exe", "pythonw.exe");
         if (!File.Exists(pythonw)) pythonw = pyexe;
         Process p = new Process();
@@ -45,6 +48,70 @@ public static class Launcher
         p.StartInfo.UseShellExecute = false;
         p.Start();
         return 0;
+    }
+
+    // python.exe may see user-site psutil that pythonw ignores.
+    // Install into THIS interpreter before launching pythonw.
+    private static bool EnsureRuntime(string pyexe, string root)
+    {
+        try
+        {
+            ProcessStartInfo psi = new ProcessStartInfo();
+            psi.FileName = pyexe;
+            psi.Arguments = "launcher_check.py ensure-runtime";
+            psi.WorkingDirectory = root;
+            psi.UseShellExecute = false;
+            psi.RedirectStandardOutput = true;
+            psi.RedirectStandardError = true;
+            psi.CreateNoWindow = true;
+            using (Process p = Process.Start(psi))
+            {
+                if (p == null)
+                {
+                    MessageBox.Show("Failed to start Python to prepare runtime.",
+                                    "LocalOps Console", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    return false;
+                }
+                StringBuilder sbOut = new StringBuilder();
+                StringBuilder sbErr = new StringBuilder();
+                p.OutputDataReceived += delegate(object s, DataReceivedEventArgs e)
+                {
+                    if (e.Data != null) sbOut.AppendLine(e.Data);
+                };
+                p.ErrorDataReceived += delegate(object s, DataReceivedEventArgs e)
+                {
+                    if (e.Data != null) sbErr.AppendLine(e.Data);
+                };
+                p.BeginOutputReadLine();
+                p.BeginErrorReadLine();
+                if (!p.WaitForExit(120000))
+                {
+                    try { p.Kill(); } catch { }
+                    MessageBox.Show("Timed out installing runtime dependency (psutil).",
+                                    "LocalOps Console", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    return false;
+                }
+                p.WaitForExit();
+                if (p.ExitCode != 0)
+                {
+                    string detail = (sbOut.ToString() + "\n" + sbErr.ToString()).Trim();
+                    if (detail.Length == 0)
+                        detail = "psutil is required but could not be installed.";
+                    if (detail.Length > 1200)
+                        detail = detail.Substring(0, 1200);
+                    MessageBox.Show(detail,
+                                    "LocalOps Console", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    return false;
+                }
+                return true;
+            }
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show("Failed to prepare Python runtime: " + ex.Message,
+                            "LocalOps Console", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            return false;
+        }
     }
 
     private static string ProbePython()

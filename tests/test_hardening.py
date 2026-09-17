@@ -1,5 +1,6 @@
 import contextlib
 import http.client
+import io
 import json
 import os
 import signal
@@ -172,6 +173,146 @@ class LauncherCapabilityTokenTests(unittest.TestCase):
             self.assertEqual(launcher_check.main(["launcher", "restart", "9600"]), 1)
         open_browser.assert_not_called()
         urlopen.assert_not_called()
+
+
+
+class EnsureRuntimeTests(unittest.TestCase):
+    def test_posix_skips_psutil_install(self):
+        buf = io.StringIO()
+        with mock.patch.object(launcher_check.sys, "platform", "darwin"):
+            with mock.patch.object(
+                    launcher_check, "_psutil_importable_without_user_site") as probe:
+                with mock.patch.object(launcher_check, "_install_psutil") as install:
+                    with mock.patch("sys.stdout", buf):
+                        rc = launcher_check.ensure_runtime()
+        self.assertEqual(rc, 0)
+        self.assertEqual(buf.getvalue().strip(), "OK")
+        buf.getvalue().encode("ascii")
+        probe.assert_not_called()
+        install.assert_not_called()
+
+    def test_windows_visible_psutil_does_not_install(self):
+        buf = io.StringIO()
+        with mock.patch.object(launcher_check.sys, "platform", "win32"):
+            with mock.patch.object(
+                    launcher_check, "_psutil_importable_without_user_site",
+                    return_value=True):
+                with mock.patch.object(launcher_check, "_install_psutil") as install:
+                    with mock.patch("sys.stdout", buf):
+                        rc = launcher_check.ensure_runtime()
+        self.assertEqual(rc, 0)
+        install.assert_not_called()
+        self.assertEqual(buf.getvalue().strip(), "OK")
+        buf.getvalue().encode("ascii")
+
+    def test_user_site_only_is_treated_as_missing(self):
+        buf = io.StringIO()
+        with mock.patch.object(launcher_check.sys, "platform", "win32"):
+            with mock.patch.object(
+                    launcher_check, "_psutil_importable_without_user_site",
+                    side_effect=[False, True]):
+                with mock.patch.object(
+                        launcher_check, "_install_psutil",
+                        return_value=True) as install:
+                    with mock.patch("sys.stdout", buf):
+                        rc = launcher_check.ensure_runtime()
+        self.assertEqual(rc, 0)
+        install.assert_called_once()
+        self.assertIn("OK", buf.getvalue())
+        buf.getvalue().encode("ascii")
+
+    def test_install_failure_is_error(self):
+        buf = io.StringIO()
+        with mock.patch.object(launcher_check.sys, "platform", "win32"):
+            with mock.patch.object(
+                    launcher_check, "_psutil_importable_without_user_site",
+                    return_value=False):
+                with mock.patch.object(
+                        launcher_check, "_install_psutil", return_value=False):
+                    with mock.patch("sys.stdout", buf):
+                        rc = launcher_check.ensure_runtime()
+        self.assertEqual(rc, 1)
+        self.assertIn("ERROR", buf.getvalue())
+        buf.getvalue().encode("ascii")
+
+    def test_installed_but_still_invisible_is_error(self):
+        buf = io.StringIO()
+        with mock.patch.object(launcher_check.sys, "platform", "win32"):
+            with mock.patch.object(
+                    launcher_check, "_psutil_importable_without_user_site",
+                    return_value=False):
+                with mock.patch.object(
+                        launcher_check, "_install_psutil", return_value=True):
+                    with mock.patch("sys.stdout", buf):
+                        rc = launcher_check.ensure_runtime()
+        self.assertEqual(rc, 1)
+        self.assertIn("not visible to pythonw", buf.getvalue())
+        buf.getvalue().encode("ascii")
+
+    def test_old_python_is_error(self):
+        buf = io.StringIO()
+        with mock.patch.object(launcher_check.sys, "version_info", (3, 11, 9)):
+            with mock.patch("sys.stdout", buf):
+                rc = launcher_check.ensure_runtime()
+        self.assertEqual(rc, 1)
+        self.assertTrue(buf.getvalue().startswith("ERROR"))
+        buf.getvalue().encode("ascii")
+
+    def test_main_dispatches_ensure_runtime(self):
+        with mock.patch.object(launcher_check, "ensure_runtime",
+                               return_value=0) as fn:
+            self.assertEqual(
+                launcher_check.main(["launcher_check.py", "ensure-runtime"]), 0)
+        fn.assert_called_once_with()
+
+    def test_probe_uses_dash_s_to_ignore_user_site(self):
+        with mock.patch.object(launcher_check.subprocess, "run") as run:
+            run.return_value = mock.Mock(returncode=0)
+            self.assertTrue(launcher_check._psutil_importable_without_user_site())
+        args = run.call_args.args[0]
+        self.assertEqual(args[0], sys.executable)
+        self.assertEqual(args[1], "-s")
+        self.assertEqual(args[2], "-c")
+        self.assertEqual(args[3], "import psutil")
+
+    def test_install_falls_back_to_realpath_purelib(self):
+        pip_calls = []
+
+        def fake_run(args, **kwargs):
+            pip_calls.append(list(args))
+            result = mock.Mock()
+            result.returncode = 0
+            result.stdout = ""
+            result.stderr = ""
+            return result
+
+        with mock.patch.object(launcher_check.subprocess, "run", fake_run):
+            with mock.patch.object(
+                    launcher_check, "_psutil_importable_without_user_site",
+                    side_effect=[False, True]):
+                with mock.patch.object(
+                        launcher_check.sysconfig, "get_path",
+                        return_value="prefix-link/Lib/site-packages"):
+                    with mock.patch.object(
+                            launcher_check.os.path, "realpath",
+                            return_value="prefix-real/Lib/site-packages"):
+                        self.assertTrue(launcher_check._install_psutil())
+        self.assertEqual(len(pip_calls), 2)
+        self.assertNotIn("--target", pip_calls[0])
+        self.assertIn("--target", pip_calls[1])
+        self.assertIn("prefix-real/Lib/site-packages", pip_calls[1])
+        self.assertNotIn("prefix-link/Lib/site-packages", pip_calls[1])
+
+    def test_start_bat_and_launcher_call_ensure_runtime(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "start.bat"), encoding="utf-8") as fh:
+            bat = fh.read()
+        with open(os.path.join(root, "tools", "launcher.cs"),
+                  encoding="utf-8") as fh:
+            cs = fh.read()
+        self.assertIn("ensure-runtime", bat)
+        self.assertNotIn("import sys,psutil", bat)
+        self.assertIn("ensure-runtime", cs)
 
 
 class ControlTokenStorageTests(unittest.TestCase):
