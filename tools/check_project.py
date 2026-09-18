@@ -20,6 +20,14 @@ import tempfile
 from pathlib import Path
 
 
+def configure_console_encoding() -> None:
+    """让检查结果在 Windows CI 的非 UTF-8 控制台中也能输出。"""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(encoding="utf-8", errors="replace")
+
+
 ROOT = Path(__file__).resolve().parents[1]
 STATIC = ROOT / "static"
 WINDOWS_RUNTIME_FILES = (
@@ -638,6 +646,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    configure_console_encoding()
     args = parse_args()
     report = Report()
     checks = [
