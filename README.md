@@ -1,29 +1,51 @@
-# 总控台（Windows）
+# 总控台 for Windows
 
-> **本仓库是 [laogou717/local-ops](https://github.com/laogou717/local-ops)（总控台）的 Windows 专用衍生版，只支持 Windows 10/11。**
-> macOS 用户请使用上游仓库；本仓库不接受以恢复 macOS/Linux 兼容为目标的改动。
+[![CI](https://github.com/FL411/local-ops/actions/workflows/ci.yml/badge.svg)](https://github.com/FL411/local-ops/actions/workflows/ci.yml)
+[![Windows 10/11](https://img.shields.io/badge/Windows-10%20%2F%2011-0078D4?logo=windows)](#系统要求)
+[![Python 3.12+](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white)](#系统要求)
+[![MIT License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-## 亮点
+**把散落在终端里的本地服务、脚本、端口和日志，收进一个可视化控制台。**
 
-- **系统托盘**：后台常驻品牌图标，左键打开控制台，右键菜单「打开 / 重启 / 停止 / 退出」，tooltip 实时显示运行状态——摆脱命令行窗口。
-- **无窗口 exe 启动器**：双击 `LocalOpsConsole.exe` 即可后台启动。
-- **Windows 原生体验**：系统托盘、无窗口启动器、开机自启、TokenUser SID 进程归属和私有 DACL。
-- **自动化回归**：单实例锁、托盘、平台泄漏扫描、控制令牌、ACL 与启动台磁盘恢复均有测试覆盖。
-- **Windows 专项修复**：修复单实例锁、项目识别命令、后台重启日志和启动台卡片恢复等问题。
+总控台面向 Windows 10/11 开发者，可以在一个本地页面中启动、停止和重启项目，查看端口占用、进程来源与资源状态，运行批处理任务，并把常用服务设置为开机自启。后端只绑定 `127.0.0.1`，数据保存在当前电脑，不需要账号或云服务。
 
-**Preview / Alpha · 源码预览**
+[查看界面](#界面预览) · [立即安装](#安装) · [使用指南](#使用) · [报告问题](https://github.com/FL411/local-ops/issues) · [查看更新](CHANGELOG.md)
 
-总控台是一个本地服务与批处理任务快速启动、运行监测工具。它把常用项目命令、长期服务和一次性批处理任务集中到本地网页中，并用 Python 3 提供只绑定回环地址的后端（运行时依赖 `psutil`）；前端是无构建、无 CDN 的原生 HTML/CSS/JavaScript。
+> 如果它帮你减少了终端窗口、端口冲突和重复启动工作，欢迎为仓库点一个 Star，让更多 Windows 开发者找到它。
 
-> 当前版本仍处于 Preview / Alpha 阶段，以源码预览形式提供。接口、配置格式和安装方式仍可能调整。本仓库为 Windows 专用版本，核心功能（服务启停、进程溯源、日志、诊断、新端口发现、控制令牌）已验证可用。
+## 它能解决什么
 
-总控台只服务当前电脑和当前用户，不是远程运维、多人协作或公网管理面板。它能够以当前用户权限执行保存的 shell 命令；不要将监听地址、反向代理、SSH 隧道或端口映射暴露到不受信任的网络。
+- **项目太多，启动容易遗漏**：把前端、API、博客、本地工具和常用脚本保存成卡片，一键启动或批量停止。
+- **不知道哪个进程占了端口**：集中查看当前用户的监听端口、PID、命令、工作目录、CPU、内存和运行时长。
+- **服务失败后排查费时**：直接查看日志与诊断建议，在启动前检查丢失的目录、脚本和运行时。
+- **终端窗口长期堆积**：双击 `LocalOpsConsole.exe` 无窗口启动，通过系统托盘打开、重启或停止总控台。
+- **重启后配置或服务难恢复**：启动时自检残留进程，从磁盘恢复启动台卡片，并可自动拉起标记为开机自启的服务。
 
-## 维护说明
+## Windows 版亮点
 
-总控台由作者个人维护：功能的新增、修改与完善以作者日常使用中的实际需求为准，迭代节奏不定；PR 不承诺审阅或合入。
+- **开箱即用的桌面入口**：安装 Python 后，双击 `LocalOpsConsole.exe` 即可后台启动并自动打开页面。
+- **系统托盘常驻**：左键打开，右键可打开、重启、停止或退出，tooltip 实时显示运行状态。
+- **本地项目识别**：可识别 Node/pnpm、Hexo/Hugo、Django/FastAPI、Go、Rust、静态站点等常见项目并生成候选命令。
+- **谨慎的进程控制**：通过运行 token、进程树和 TokenUser SID 识别受控进程，不会仅凭端口号静默结束外部进程。
+- **Windows 专项可靠性**：覆盖单实例锁、无窗口日志、控制令牌、私有 DACL、残留进程清理和启动台磁盘恢复。
 
-如果你希望增加功能、修复问题或适配其他平台，欢迎 **Fork 本仓库自行修改**，并在 Discussions 中提交衍生版本说明。经过试用评估后，优秀的衍生版本会收录到下方 [社区衍生版本](#社区衍生版本) 列表推荐给大家；衍生版本由各自作者维护，未经原作者审阅或测试，使用前请自行评估。
+## 30 秒开始
+
+1. 安装 [Python 3.12+](https://www.python.org/downloads/)，安装时勾选 **Add python.exe to PATH**。
+2. 下载仓库源码，或运行 `git clone https://github.com/FL411/local-ops.git`。
+3. 双击项目根目录中的 `LocalOpsConsole.exe`，首次运行会安装 `psutil` 并打开本地控制台。
+
+更完整的环境要求、备用启动方式和升级说明见下方 [安装](#安装) 与 [运行](#运行)。
+
+> **Preview / Alpha**：当前以源码预览形式提供，接口、配置格式和安装方式仍可能调整。核心功能已经过 Windows 自动化测试，但升级前仍建议备份 `%APPDATA%\总控台\`。
+
+本仓库是 [laogou717/local-ops](https://github.com/laogou717/local-ops) 的 Windows 专用衍生版。感谢原项目提供的产品基础；macOS 用户请使用上游仓库，本仓库只维护 Windows 10/11。
+
+总控台只服务当前电脑和当前用户，不是远程运维、多人协作或公网管理面板。它能够以当前用户权限执行保存的 shell 命令；不要通过监听地址修改、反向代理、SSH 隧道或端口映射将它暴露到不受信任的网络。
+
+## 维护与参与
+
+项目目前由 FL411 主要维护，优先解决 Windows 日常开发中的真实问题。欢迎通过 [Issues](https://github.com/FL411/local-ops/issues) 报告缺陷、提出需求，或提交范围清晰且带验证结果的 Pull Request。为保持实现和安全边界清晰，本仓库不接受恢复 macOS/Linux 运行路径的改动。
 
 ## 功能
 
@@ -351,20 +373,13 @@ python tools\check_project.py
 - 不含任何项目内旧 `data/`、用户数据、日志、绝对路径、token 或缓存的发行包。
 - Windows 发行包（zip）解压后可直接运行：`LocalOpsConsole.exe` 无窗口启动、`start.bat` 备用；按 `RELEASE_CHECKLIST.md` 完成 Windows 全新安装与回退验证（含控制令牌只读/可写切换、ACL 冒烟检查）。
 
-## 社区衍生版本
+## 项目关系与致谢
 
-以下衍生版本由社区贡献者各自维护，未经原作者审阅或测试，收录仅作推荐。提交新衍生版本或更新说明，请前往 Discussions。
-
-| 衍生版本 | 说明 | 出处 |
-| --- | --- | --- |
-| Windows 10/11 适配（上游历史提案） | 上游仓库的双平台适配提案，仅作背景参考 | PR [#2](https://github.com/laogou717/local-ops/pull/2)（dontpanic1） |
-| Windows 11 安全优先移植（Draft） | Job Objects、签名回执、CREATE_SUSPENDED 等更严格的进程所有权模型，含打包体系 | PR [#3](https://github.com/laogou717/local-ops/pull/3)（songconmaisaix31-design） |
-| Windows 后端 `server_win.py` | 独立 Windows 后端（纯标准库），复用本仓库前端 | PR [#4](https://github.com/laogou717/local-ops/pull/4)（Hexvork） |
-| 总控台 Windows 专用版 | 本仓库。psutil 运行时依赖；系统托盘、无窗口启动器、开机自启、端口释放、控制令牌。不再维护 macOS 路径 | [FL411/local-ops](https://github.com/FL411/local-ops) |
+本项目基于 [laogou717/local-ops](https://github.com/laogou717/local-ops) 持续开发，并专注于 Windows 10/11 的运行体验、安全边界和长期维护。上游功能同步与 Windows 适配取舍记录在 [`docs/upstream-pr-map.md`](docs/upstream-pr-map.md)。感谢上游作者及所有参与讨论、测试和贡献代码的开发者。
 
 ## 参与贡献与安全
 
-- 提交代码前请阅读 [`CONTRIBUTING.md`](CONTRIBUTING.md) 与上方「维护说明」，并运行 `python tools\check_project.py`。
+- 提交代码前请阅读 [`CONTRIBUTING.md`](CONTRIBUTING.md) 与上方「维护与参与」，并运行 `python tools\check_project.py`。
 - 行为规范见 [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md)。
 - 安全问题不要作为普通公开 Issue 披露；报告方式和脱敏要求见 [`SECURITY.md`](SECURITY.md)。
 - 新增或替换字体、图标、插画、纹理等素材时，必须同步更新 [`ASSET_PROVENANCE.md`](ASSET_PROVENANCE.md) 和 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)。
