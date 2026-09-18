@@ -1318,6 +1318,18 @@ class ConsoleStartupTests(unittest.TestCase):
                                     open_browser=open_browser)
                 return obl.call_count
 
+    def test_console_encoding_is_configured_before_startup_output(self):
+        stdout = mock.Mock()
+        stderr = mock.Mock()
+        with mock.patch.object(server.sys, "stdout", stdout), \
+                mock.patch.object(server.sys, "stderr", stderr), \
+                mock.patch.object(server, "logging"):
+            server.configure_console_encoding()
+        stdout.reconfigure.assert_called_once_with(
+            encoding="utf-8", errors="replace")
+        stderr.reconfigure.assert_called_once_with(
+            encoding="utf-8", errors="replace")
+
     def test_default_config_opens_browser(self):
         self.assertEqual(self._run_console(open_browser=True), 1)
 

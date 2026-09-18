@@ -134,6 +134,19 @@ MANUAL_STOP_LOCK = threading.RLock()
 MANUAL_STOP_TOKENS = set()
 
 
+def configure_console_encoding():
+    """让 Windows 非 UTF-8 控制台也能安全输出诊断信息。"""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, OSError, ValueError):
+            # 某些嵌入式/测试输出流不支持修改编码；print 本身仍可继续。
+            pass
+
+
 def is_current_user(identity):
     """严格判断进程身份是否属于当前用户。
 
@@ -4502,6 +4515,7 @@ def _start_autostart_thread(cfg):
 
 
 def _run_console(preferred_port=None, open_browser=True):
+    configure_console_encoding()
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -4611,6 +4625,7 @@ def redirect_console_output():
 
 def main(preferred_port=None, open_browser=True, log_to_file=False):
     """Run exactly one console for this project/data directory."""
+    configure_console_encoding()
     migration = prepare_runtime_storage()
     if log_to_file:
         redirect_console_output()
