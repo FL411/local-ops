@@ -21,7 +21,7 @@
 ## 运行
 
 macOS：`python3 server.py` → 绑定 `127.0.0.1`，端口从 **9600** 起尝试，被占则 +1（最多 10 个）。启动后自动打开浏览器。`/favicon.ico` 返回统一品牌图标。双击 `总控台.app` 会先识别同目录的现有总控台，可直接打开或安全重启。
-Windows：`start.bat` 或 `LocalOpsConsole.exe`（自动探测 Python ≥3.12，并用 `ensure-runtime` 把 psutil 装进**当前解释器**，再 `pythonw server.py --log-to-file` 无窗口后台运行）。启动时自检同一项目的残留/异常总控台进程（无端口、探活失败、或内存卡片空而磁盘仍有配置则清理后重拉）；健康实例仍只打开浏览器。`/api/state` 若内存卡片为空而磁盘仍有配置，会同步读回后再响应，避免把空启动台缓存出去。或手动 `python server.py`。数据目录 `%APPDATA%\总控台\config.json`（icons/ 为应用图标；`control.token` 为仅当前用户可读的本地控制能力令牌）、日志 `%LOCALAPPDATA%\总控台\console.log`（macOS 分别为 `~/Library/Application Support/总控台` 与 `~/Library/Logs/总控台`）。
+Windows：`start.bat` 或 `LocalOpsConsole.exe`（自动探测 Python ≥3.12，并用 `ensure-runtime` 把 psutil 装进**当前解释器**，再 `pythonw server.py --log-to-file` 无窗口后台运行）。启动时自检同一项目的残留/异常总控台进程（无端口、探活失败、或内存卡片空而磁盘仍有配置则清理后重拉）；健康实例仍只打开浏览器。`/api/state` 每次响应都从磁盘 `config.json` 重建启动台卡片（进程/端口扫描仍走缓存），避免内存或缓存空列表盖住真实配置。或手动 `python server.py`。数据目录 `%APPDATA%\总控台\config.json`（icons/ 为应用图标；`control.token` 为仅当前用户可读的本地控制能力令牌）、日志 `%LOCALAPPDATA%\总控台\console.log`（macOS 分别为 `~/Library/Application Support/总控台` 与 `~/Library/Logs/总控台`）。
 
 ## 平台差异（Windows 移植的有意取舍）
 
@@ -115,7 +115,7 @@ Windows：`start.bat` 或 `LocalOpsConsole.exe`（自动探测 Python ≥3.12，
 ## 后端实现要点
 
 - **端口扫描**：`lsof -iTCP -sTCP:LISTEN -P -n`，按 `(pid, port)` 去重（IPv4/6 重复行）。lsof 的 COMMAND 列会截断，名称以 ps 的 comm 为准。
-- **状态快照**：`/api/state` 使用 2.2 秒 TTL 与 stale-while-revalidate；过期时立即返回上一份完整快照，后台最多一个刷新线程。缓存锁内不得读取配置或执行进程/端口扫描，`Config.update()` 必须在释放配置锁后再使缓存失效，避免锁顺序反转。
+- **状态快照**：`/api/state` 对进程/端口扫描使用 2.2 秒 TTL 与 stale-while-revalidate；过期时立即返回上一份扫描结果，后台最多一个刷新线程。启动台卡片每次都从磁盘 `config.json` 重建（主文件不可读才读 `.bak`），不把内存或缓存里的空列表当成配置。缓存锁内不得读取配置或执行进程/端口扫描，`Config.update()` 必须在释放配置锁后再使缓存失效，避免锁顺序反转。
 - **进程详情**：批量 `ps -o pid=,user=,comm=,args=,%cpu=,%mem=,etime= -p <逗号分隔pid>`；只保留 `user == 当前用户`。
 - **cwd**：`lsof -a -p <逗号分隔pid> -d cwd -Fn`，解析 `n` 行。
 - **etime 解析**：`[[dd-]hh:]mm:ss` → 秒。

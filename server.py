@@ -627,8 +627,41 @@ class Config:
             raw = _load_config_raw(self._path + ".bak")
         return self._apps_from_raw(raw)
 
+    def _reload_from_disk_unlocked(self):
+        """Refresh in-memory config from disk. Caller must hold _lock.
+
+        Read-only: never persist on poll. Main file if readable; backup only
+        if the main file is unreadable. A readable main file with ``apps: []``
+        is treated as the user deleting the last card, not as corruption.
+        If neither file can be parsed, keep the current in-memory copy.
+        """
+        raw = _load_config_raw(self._path)
+        from_backup = False
+        if raw is None:
+            raw = _load_config_raw(self._path + ".bak")
+            from_backup = raw is not None
+        if raw is None:
+            return False
+        try:
+            migrated, source_version = migrate_config(raw)
+            data = self._normalize(migrated)
+        except FutureConfigSchemaError:
+            LOG.error("拒绝降级读取配置: %s", self._path)
+            return False
+        except (ConfigSchemaError, TypeError, ValueError):
+            LOG.exception("读取配置失败: %s", self._path)
+            return False
+        self._data = data
+        # Sticky startup health: a later readable main file must not hide
+        # that this process recovered from backup or migrated schema.
+        if from_backup:
+            self._recovered_from_backup = True
+        if source_version < CURRENT_SCHEMA_VERSION:
+            self._migration_from = source_version
+        return True
+
     def restore_apps_from_disk_if_empty(self):
-        """内存应用列表为空但磁盘仍有卡片时，只把 apps 从文件读回。
+        """内存应用列表为空但磁盘仍有卡片时，把配置从文件读回。
 
         与 update() 共用 _lock：删光卡片的落盘会先完成，随后读到的也是空列表，
         不会把用户刚删除的卡片救回来。主文件可读且为空时不以备份覆盖。
@@ -636,18 +669,19 @@ class Config:
         with self._lock:
             if self._data.get("apps"):
                 return False
-            restored = self._read_disk_apps()
+            self._reload_from_disk_unlocked()
+            restored = self._data.get("apps") or []
             if not restored:
                 return False
-            self._data["apps"] = restored
             LOG.warning(
                 "restored %d apps from disk (in-memory list was empty): %s",
                 len(restored), self._path)
             return True
 
     def snapshot(self):
-        """返回配置的深拷贝（数据均为 JSON 可序列化）。"""
+        """返回当前磁盘配置的深拷贝（数据均为 JSON 可序列化）。"""
         with self._lock:
+            self._reload_from_disk_unlocked()
             return json.loads(json.dumps(self._data, ensure_ascii=False))
 
     @property
@@ -667,10 +701,11 @@ class Config:
             }
 
     def update(self, fn):
-        """在锁内执行 fn(self._data) 修改配置，随后原子落盘，返回 fn 的返回值。"""
+        """先从磁盘载入，再在锁内执行 fn(self._data) 并原子落盘，返回 fn 的返回值。"""
         with self._lock:
             if not self._writable:
                 raise OSError("配置处于只读保护状态，请先恢复配置或权限")
+            self._reload_from_disk_unlocked()
             previous = json.loads(json.dumps(self._data, ensure_ascii=False))
             try:
                 result = fn(self._data)
@@ -1557,14 +1592,17 @@ def build_state(cfg, console_port, config_health=None):
     # 仅在有可修复身份时附带内部字段；_refresh_state 在序列化前取走它。
     if "attached_repairs" in locals() and attached_repairs:
         state["_attachedRepairs"] = attached_repairs
+    state["_listeners"] = set(listeners)
+    state["_groups"] = groups
     return state
 
 
 # ---------------------------------------------------------------- 状态快照缓存
-# 完整快照包含进程与端口扫描，Windows 上也可能耗时数秒。过期快照采用
-# stale-while-revalidate：请求立即复用上一份完整结果，后台最多启动一个刷新；
-# 首次无缓存时由一个请求构建，其余请求等待同一结果。任何配置读取和慢扫描
-# 都不得发生在缓存锁内，避免与 Config.update 形成锁顺序反转。
+# 进程与端口扫描在 Windows 上也可能耗时数秒，因此只缓存这一层，并采用
+# stale-while-revalidate：过期时立即复用上一份扫描结果，后台最多一个刷新。
+# 启动台卡片、主题等配置每次响应都从磁盘 config.json 重建，避免内存/缓存
+# 空列表盖住真实卡片。任何配置读取和慢扫描都不得发生在缓存锁内，避免与
+# Config.update 形成锁顺序反转。
 STATE_CACHE_TTL = 2.2  # 秒
 STATE_CACHE_INITIAL_WAIT = 15.0
 _state_cache_lock = threading.Lock()
@@ -1572,6 +1610,8 @@ _state_cache_ready = threading.Condition(_state_cache_lock)
 _state_cache = {
     "mono": 0.0,
     "state": None,
+    "listeners": None,
+    "groups": None,
     "building": False,
     "generation": 0,
 }
@@ -1586,11 +1626,25 @@ def invalidate_state_cache():
         _state_cache_ready.notify_all()
 
 
-def _finish_state_refresh(state, generation):
+def _copy_cached_scan_locked():
+    """Copy cached process-scan parts. Caller must hold _state_cache_ready."""
+    listeners = _state_cache.get("listeners")
+    groups = _state_cache.get("groups")
+    listeners_copy = set(listeners) if listeners else set()
+    if isinstance(groups, dict):
+        groups_copy = {key: list(value) for key, value in groups.items()}
+    else:
+        groups_copy = groups
+    return listeners_copy, groups_copy
+
+
+def _finish_state_refresh(state, generation, listeners=None, groups=None):
     with _state_cache_ready:
         if (state is not None
                 and generation == _state_cache.get("generation", 0)):
             _state_cache["state"] = state
+            _state_cache["listeners"] = set(listeners or set())
+            _state_cache["groups"] = groups
             _state_cache["mono"] = time.monotonic()
         _state_cache["building"] = False
         _state_cache_ready.notify_all()
@@ -1598,17 +1652,13 @@ def _finish_state_refresh(state, generation):
 
 def _refresh_state(cfg, console_port, generation, raise_errors=False):
     try:
-        # 先 snapshot，再按需恢复：避免 update() 持锁等待 snapshot 时
-        # restore() 先抢同一把配置锁造成死锁。
+        # snapshot() 自己从磁盘读配置。Config 锁与缓存锁绝不同时持有。
         cfg_snapshot = cfg.snapshot()
-        restore = getattr(cfg, "restore_apps_from_disk_if_empty", None)
-        if callable(restore) and not (cfg_snapshot.get("apps") or []):
-            if restore():
-                cfg_snapshot = cfg.snapshot()
-        # Config 锁与缓存锁绝不同时持有。
         config_health = cfg.health_info()
         state = build_state(cfg_snapshot, console_port, config_health)
         attached_repairs = state.pop("_attachedRepairs", [])
+        listeners = state.pop("_listeners", set())
+        groups = state.pop("_groups", None)
         repair_attached_app_identities(cfg, attached_repairs)
     except Exception:
         _finish_state_refresh(None, generation)
@@ -1616,7 +1666,7 @@ def _refresh_state(cfg, console_port, generation, raise_errors=False):
             raise
         LOG.exception("后台刷新状态快照失败")
         return None
-    _finish_state_refresh(state, generation)
+    _finish_state_refresh(state, generation, listeners, groups)
     return state
 
 
@@ -1650,64 +1700,92 @@ def warm_state_cache(cfg, console_port):
     return True
 
 
-def _snapshot_lacks_disk_apps(cfg, cached):
-    """True when a launchpad snapshot is empty but this config file still has cards."""
-    if not isinstance(cached, dict) or "apps" not in cached:
-        return False
-    if cached.get("apps"):
-        return False
+def _live_config_object(cfg):
+    """Real Config has a filesystem path string; unittest mocks do not."""
     path = getattr(cfg, "path", None)
-    if not isinstance(path, str) or not path:
-        return False
-    return _disk_configured_app_count(path) > 0
+    return isinstance(path, str) and bool(path)
+
+
+def _overlay_launchpad_from_disk(cfg, state, listeners=None, groups=None):
+    """Rebuild launchpad cards from disk; keep cached process-scan fields.
+
+    Must not run while holding the state-cache lock: snapshot() takes the
+    Config lock, and Config.update() takes Config then cache.
+    """
+    if not _live_config_object(cfg) or not isinstance(state, dict):
+        return state
+    try:
+        snapshot = cfg.snapshot()
+        health = cfg.health_info()
+    except Exception:
+        LOG.exception("读取磁盘配置以覆盖启动台失败")
+        return state
+    if not isinstance(snapshot, dict):
+        return state
+    overlaid = dict(state)
+    try:
+        overlaid["apps"] = build_apps(snapshot, listeners or set(), groups)
+    except Exception:
+        LOG.exception("按磁盘配置重建启动台失败")
+        overlaid["apps"] = list(snapshot.get("apps") or [])
+    overlaid["uiTheme"] = snapshot.get("uiTheme") or DEFAULT_UI_THEME
+    overlaid["openBrowser"] = bool(snapshot.get("openBrowser", True))
+    overlaid["watchedKeywords"] = list(snapshot.get("watchedKeywords") or [])
+    overlaid["schemaVersion"] = snapshot.get(
+        "schemaVersion", CURRENT_SCHEMA_VERSION)
+    if isinstance(health, dict):
+        overlaid["configHealth"] = dict(health)
+    return overlaid
 
 
 def get_state_snapshot(cfg, console_port):
     now = time.monotonic()
     build_here = False
     start_background = False
+    cached = None
+    listeners = set()
+    groups = None
+    generation = None
     with _state_cache_ready:
         cached = _state_cache.get("state")
-        usable = (cached is not None
-                  and not _snapshot_lacks_disk_apps(cfg, cached))
-        if (usable
+        listeners, groups = _copy_cached_scan_locked()
+        if (cached is not None
                 and now - _state_cache.get("mono", 0.0) < STATE_CACHE_TTL):
-            return cached
-        if usable:
+            pass
+        elif cached is not None:
             if not _state_cache.get("building"):
                 generation = _state_cache.get("generation", 0)
                 _state_cache["building"] = True
                 start_background = True
-            else:
-                generation = None
         elif not _state_cache.get("building"):
             generation = _state_cache.get("generation", 0)
             _state_cache["building"] = True
             build_here = True
         else:
             deadline = time.monotonic() + STATE_CACHE_INITIAL_WAIT
-            while ((_state_cache.get("state") is None
-                    or _snapshot_lacks_disk_apps(cfg, _state_cache.get("state")))
+            while (_state_cache.get("state") is None
                    and _state_cache.get("building")):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     break
                 _state_cache_ready.wait(remaining)
             cached = _state_cache.get("state")
-            if (cached is not None
-                    and not _snapshot_lacks_disk_apps(cfg, cached)):
-                return cached
-            generation = _state_cache.get("generation", 0)
-            _state_cache["building"] = True
-            build_here = True
+            listeners, groups = _copy_cached_scan_locked()
+            if cached is None:
+                generation = _state_cache.get("generation", 0)
+                _state_cache["building"] = True
+                build_here = True
 
     if start_background:
         _start_state_refresh(cfg, console_port, generation)
-        return cached
+        return _overlay_launchpad_from_disk(cfg, cached, listeners, groups)
     if build_here:
-        return _refresh_state(
+        state = _refresh_state(
             cfg, console_port, generation, raise_errors=True)
-    return cached
+        with _state_cache_ready:
+            listeners, groups = _copy_cached_scan_locked()
+        return _overlay_launchpad_from_disk(cfg, state, listeners, groups)
+    return _overlay_launchpad_from_disk(cfg, cached, listeners, groups)
 
 
 def build_health(cfg):
