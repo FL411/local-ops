@@ -31,8 +31,8 @@ body:
     id: environment
     attributes:
       label: 环境
-      description: 请填写 macOS、Python 和浏览器版本
-      placeholder: macOS 15.5 / Python 3.12.4 / Safari 18
+      description: 请填写 Windows、Python 和浏览器版本
+      placeholder: Windows 11 / Python 3.12.4 / Edge 131
     validations:
       required: true
   - type: textarea

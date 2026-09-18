@@ -39,11 +39,11 @@ OFL 1.1 允许字体与软件一同捆绑和再分发，前提是每份副本包
 
 ## 项目图像
 
-- `static/assets/console-app-icon.png`、`brand-mark.png`、`favicon-32.png`、`favicon.ico`、`apple-touch-icon.png` 与 `总控台.app/Contents/Resources/AppIcon.icns` 来自同一套品牌方向；派生图标由 `tools/gen_brand_assets.py` 生成。
+- `static/assets/console-app-icon.png`、`brand-mark.png`、`favicon-32.png`、`favicon.ico` 与 `apple-touch-icon.png` 来自同一套品牌方向；派生图标由 `tools/gen_brand_assets.py` 生成。
 - 上述品牌素材由项目维护者在用户选定方向后，于 2026-07-23 在 Codex 中使用 OpenAI Image Generation `image_gen` 工具定向生成。本次工具调用未暴露底层模型版本，因此在 `ASSET_PROVENANCE.md` 中标为 `REVIEW_REQUIRED`。
 
 首次公开发行前，发布负责人必须归档原始输出、生成主体、当次适用条款和允许随本项目再分发的书面结论。若结论不支持当前发行方式，应在发布前替换素材并同步更新来源、修改记录、SHA-256 与状态。
 
 ## 开发期工具
 
-`tools/gen_brand_assets.py` 使用 `requirements-dev.txt` 精确锁定的 Pillow，并调用 macOS 自带的 `iconutil`；`tools/gen_icons.py` 由 vendored Lucide SVG 重新生成 `static/icons.js`。这些工具只用于重新生成已入库资源，不随总控台运行，也不是运行时依赖。更新版本时必须重新核对各自上游许可和来源记录。
+`tools/gen_brand_assets.py` 使用 `requirements-dev.txt` 精确锁定的 Pillow 生成 PNG/ICO 网页图标；`tools/gen_icons.py` 由 vendored Lucide SVG 重新生成 `static/icons.js`。这些工具只用于重新生成已入库资源，不随总控台运行，也不是运行时依赖。更新版本时必须重新核对各自上游许可和来源记录。

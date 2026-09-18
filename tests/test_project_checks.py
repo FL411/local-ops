@@ -60,6 +60,17 @@ class JavaScriptBindingCheckTests(unittest.TestCase):
         command.assert_not_called()
 
 
+class ConsoleEncodingTests(unittest.TestCase):
+    def test_configure_console_encoding_reconfigures_supported_streams(self):
+        stdout = mock.Mock()
+        stderr = mock.Mock()
+        with mock.patch.object(check_project.sys, "stdout", stdout), \
+                mock.patch.object(check_project.sys, "stderr", stderr):
+            check_project.configure_console_encoding()
+        stdout.reconfigure.assert_called_once_with(encoding="utf-8", errors="replace")
+        stderr.reconfigure.assert_called_once_with(encoding="utf-8", errors="replace")
+
+
 class WindowsAclSmokeTests(unittest.TestCase):
     def test_non_windows_acl_smoke_is_explicitly_skipped(self):
         with mock.patch.object(check_project.os, "name", "posix"):

@@ -3,7 +3,7 @@
 """总控台后端（单文件，仅 Python 3 标准库）。
 
 本地服务监控 + 快速启动台：
-    python3 server.py  →  绑定 127.0.0.1，端口 9600 起（被占 +1，最多 10 个）
+    python server.py  →  绑定 127.0.0.1，端口 9600 起（被占 +1，最多 10 个）
 API 契约与实现要点见 AGENTS.md。
 """
 
@@ -15,7 +15,6 @@ import logging
 import os
 import re
 import secrets
-import shlex
 import shutil
 import signal
 import stat
@@ -31,7 +30,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import sysops
 
-# Windows 系统托盘（纯 ctypes，零依赖）；非 Windows 平台跳过。
+# Windows 系统托盘（纯 ctypes，零依赖）。
 try:
     import tray as _tray_mod
 except ImportError:
@@ -108,7 +107,7 @@ APP_VERSION, VERSION_LOAD_ERROR = read_project_version()
 HOST = "127.0.0.1"
 PORT_START = 9600
 PORT_TRIES = 10
-SUBPROCESS_TIMEOUT = 5          # lsof/ps 等子进程超时（秒）
+SUBPROCESS_TIMEOUT = 5          # 外部命令超时（秒）
 MAX_ICON_BYTES = 5 * 1024 * 1024
 MAX_JSON_BYTES = 1 * 1024 * 1024
 MAX_DETECT_FILE_BYTES = 2 * 1024 * 1024
@@ -133,6 +132,22 @@ LOG = logging.getLogger("console")
 LOG_LOCK = threading.RLock()
 MANUAL_STOP_LOCK = threading.RLock()
 MANUAL_STOP_TOKENS = set()
+
+
+def configure_console_encoding():
+    """让 Windows 非 UTF-8 控制台也能安全输出诊断信息。"""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, OSError, ValueError):
+            # 某些嵌入式/测试输出流不支持修改编码；print 本身仍可继续。
+            pass
+
+
+configure_console_encoding()
 
 
 def is_current_user(identity):
@@ -216,10 +231,9 @@ def _ensure_private_dir(path):
         os.chmod(path, 0o700)
     except OSError:
         LOG.warning("无法收紧目录权限: %s", path)
-    if sysops.IS_WINDOWS:
-        # Windows chmod 不改变 DACL。数据目录可删除/替换其中的 token 文件，
-        # 因此必须在目录级别限制为当前 SID，而不只保护单个文件。
-        sysops.protect_private_directory(path)
+    # Windows chmod 不改变 DACL。数据目录可删除/替换其中的 token 文件，
+    # 因此必须在目录级别限制为当前 SID，而不只保护单个文件。
+    sysops.protect_private_directory(path)
 
 
 def _copy_private_regular_file(source, target):
@@ -256,7 +270,7 @@ def _install_migrated_directory(target, populate):
     if os.path.lexists(target):
         return False
     parent = os.path.dirname(target) or "."
-    # parent 可能是用户共用的 ~/Library/Application Support，
+    # parent 可能是用户共用的 AppData\Roaming，不能把整个目录收成 0700。
     # 只确保存在，不擅自改它的现有权限。
     os.makedirs(parent, mode=0o700, exist_ok=True)
     staging = tempfile.mkdtemp(prefix=".console-migration-", dir=parent)
@@ -627,8 +641,41 @@ class Config:
             raw = _load_config_raw(self._path + ".bak")
         return self._apps_from_raw(raw)
 
+    def _reload_from_disk_unlocked(self):
+        """Refresh the in-memory config from disk; caller must hold _lock.
+
+        Polling is read-only: it never writes a repaired copy back to disk.
+        The main file wins whenever it is readable; the backup is consulted
+        only when the main file cannot be parsed. A valid main file with an
+        empty ``apps`` list is an intentional empty state, not corruption.
+        If neither file is readable, keep the current in-memory copy.
+        """
+        raw = _load_config_raw(self._path)
+        from_backup = False
+        if raw is None:
+            raw = _load_config_raw(self._path + ".bak")
+            from_backup = raw is not None
+        if raw is None:
+            return False
+        try:
+            migrated, source_version = migrate_config(raw)
+            data = self._normalize(migrated)
+        except FutureConfigSchemaError:
+            LOG.error("拒绝降级读取配置: %s", self._path)
+            return False
+        except (ConfigSchemaError, TypeError, ValueError):
+            LOG.exception("读取配置失败: %s", self._path)
+            return False
+        self._data = data
+        # Keep startup diagnostics visible after a later successful poll.
+        if from_backup:
+            self._recovered_from_backup = True
+        if source_version < CURRENT_SCHEMA_VERSION:
+            self._migration_from = source_version
+        return True
+
     def restore_apps_from_disk_if_empty(self):
-        """内存应用列表为空但磁盘仍有卡片时，只把 apps 从文件读回。
+        """内存应用列表为空但磁盘仍有卡片时，把配置从文件读回。
 
         与 update() 共用 _lock：删光卡片的落盘会先完成，随后读到的也是空列表，
         不会把用户刚删除的卡片救回来。主文件可读且为空时不以备份覆盖。
@@ -636,18 +683,19 @@ class Config:
         with self._lock:
             if self._data.get("apps"):
                 return False
-            restored = self._read_disk_apps()
+            self._reload_from_disk_unlocked()
+            restored = self._data.get("apps") or []
             if not restored:
                 return False
-            self._data["apps"] = restored
             LOG.warning(
                 "restored %d apps from disk (in-memory list was empty): %s",
                 len(restored), self._path)
             return True
 
     def snapshot(self):
-        """返回配置的深拷贝（数据均为 JSON 可序列化）。"""
+        """返回当前磁盘配置的深拷贝（数据均为 JSON 可序列化）。"""
         with self._lock:
+            self._reload_from_disk_unlocked()
             return json.loads(json.dumps(self._data, ensure_ascii=False))
 
     @property
@@ -667,10 +715,11 @@ class Config:
             }
 
     def update(self, fn):
-        """在锁内执行 fn(self._data) 修改配置，随后原子落盘，返回 fn 的返回值。"""
+        """先从磁盘载入，再在锁内执行 fn(self._data) 并原子落盘，返回 fn 的返回值。"""
         with self._lock:
             if not self._writable:
                 raise OSError("配置处于只读保护状态，请先恢复配置或权限")
+            self._reload_from_disk_unlocked()
             previous = json.loads(json.dumps(self._data, ensure_ascii=False))
             try:
                 result = fn(self._data)
@@ -779,7 +828,7 @@ def _to_float(tok, default=0.0):
 
 
 def scan_listeners():
-    """lsof/psutil 监听快照 → {(pid, port): {bind_host, ...}}。
+    """psutil 监听快照 → {(pid, port): {bind_host, ...}}。
 
     字典仍可像旧集合一样迭代/判断 ``(pid, port)``，同时保留监听地址，
     供前端区分仅监听 ``::1`` 的服务（需通过 localhost 打开）。
@@ -818,14 +867,13 @@ def listener_open_host(listeners, port, pids=None):
 def ps_snapshot(pids=None, with_uid=True):
     """批量进程信息 → {pid: {"uid","comm","args","cpu","mem","etime"}}。
 
-    平台实现见 sysops：macOS 用 ps（comm 保持完整路径），
-    Windows 用 psutil（comm 为 exe 路径，etime 单位同为秒）。
+    平台实现见 sysops：psutil（comm 为 exe 路径，etime 单位为秒）。
     """
     return sysops.ps_snapshot(pids, with_uid=with_uid)
 
 
 def lsof_cwds(pids):
-    """{pid: cwd}。macOS 用 lsof -d cwd，Windows 用 psutil。"""
+    """{pid: cwd}。"""
     return sysops.lsof_cwds(pids)
 
 
@@ -835,9 +883,7 @@ def pid_alive(pid):
 
 # ---------------------------------------------------------------- 状态构建
 
-SYSTEM_PATH_PREFIXES = ("/usr/libexec/", "/usr/sbin/", "/sbin/", "/System/", "/usr/lib/")
-if sysops.IS_WINDOWS:
-    SYSTEM_PATH_PREFIXES = SYSTEM_PATH_PREFIXES + sysops.windows_system_dirs()
+SYSTEM_PATH_PREFIXES = sysops.windows_system_dirs()
 
 # Windows 系统进程名单（按 exe 基名匹配，无路径时也能命中）。
 # comm 拿不到完整路径（如 System 进程）时按名称归为后台，避免服务监控噪音。
@@ -850,8 +896,7 @@ _WINDOWS_SYSTEM_NAMES = frozenset({
     "logonui", "userinit", "winlogon",
 })
 
-# 开发服务关键词：命中 name/args 时优先归为 "mine"（覆盖 .app 规则，
-# 例如 ollama 守护进程在 Ollama.app 内、Docker 在 Docker.app 内）
+# 开发服务关键词：命中 name/args 时优先归为 "mine"
 DEV_KEYWORDS = (
     "python", "node", "ruby", "php", "nginx", "caddy", "postgres",
     "mysql", "redis", "mongo", "ollama", "docker", "deno", "bun",
@@ -866,18 +911,12 @@ def classify_group(key, name, comm, args, cwd, promoted):
     text = name.lower()
     if any(k in text for k in DEV_KEYWORDS):
         return "mine"
-    if sysops.IS_WINDOWS:
-        base = os.path.basename(text)
-        if base.endswith(".exe"):
-            base = base[:-4]
-        if base in _WINDOWS_SYSTEM_NAMES:
-            return "background"
-        # 其余沿用下方通用路径前缀判断
-    if ".app/Contents/" in comm or ".app/Contents/" in args:
+    base = os.path.basename(text)
+    if base.endswith(".exe"):
+        base = base[:-4]
+    if base in _WINDOWS_SYSTEM_NAMES:
         return "background"
     if comm.startswith(SYSTEM_PATH_PREFIXES):
-        return "background"
-    if "/Library/Containers/" in comm or "/Library/Containers/" in (cwd or ""):
         return "background"
     return "mine"
 
@@ -903,8 +942,7 @@ def project_name(cwd):
 # 向上爬时要跳过的包装层（按 argv[0] 基名匹配）：壳、包管理器与任务执行器
 _ORIGIN_SKIP_NAMES = {
     "zsh", "bash", "sh", "dash", "fish", "login", "su", "sudo", "env",
-    "command", "xargs", "nohup", "setsid", "script", "expect", "caffeinate",
-    "launchd",
+    "command", "xargs", "nohup", "script", "expect",
     "npm", "npx", "pnpm", "yarn", "corepack", "make", "just",
     "node", "tsx", "nodemon", "deno", "bun", "bunx",
     "python", "python3", "uv", "poetry", "pip", "pipx",
@@ -1008,21 +1046,10 @@ def _win_join_cmdline(cmdline):
 def origin_snapshot(pids=None):
     """进程表 → {pid: (ppid, args)}，供来源溯源。
 
-    macOS 用 ps -axo pid=,ppid=,args；Windows 只读取目标 PID 的祖先链，
-    避免为了少量监听进程获取全机每个进程的命令行。
+    只读取目标 PID 的祖先链，避免为了少量监听进程获取全机每个进程的命令行。
     """
     table = {}
-    if sysops.IS_POSIX:
-        for line in run_cmd(["ps", "-axo", "pid=,ppid=,args"]).splitlines():
-            toks = line.split(None, 2)
-            if len(toks) < 2:
-                continue
-            try:
-                pid, ppid = int(toks[0]), int(toks[1])
-            except ValueError:
-                continue
-            table[pid] = (ppid, toks[2] if len(toks) > 2 else "")
-        return table
+    mod = sysops._psutil()
     mod = sysops._psutil()
     if pids is None:
         processes = mod.process_iter(["pid", "ppid", "cmdline"])
@@ -1088,21 +1115,17 @@ def attribute_origin(pid, table):
             label, icon = _ORIGIN_APP_ALIASES.get(
                 app_name.casefold(), (app_name, "package"))
             return {"label": label, "icon": icon}
-        if sysops.IS_WINDOWS:
-            # Windows 可执行路径可能含空格并被引号包裹，split()[0] 会截断；
-            # 用引号感知解析出完整 exe 路径。
-            m = re.match(r'\s*(?:"([^"]*)"|(\S+))', parent_args)
-            exe_path = (m.group(1) if m and m.group(1) is not None
-                        else (m.group(2) if m else ""))
-        else:
-            exe_path = parent_args.split()[0] if parent_args.split() else ""
+        # 可执行路径可能含空格并被引号包裹，split()[0] 会截断；
+        # 用引号感知解析出完整 exe 路径。
+        m = re.match(r'\s*(?:"([^"]*)"|(\S+))', parent_args)
+        exe_path = (m.group(1) if m and m.group(1) is not None
+                    else (m.group(2) if m else ""))
         base = os.path.basename(exe_path).lstrip("-")
-        if sysops.IS_WINDOWS and base.lower().endswith(".exe"):
+        if base.lower().endswith(".exe"):
             base = base[:-4]
-        if sysops.IS_WINDOWS:
-            win_alias = _WINDOWS_ORIGIN_ALIASES.get(base.lower())
-            if win_alias:
-                return {"label": win_alias[0], "icon": win_alias[1]}
+        win_alias = _WINDOWS_ORIGIN_ALIASES.get(base.lower())
+        if win_alias:
+            return {"label": win_alias[0], "icon": win_alias[1]}
         if base in _ORIGIN_MULTIPLEXERS:
             return {"label": _ORIGIN_MULTIPLEXERS[base], "icon": "terminal"}
         if base and base not in _ORIGIN_SKIP_NAMES and candidate is None:
@@ -1183,8 +1206,6 @@ def build_watched(keywords):
         if pid == SELF_PID or not is_current_user(info.get("uid")):
             continue
         name = os.path.basename(info.get("comm") or "") or "?"
-        if name in ("ps", "lsof"):
-            continue
         args = info.get("args") or ""
         args_lower = args.casefold()
         matched = [keyword for keyword, lowered in normalized
@@ -1200,26 +1221,8 @@ def build_watched(keywords):
 
 
 def pgid_members_map():
-    """ps -axo pid=,pgid= → {pgid: [pid, ...]}（仅 macOS）。
-
-    进程退出后其子孙仍保留原 pgid（被 launchd 收养也不变），
-    因此按 pgid 能找到「脚本把服务放后台后自己退出」的存活成员。
-    Windows 无等价 pgid：请使用 sysops.group_members（进程树回溯），
-    本函数在 Windows 上返回空字典，_managed_candidates 会回退。
-    """
-    if sysops.IS_WINDOWS:
-        return {}
-    groups = {}
-    for line in run_cmd(["ps", "-axo", "pid=,pgid="]).splitlines():
-        parts = line.split()
-        if len(parts) != 2:
-            continue
-        try:
-            pid, pgid = int(parts[0]), int(parts[1])
-        except ValueError:
-            continue
-        groups.setdefault(pgid, []).append(pid)
-    return groups
+    """Windows 无 POSIX pgid；进程树请用 sysops.group_members。"""
+    return {}
 
 
 def _managed_candidates(app, groups):
@@ -1310,7 +1313,7 @@ def legacy_managed_pid(app, listeners=None, snap=None, cwds=None):
     for pid in sorted(port_pids):
         if not is_current_user(snap.get(pid, {}).get("uid")):
             continue
-        if (sysops.IS_WINDOWS and expected_ctime is not None
+        if (expected_ctime is not None
                 and pid == recorded_pid
                 and snap.get(pid, {}).get("ctime") != expected_ctime):
             continue
@@ -1557,14 +1560,19 @@ def build_state(cfg, console_port, config_health=None):
     # 仅在有可修复身份时附带内部字段；_refresh_state 在序列化前取走它。
     if "attached_repairs" in locals() and attached_repairs:
         state["_attachedRepairs"] = attached_repairs
+    # Keep the expensive process scan cached, while rebuilding cards from
+    # the current on-disk configuration for each response.
+    state["_listeners"] = set(listeners)
+    state["_groups"] = groups
     return state
 
 
 # ---------------------------------------------------------------- 状态快照缓存
-# 完整快照包含进程与端口扫描，Windows 上也可能耗时数秒。过期快照采用
-# stale-while-revalidate：请求立即复用上一份完整结果，后台最多启动一个刷新；
-# 首次无缓存时由一个请求构建，其余请求等待同一结果。任何配置读取和慢扫描
-# 都不得发生在缓存锁内，避免与 Config.update 形成锁顺序反转。
+# 进程与端口扫描在 Windows 上也可能耗时数秒，因此只缓存这一层，并采用
+# stale-while-revalidate：过期时立即复用上一份扫描结果，后台最多一个刷新。
+# 启动台卡片、主题等配置每次响应都从磁盘 config.json 重建，避免内存/缓存
+# 空列表盖住真实卡片。任何配置读取和慢扫描都不得发生在缓存锁内，避免与
+# Config.update 形成锁顺序反转。
 STATE_CACHE_TTL = 2.2  # 秒
 STATE_CACHE_INITIAL_WAIT = 15.0
 _state_cache_lock = threading.Lock()
@@ -1572,6 +1580,8 @@ _state_cache_ready = threading.Condition(_state_cache_lock)
 _state_cache = {
     "mono": 0.0,
     "state": None,
+    "listeners": None,
+    "groups": None,
     "building": False,
     "generation": 0,
 }
@@ -1586,11 +1596,25 @@ def invalidate_state_cache():
         _state_cache_ready.notify_all()
 
 
-def _finish_state_refresh(state, generation):
+def _copy_cached_scan_locked():
+    """Copy cached process-scan fields; caller must hold _state_cache_ready."""
+    listeners = _state_cache.get("listeners")
+    groups = _state_cache.get("groups")
+    listeners_copy = set(listeners) if listeners else set()
+    if isinstance(groups, dict):
+        groups_copy = {key: list(value) for key, value in groups.items()}
+    else:
+        groups_copy = groups
+    return listeners_copy, groups_copy
+
+
+def _finish_state_refresh(state, generation, listeners=None, groups=None):
     with _state_cache_ready:
         if (state is not None
                 and generation == _state_cache.get("generation", 0)):
             _state_cache["state"] = state
+            _state_cache["listeners"] = set(listeners or set())
+            _state_cache["groups"] = groups
             _state_cache["mono"] = time.monotonic()
         _state_cache["building"] = False
         _state_cache_ready.notify_all()
@@ -1598,17 +1622,13 @@ def _finish_state_refresh(state, generation):
 
 def _refresh_state(cfg, console_port, generation, raise_errors=False):
     try:
-        # 先 snapshot，再按需恢复：避免 update() 持锁等待 snapshot 时
-        # restore() 先抢同一把配置锁造成死锁。
+        # snapshot() 自己从磁盘读配置。Config 锁与缓存锁绝不同时持有。
         cfg_snapshot = cfg.snapshot()
-        restore = getattr(cfg, "restore_apps_from_disk_if_empty", None)
-        if callable(restore) and not (cfg_snapshot.get("apps") or []):
-            if restore():
-                cfg_snapshot = cfg.snapshot()
-        # Config 锁与缓存锁绝不同时持有。
         config_health = cfg.health_info()
         state = build_state(cfg_snapshot, console_port, config_health)
         attached_repairs = state.pop("_attachedRepairs", [])
+        listeners = state.pop("_listeners", set())
+        groups = state.pop("_groups", None)
         repair_attached_app_identities(cfg, attached_repairs)
     except Exception:
         _finish_state_refresh(None, generation)
@@ -1616,7 +1636,7 @@ def _refresh_state(cfg, console_port, generation, raise_errors=False):
             raise
         LOG.exception("后台刷新状态快照失败")
         return None
-    _finish_state_refresh(state, generation)
+    _finish_state_refresh(state, generation, listeners, groups)
     return state
 
 
@@ -1650,64 +1670,91 @@ def warm_state_cache(cfg, console_port):
     return True
 
 
-def _snapshot_lacks_disk_apps(cfg, cached):
-    """True when a launchpad snapshot is empty but this config file still has cards."""
-    if not isinstance(cached, dict) or "apps" not in cached:
-        return False
-    if cached.get("apps"):
-        return False
+def _live_config_object(cfg):
+    """Return whether cfg looks like the real filesystem-backed Config."""
     path = getattr(cfg, "path", None)
-    if not isinstance(path, str) or not path:
-        return False
-    return _disk_configured_app_count(path) > 0
+    return isinstance(path, str) and bool(path)
+
+
+def _overlay_launchpad_from_disk(cfg, state, listeners=None, groups=None):
+    """Rebuild launchpad cards from disk while keeping cached process scans.
+
+    This function intentionally runs outside the state-cache lock: snapshot()
+    takes the Config lock, while Config.update() invalidates the state cache
+    after releasing that lock.
+    """
+    if not _live_config_object(cfg) or not isinstance(state, dict):
+        return state
+    try:
+        snapshot = cfg.snapshot()
+        health = cfg.health_info()
+    except Exception:
+        LOG.exception("读取磁盘配置以覆盖启动台失败")
+        return state
+    overlaid = dict(state)
+    try:
+        overlaid["apps"] = build_apps(snapshot, listeners or set(), groups)
+    except Exception:
+        LOG.exception("按磁盘配置重建启动台失败")
+        overlaid["apps"] = list(snapshot.get("apps") or [])
+    overlaid["uiTheme"] = snapshot.get("uiTheme") or DEFAULT_UI_THEME
+    overlaid["openBrowser"] = bool(snapshot.get("openBrowser", True))
+    overlaid["watchedKeywords"] = list(snapshot.get("watchedKeywords") or [])
+    overlaid["schemaVersion"] = snapshot.get(
+        "schemaVersion", CURRENT_SCHEMA_VERSION)
+    if isinstance(health, dict):
+        overlaid["configHealth"] = dict(health)
+    return overlaid
 
 
 def get_state_snapshot(cfg, console_port):
     now = time.monotonic()
     build_here = False
     start_background = False
+    cached = None
+    listeners = set()
+    groups = None
+    generation = None
     with _state_cache_ready:
         cached = _state_cache.get("state")
-        usable = (cached is not None
-                  and not _snapshot_lacks_disk_apps(cfg, cached))
-        if (usable
+        listeners, groups = _copy_cached_scan_locked()
+        if (cached is not None
                 and now - _state_cache.get("mono", 0.0) < STATE_CACHE_TTL):
-            return cached
-        if usable:
+            pass
+        elif cached is not None:
             if not _state_cache.get("building"):
                 generation = _state_cache.get("generation", 0)
                 _state_cache["building"] = True
                 start_background = True
-            else:
-                generation = None
         elif not _state_cache.get("building"):
             generation = _state_cache.get("generation", 0)
             _state_cache["building"] = True
             build_here = True
         else:
             deadline = time.monotonic() + STATE_CACHE_INITIAL_WAIT
-            while ((_state_cache.get("state") is None
-                    or _snapshot_lacks_disk_apps(cfg, _state_cache.get("state")))
+            while (_state_cache.get("state") is None
                    and _state_cache.get("building")):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     break
                 _state_cache_ready.wait(remaining)
             cached = _state_cache.get("state")
-            if (cached is not None
-                    and not _snapshot_lacks_disk_apps(cfg, cached)):
-                return cached
-            generation = _state_cache.get("generation", 0)
-            _state_cache["building"] = True
-            build_here = True
+            listeners, groups = _copy_cached_scan_locked()
+            if cached is None:
+                generation = _state_cache.get("generation", 0)
+                _state_cache["building"] = True
+                build_here = True
 
     if start_background:
         _start_state_refresh(cfg, console_port, generation)
-        return cached
+        return _overlay_launchpad_from_disk(cfg, cached, listeners, groups)
     if build_here:
-        return _refresh_state(
+        state = _refresh_state(
             cfg, console_port, generation, raise_errors=True)
-    return cached
+        with _state_cache_ready:
+            listeners, groups = _copy_cached_scan_locked()
+        return _overlay_launchpad_from_disk(cfg, state, listeners, groups)
+    return _overlay_launchpad_from_disk(cfg, cached, listeners, groups)
 
 
 def build_health(cfg):
@@ -1727,8 +1774,6 @@ def build_health(cfg):
                 mode = os.lstat(path).st_mode
                 if stat.S_ISLNK(mode):
                     issues.append("%s 目录不能是符号链接" % label)
-                elif not sysops.IS_WINDOWS and mode & 0o077:
-                    issues.append("%s 目录权限不是 0700" % label)
             except OSError as e:
                 issues.append("无法检查 %s 目录: %s" % (label, e))
     for label, path in (("config", CONFIG_PATH),
@@ -1744,8 +1789,6 @@ def build_health(cfg):
             continue
         if not stat.S_ISREG(mode):
             issues.append("%s 不是普通文件" % label)
-        elif not sysops.IS_WINDOWS and mode & 0o077:
-            issues.append("%s 文件权限不是 0600" % label)
     degraded = bool(issues)
     snapshot = cfg.snapshot()
     return {
@@ -1831,59 +1874,36 @@ def app_alive_sign(app, listeners=None):
 
 
 def build_launch_env(token, environ=None):
-    """构建无 Terminal 启动时仍可找到常见开发工具的环境。
+    """无窗口启动时仍可找到常见开发工具的环境。
 
-    Finder/LSUIElement 启动的应用通常只有系统 PATH，不会读取用户 shell 配置；
-    因此显式补入 Homebrew、npm/pnpm、Volta、NVM、fnm 等常见目录。
-    Windows 上补充 npm/pnpm/yarn 全局与常见工具目录。
+    pythonw 不会读取用户 shell 配置，因此显式补入 npm/pnpm、NVM、fnm
+    与系统目录。
     """
     env = dict(os.environ if environ is None else environ)
     home = os.path.expanduser("~")
     preferred = []
-    if sysops.IS_WINDOWS:
-        appdata = os.environ.get("APPDATA") or os.path.join(home, "AppData", "Roaming")
-        preferred.extend([
-            os.path.join(appdata, "npm"),
-            os.path.join(home, "AppData", "Roaming", "npm"),
-            os.path.join(home, "AppData", "Local", "pnpm"),
-            os.path.join(home, ".bun", "bin"),
-            os.path.join(home, ".asdf", "shims"),
-        ])
-        preferred.extend(sorted(
-            glob.glob(os.path.join(home, ".nvm", "versions", "node", "*")),
-            reverse=True))
-        preferred.extend(sorted(
-            glob.glob(os.path.join(home, ".fnm", "node-versions", "*", "installation")),
-            reverse=True))
-    else:
-        preferred.extend([
-            os.path.join(home, ".local", "bin"),
-            os.path.join(home, ".volta", "bin"),
-            os.path.join(home, ".bun", "bin"),
-            os.path.join(home, "Library", "pnpm"),
-            os.path.join(home, ".asdf", "shims"),
-            "/opt/homebrew/bin", "/opt/homebrew/sbin",
-            "/usr/local/bin", "/usr/local/sbin",
-        ])
-        preferred.extend(sorted(
-            glob.glob(os.path.join(home, ".nvm", "versions", "node", "*", "bin")),
-            reverse=True))
-        preferred.extend(sorted(
-            glob.glob(os.path.join(home, ".fnm", "node-versions", "*", "installation", "bin")),
-            reverse=True))
+    appdata = os.environ.get("APPDATA") or os.path.join(home, "AppData", "Roaming")
+    preferred.extend([
+        os.path.join(appdata, "npm"),
+        os.path.join(home, "AppData", "Roaming", "npm"),
+        os.path.join(home, "AppData", "Local", "pnpm"),
+        os.path.join(home, ".bun", "bin"),
+        os.path.join(home, ".asdf", "shims"),
+    ])
+    preferred.extend(sorted(
+        glob.glob(os.path.join(home, ".nvm", "versions", "node", "*")),
+        reverse=True))
+    preferred.extend(sorted(
+        glob.glob(os.path.join(home, ".fnm", "node-versions", "*", "installation")),
+        reverse=True))
     preferred.extend((env.get("PATH") or "").split(os.pathsep))
-    if sysops.IS_WINDOWS:
-        preferred.extend((
-            os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32"),
-            os.path.join(os.environ.get("SystemRoot", r"C:\Windows")),
-        ))
-    else:
-        preferred.extend(("/usr/bin", "/bin", "/usr/sbin", "/sbin"))
+    preferred.extend((
+        os.path.join(os.environ.get("SystemRoot") or r"C:\Windows", "System32"),
+        os.path.join(os.environ.get("SystemRoot") or r"C:\Windows"),
+    ))
     seen = set()
     env["PATH"] = os.pathsep.join(
         path for path in preferred if path and not (path in seen or seen.add(path)))
-    if not sysops.IS_WINDOWS:
-        env.setdefault("PNPM_HOME", os.path.join(home, "Library", "pnpm"))
     env[RUN_TOKEN_ENV] = token
     return env
 
@@ -2087,37 +2107,24 @@ def stop_app_for_update(cfg, app, timeout=5.0):
 
 
 def pick_path(what):
-    """系统文件/目录选择框（macOS osascript / Windows tkinter）。
-    返回 (path|None, canceled)。"""
+    """系统文件/目录选择框（tkinter）。返回 (path|None, canceled)。"""
     return sysops.pick_path(what)
 
 
 def command_for_script(path):
-    """按脚本类型生成可直接保存的 shell 命令，并安全引用任意文件名。"""
+    """按脚本类型生成可直接保存的命令，并安全引用任意文件名。"""
     normalized = os.path.abspath(os.path.expanduser(str(path)))
     suffix = os.path.splitext(normalized)[1].lower()
-    if sysops.IS_WINDOWS:
-        quoted = _quote_win(normalized)
-        if suffix == ".py":
-            return "%s -- %s" % (_quote_win(sys.executable), quoted)
-        if suffix == ".ps1":
-            return "powershell -NoProfile -ExecutionPolicy Bypass -File %s" % quoted
-        if suffix in (".bat", ".cmd"):
-            return quoted
-        if suffix in (".sh", ".bash"):
-            return "bash -- %s" % quoted
-        return quoted
-    quoted = shlex.quote(normalized)
+    quoted = _quote_win(normalized)
     if suffix == ".py":
-        return "python3 -- %s" % quoted
-    if suffix == ".zsh":
-        return "/bin/zsh -- %s" % quoted
-    if suffix in (".sh", ".bash"):
-        return "/bin/bash -- %s" % quoted
-    if os.access(normalized, os.X_OK):
+        return "%s -- %s" % (_quote_win(sys.executable), quoted)
+    if suffix == ".ps1":
+        return "powershell -NoProfile -ExecutionPolicy Bypass -File %s" % quoted
+    if suffix in (".bat", ".cmd"):
         return quoted
-    # .command 常见于 Finder 双击脚本；没有执行位时仍可明确交给 bash。
-    return "/bin/bash -- %s" % quoted
+    if suffix in (".sh", ".bash"):
+        return "bash -- %s" % quoted
+    return quoted
 
 
 def _quote_win(path):
@@ -2130,11 +2137,8 @@ def _quote_win(path):
     return path
 
 
-SCRIPT_SUFFIXES = {".py", ".sh", ".bash", ".zsh", ".command"}
-if sysops.IS_WINDOWS:
-    SCRIPT_SUFFIXES |= {".bat", ".cmd", ".ps1"}
-# Windows 的 Python 命令名是 python/py（无 python3），macOS 是 python3。
-PYTHON_CMD = "python" if sysops.IS_WINDOWS else "python3"
+SCRIPT_SUFFIXES = {".py", ".sh", ".bash", ".bat", ".cmd", ".ps1"}
+PYTHON_CMD = "python"
 SHELL_BUILTINS = {
     ".", ":", "[", "alias", "break", "cd", "command", "continue", "echo",
     "eval", "exec", "exit", "export", "false", "printf", "pwd", "read",
@@ -2179,26 +2183,7 @@ def _simple_command_tokens(command):
     """解析无管道/重定向/展开的简单命令；不确定时返回 None。"""
     if not isinstance(command, str) or not command.strip():
         return []
-    if sysops.IS_WINDOWS:
-        return _simple_windows_command_tokens(command)
-    try:
-        lexer = shlex.shlex(
-            command, posix=True, punctuation_chars="|&;<>()")
-        lexer.whitespace_split = True
-        lexer.commenters = ""
-        tokens = list(lexer)
-    except ValueError:
-        return None
-    if not tokens:
-        return []
-    if any(token and all(char in "|&;<>()" for char in token)
-           for token in tokens):
-        return None
-    # 健康检查绝不展开变量、通配符或命令替换；这类命令照常允许运行。
-    if any(any(char in token for char in ("$", "*", "?", "[", "]", "`"))
-           for token in tokens):
-        return None
-    return tokens
+    return _simple_windows_command_tokens(command)
 
 
 def _resolve_command_path(value, cwd):
@@ -2212,11 +2197,11 @@ def _command_path_is_absolute(value):
     expanded = os.path.expanduser(value)
     if os.path.isabs(expanded):
         return True
-    return bool(sysops.IS_WINDOWS and re.match(r"^[A-Za-z]:[\\/]", expanded))
+    return bool(re.match(r"^[A-Za-z]:[\\/]", expanded))
 
 
 def _looks_like_command_path(value):
-    return "/" in value or (sysops.IS_WINDOWS and "\\" in value)
+    return "/" in value or "\\" in value
 
 
 def _script_target(tokens, cwd):
@@ -2259,7 +2244,7 @@ def _script_target(tokens, cwd):
                     not _command_path_is_absolute(candidate))
         return None, False, False
 
-    if sysops.IS_WINDOWS and base in {
+    if base in {
             "powershell", "powershell.exe", "pwsh", "pwsh.exe"}:
         if any(arg.casefold() in {
                 "-command", "-c", "-encodedcommand", "-encodedcommands"}
@@ -2336,7 +2321,7 @@ def inspect_app_health(app):
             add(
                 "script-not-executable", "脚本不可执行",
                 "直接运行的脚本没有执行权限：%s" % script_path,
-                "给脚本执行权限，或改为使用 bash / python3 执行。",
+                "改用 python / powershell 启动脚本，或检查文件权限。",
                 "edit-command",
             )
 
@@ -2515,7 +2500,9 @@ def detect_project(root):
             if is_hexo and str(name).lower() == "server" and re.search(
                     r"\bhexo\s+(?:s|server)\b", script, re.I):
                 continue  # 下方提供更短、更通用的 hexo s，不重复同一操作
-            command = "%s %s" % (runner, shlex.quote(str(name)))
+            name = str(name)
+            command = "%s %s" % (
+                runner, name if re.fullmatch(r"[\w:-]+", name) else _quote_win(name))
             port = _port_from_command(script)
             if port is None:
                 port = _package_default_port(str(name).lower(), script, deps)
@@ -2618,10 +2605,18 @@ def detect_project(root):
         note_file("Cargo.toml")
         add("cargo run", "Rust 项目", "Cargo.toml", None, 61)
 
-    for script_name in ("start.command", "dev.command", "run.command", "start.sh", "dev.sh", "run.sh"):
+    for script_name in ("start.bat", "start.cmd", "dev.bat", "run.bat",
+                        "start.ps1", "start.sh", "dev.sh", "run.sh"):
         if os.path.isfile(os.path.join(root, script_name)):
             note_file(script_name)
-            add("bash %s" % shlex.quote("./" + script_name),
+            quoted = _quote_win("./" + script_name)
+            if script_name.endswith(".ps1"):
+                command = "powershell -NoProfile -ExecutionPolicy Bypass -File %s" % quoted
+            elif script_name.endswith((".bat", ".cmd")):
+                command = quoted
+            else:
+                command = "bash %s" % quoted
+            add(command,
                 "现有启动脚本", script_name, None, 70,
                 "也可以继续使用“选择脚本”手动指定")
             break
@@ -2666,30 +2661,7 @@ def resolve_app_stop_target(app, listeners=None):
         return None, "受控进程组信息无效"
     legacy_pid = legacy_managed_pid(app, listeners)
     if legacy_pid:
-        if app.get("attached") and sysops.IS_POSIX:
-            try:
-                pgid = os.getpgid(legacy_pid)
-            except (ProcessLookupError, PermissionError, OSError):
-                pgid = None
-            if isinstance(pgid, int) and pgid > 0 and pgid != os.getpgrp():
-                members = _current_user_group_members(pgid)
-                member_cwds = lsof_cwds(members)
-                expected_cwd = app.get("cwd")
-                try:
-                    safe_group = bool(members and expected_cwd) and all(
-                        member_cwds.get(pid)
-                        and os.path.realpath(member_cwds[pid])
-                        == os.path.realpath(expected_cwd)
-                        for pid in members
-                    )
-                except OSError:
-                    safe_group = False
-                if safe_group:
-                    return {
-                        "kind": "group",
-                        "id": pgid,
-                        "members": list(members),
-                    }, None
+        return {"kind": "pid", "id": legacy_pid, "members": [legacy_pid]}, None
         return {"kind": "pid", "id": legacy_pid, "members": [legacy_pid]}, None
     return None, "无法确认受控进程，未执行停止"
 
@@ -2698,16 +2670,14 @@ def signal_app_stop(target, sig=signal.SIGTERM):
     """Signal a target returned by resolve_app_stop_target."""
     ident = target["id"]
     if target["kind"] == "group":
-        members = target.get("members") if sysops.IS_WINDOWS else None
+        members = target.get("members")
         return sysops.signal_group(ident, sig, members=members)
     return sysops.kill_process(ident, force=False)
 
 
 def stop_target_alive(target, expected_uid=None):
     if target["kind"] == "group":
-        if sysops.IS_WINDOWS:
-            return any(pid_alive(pid) for pid in target.get("members") or [])
-        return sysops.group_alive(target["id"])
+        return any(pid_alive(pid) for pid in target.get("members") or [])
     if not sysops.pid_alive(target["id"]):
         return False
     if expected_uid is None:
@@ -2737,11 +2707,9 @@ def stop_app_and_wait(app, timeout=APP_STOP_TIMEOUT_SEC, listeners=None):
         if time.monotonic() >= deadline:
             if target["kind"] == "pid":
                 remaining = target["members"]
-            elif sysops.IS_WINDOWS:
+            else:
                 remaining = [pid for pid in target.get("members") or []
                              if pid_alive(pid)]
-            else:
-                remaining = _current_user_group_members(target["id"])
             suffix = "（PID %s）" % "、".join(str(p) for p in remaining) if remaining else ""
             return False, "应用未在 %.1f 秒内退出%s，仍保留管理状态" % (timeout, suffix)
         time.sleep(0.05)
@@ -3096,7 +3064,7 @@ def diagnose_app(cfg, app):
     if m and "cannot find module" not in log_lower:
         add("runtime-missing", "找不到运行时：%s" % m.group(1),
             "系统里找不到 %s 这个命令。" % m.group(1),
-            "确认该运行时已安装（如 node / python3 / pnpm）；总控台启动时会补常见 PATH，但程序本身需要存在。")
+            "确认该运行时已安装（如 node / python / pnpm）；总控台启动时会补常见 PATH，但程序本身需要存在。")
 
     if "missing script" in log_lower and has_pkg:
         script_names = []
@@ -3119,13 +3087,11 @@ def diagnose_app(cfg, app):
     if "eacces" in log_lower or "permission denied" in log_lower:
         add("perm", "权限不足",
             "日志报权限不足（EACCES / permission denied）。",
-            "检查文件/目录权限；脚本需要可执行权限：chmod +x <脚本>。不要简单用 sudo 运行。")
+            "检查文件/目录权限；Windows 上请确认当前用户可读写该路径，不要用管理员权限硬跑。")
 
     m = re.search(r"modulenotfounderror: no module named '([^']+)'", log_lower)
     if m:
-        venv_hint = ("%s -m venv .venv && .venv\\Scripts\\pip install %s"
-                     if sysops.IS_WINDOWS else
-                     "python3 -m venv .venv && .venv/bin/pip install %s")
+        venv_hint = "%s -m venv .venv && .venv\\Scripts\\pip install %s"
         add("pip-missing", "缺少 Python 包：%s" % m.group(1),
             "日志报 ModuleNotFoundError: No module named '%s'。" % m.group(1),
             "建议在项目目录建虚拟环境再装：%s" % (venv_hint % m.group(1)))
@@ -3140,7 +3106,7 @@ def diagnose_app(cfg, app):
         if code == 126:
             add("not-exec", "命令没有执行权限（exit 126）",
                 "退出码 126 表示文件不可执行。",
-                "给脚本加执行权限：chmod +x <脚本>，或用 bash <脚本> 启动。")
+                "改用 python / powershell 启动脚本，或检查文件是否存在、当前用户是否可执行。")
         elif code == 127:
             add("not-found", "命令不存在（exit 127）",
                 "退出码 127 表示 shell 找不到这个命令。",
@@ -4434,7 +4400,7 @@ def _launcher_alert(message):
 
 
 def launcher_main():
-    """start.command 的无命令启动入口。"""
+    """启动器入口：识别已有实例，可打开、重启或取消。"""
     instances = find_console_instances()
     if not instances:
         try:
@@ -4511,13 +4477,10 @@ def restart_helper(old_pid, preferred_port):
         return 1
     args = [sys.executable, os.path.abspath(__file__),
             "--preferred-port", str(int(preferred_port)), "--no-browser"]
-    if sysops.IS_WINDOWS:
-        # pythonw 无控制台：必须带 --log-to-file 重定向 stdout/stderr，
-        # 否则 print/logging 写入无效句柄，日志不可见且可能拖垮请求线程。
-        args.append("--log-to-file")
-        subprocess.Popen(args, cwd=BASE_DIR, close_fds=True)
-        return 0
-    os.execv(sys.executable, args)
+    # pythonw 无控制台：必须带 --log-to-file 重定向 stdout/stderr，
+    # 否则 print/logging 写入无效句柄，日志不可见且可能拖垮请求线程。
+    args.append("--log-to-file")
+    subprocess.Popen(args, cwd=BASE_DIR, close_fds=True)
     return 0
 
 
@@ -4555,6 +4518,7 @@ def _start_autostart_thread(cfg):
 
 
 def _run_console(preferred_port=None, open_browser=True):
+    configure_console_encoding()
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -4599,7 +4563,7 @@ def _run_console(preferred_port=None, open_browser=True):
     # 开机自启：延迟拉起标记 autostart 的 service（守护线程，失败不阻塞）。
     _start_autostart_thread(cfg)
     tray_icon = None
-    if sysops.IS_WINDOWS and _tray_mod is not None:
+    if _tray_mod is not None:
         url = console_url(port, server.control_token)
         tray_icon = _tray_mod.TrayIcon(
             "总控台 · %s:%d · 运行中" % (HOST, port),
@@ -4622,7 +4586,7 @@ def _run_console(preferred_port=None, open_browser=True):
 def redirect_console_output():
     """将总控台输出安全追加到日志目录 console.log。
 
-    供 macOS .app 与 Windows 无窗口后台运行（pythonw --log-to-file）使用；
+    供 Windows 无窗口后台运行（pythonw --log-to-file）使用；
     在 pythonw 下 sys.stdout/stderr 为 None、fd 1/2 无效，均已保护。
     """
     path = os.path.join(LOGS_DIR, "console.log")
@@ -4664,6 +4628,7 @@ def redirect_console_output():
 
 def main(preferred_port=None, open_browser=True, log_to_file=False):
     """Run exactly one console for this project/data directory."""
+    configure_console_encoding()
     migration = prepare_runtime_storage()
     if log_to_file:
         redirect_console_output()

@@ -1,4 +1,4 @@
-PYTHON ?= python3
+PYTHON ?= python
 DIST_DIR ?= dist
 
 .PHONY: check syntax test release-check release release-verify dev-setup generate-icons generate-brand

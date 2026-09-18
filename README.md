@@ -1,21 +1,21 @@
-# 总控台（Windows 移植版）
+# 总控台（Windows）
 
-> **本仓库是 [laogou717/local-ops](https://github.com/laogou717/local-ops)（总控台）的 Windows 移植衍生版**，面向 Windows 10/11 用户：完整保留原版全部功能，并额外提供系统托盘、无窗口启动器。
-> **macOS 用户请直接使用上游仓库**，本仓库以 Windows 为使用目标。
+> **本仓库是 [laogou717/local-ops](https://github.com/laogou717/local-ops)（总控台）的 Windows 专用衍生版，只支持 Windows 10/11。**
+> macOS 用户请使用上游仓库；本仓库不接受以恢复 macOS/Linux 兼容为目标的改动。
 
 ## 亮点
 
 - **系统托盘**：后台常驻品牌图标，左键打开控制台，右键菜单「打开 / 重启 / 停止 / 退出」，tooltip 实时显示运行状态——摆脱命令行窗口。
-- **无窗口 exe 启动器**：双击 `LocalOpsConsole.exe` 即可后台启动，体验等同 macOS 的 `.app`。
-- **功能完全对齐**：API 层 14 条路由 + 23 个 handler 与上游 100% 覆盖，无功能缺失。
-- **205 项测试全绿**：单实例锁、托盘、平台泄漏扫描、控制令牌与 ACL 保护均已回归固化。
-- **顺带修复上游缺陷**：单实例锁失效、`detect_project` 硬编码 `python3`、Windows 重启后日志丢失等。
+- **无窗口 exe 启动器**：双击 `LocalOpsConsole.exe` 即可后台启动。
+- **Windows 原生体验**：系统托盘、无窗口启动器、开机自启、TokenUser SID 进程归属和私有 DACL。
+- **自动化回归**：单实例锁、托盘、平台泄漏扫描、控制令牌、ACL 与启动台磁盘恢复均有测试覆盖。
+- **Windows 专项修复**：修复单实例锁、项目识别命令、后台重启日志和启动台卡片恢复等问题。
 
 **Preview / Alpha · 源码预览**
 
-总控台是一个本地服务与批处理任务快速启动、运行监测工具。它把常用项目命令、长期服务和一次性批处理任务集中到本地网页中，并用 Python 3 提供只绑定回环地址的后端（macOS 仅用标准库；Windows 额外依赖 psutil）；前端是无构建、无 CDN 的原生 HTML/CSS/JavaScript。
+总控台是一个本地服务与批处理任务快速启动、运行监测工具。它把常用项目命令、长期服务和一次性批处理任务集中到本地网页中，并用 Python 3 提供只绑定回环地址的后端（运行时依赖 `psutil`）；前端是无构建、无 CDN 的原生 HTML/CSS/JavaScript。
 
-> 当前版本仍处于 Preview / Alpha 阶段，以源码预览形式提供。接口、配置格式和安装方式仍可能调整。Windows 平台为移植版本，核心功能（服务启停、进程溯源、日志、诊断、新端口发现、控制令牌）已验证可用。
+> 当前版本仍处于 Preview / Alpha 阶段，以源码预览形式提供。接口、配置格式和安装方式仍可能调整。本仓库为 Windows 专用版本，核心功能（服务启停、进程溯源、日志、诊断、新端口发现、控制令牌）已验证可用。
 
 总控台只服务当前电脑和当前用户，不是远程运维、多人协作或公网管理面板。它能够以当前用户权限执行保存的 shell 命令；不要将监听地址、反向代理、SSH 隧道或端口映射暴露到不受信任的网络。
 
@@ -32,7 +32,7 @@
 - 在当前页面会话中发现新出现的、尚未管理的监听端口，可直接加入启动台或忽略隐藏。
 - 运行前检查工作目录、脚本和运行时；明确失效时直接给出修复入口，不必先失败一次。
 - 从项目文件夹识别常用启动命令，但不安装依赖、不执行项目代码。
-- 通过运行 token、进程组和当前 UID 联合识别受控进程，不会因端口相同就杀死外部进程。
+- 通过运行 token、进程树和当前用户 TokenUser SID 联合识别受控进程，不会因端口相同就杀死外部进程。
 - Ops 指挥台单一主题：深空蓝黑/雾灰双色，左侧导航轨、KPI 概览卡、实时动态侧栏，浅色、深色和跟随系统。
 - 全局命令面板可直接添加服务或批处理任务；启动台卡片支持鼠标拖拽和键盘排序。
 
@@ -64,18 +64,13 @@
    > 也可手动运行：`python -m pip install "psutil>=7.2"` 后执行 `python server.py`。
 3. 建议将脚本保存在稳定、会单独备份的自动化目录中（参见下文「批处理任务」说明）。
 
-### macOS
-
-> **本仓库不提供 macOS 版本与安装说明**。macOS 用户请直接使用上游仓库
-> <https://github.com/laogou717/local-ops>，安装与使用方式见上游 README。
-
 ## 运行
 
 ### Windows
 
 | 方式 | 操作 | 适用场景 |
 | --- | --- | --- |
-| **exe 启动器** | 双击 `LocalOpsConsole.exe`（项目根已附带；重新编译见 `tools\build_launcher.bat`） | **推荐**。无窗口、无命令行、双击即用（同 macOS `.app`） |
+| **exe 启动器** | 双击 `LocalOpsConsole.exe`（项目根已附带；重新编译见 `tools\build_launcher.bat`） | **推荐**。无窗口、无命令行、双击即用 |
 | 双击脚本 | 双击 `start.bat` | 备用。已运行时直接打开浏览器 |
 | 命令行 | `python server.py` | 调试、脚本化（前台运行，Ctrl+C 停止） |
 
@@ -86,11 +81,7 @@ Windows 后台运行说明：
 - **停止总控台**：打开页面后点击顶栏「停止」（网页按钮，不影响已启动的应用）；或托盘右键「停止总控台」。
 - 首次运行时，`start.bat` 与 `LocalOpsConsole.exe` 都会把 `psutil`（≥ 7.2）装进**当前解释器**的 site-packages，确保 `pythonw` 能导入（仅装到 user-site 会降级运行）。
 
-### macOS
-
-> macOS 用户请使用上游仓库 <https://github.com/laogou717/local-ops>，本仓库不提供 macOS 运行说明。
-
-两个平台通用的命令行参数：
+命令行参数：
 
 ```bash
 python server.py --no-browser        # 只启动服务，不自动打开浏览器
@@ -115,7 +106,7 @@ python server.py --preferred-port 9603  # 在 9600-9609 内指定优先端口
 - **排序**：鼠标拖拽，或聚焦卡片后按空格进入键盘排序（方向键移动，空格确认）。
 - **批量停止**：右侧「快捷操作」里可一键停止全部运行中的应用（有确认框，逐个安全停止，绝不按端口杀进程）。
 - **开机自启（autostart）**：编辑服务卡片时打开「开机自启」开关，总控台启动后会按配置顺序自动拉起标记的服务（仅长期服务，批处理任务无自启意义）。配合「总控台自身设为开机启动」（Windows 注册表 Run 键）即可实现开机后全部托管服务自动就绪。
-- **端口被占用时**：点启动会弹出确认框，展示占用进程的名称、PID 与命令，确认后终止该占用进程（仅限当前用户进程，后端 UID 校验兜底）并自动启动服务——一键解决端口冲突。
+- **端口被占用时**：点启动会弹出确认框，展示占用进程的名称、PID 与命令，确认后终止该占用进程（仅限 TokenUser SID 与当前用户一致的进程）并自动启动服务——一键解决端口冲突。
 
 ### 服务监控（看这台设备在跑什么）
 
@@ -154,38 +145,26 @@ python server.py --preferred-port 9603  # 在 9600-9609 内指定优先端口
 
 ## 数据、隐私与备份
 
-运行数据与程序目录分离。默认位置按平台区分：
+运行数据与程序目录分离。Windows 默认位置如下：
 
-| 平台 | 路径 | 内容 | 备份建议 |
-| --- | --- | --- | --- |
-| macOS | `~/Library/Application Support/总控台/config.json` | 应用命令、本地路径、端口、标记和运行识别信息 | 必须 |
-| macOS | `~/Library/Application Support/总控台/config.json.bak` | 上一份已知良好的配置 | 必须 |
-| macOS | `~/Library/Application Support/总控台/icons/` | 用户上传的图标和站点图标 | 按需 |
-| macOS | `~/Library/Logs/总控台/` | 应用与总控台运行日志 | 通常不需 |
-| Windows | `%APPDATA%\总控台\config.json`（及 `.bak`） | 同 macOS 的 config 两项 | 必须 |
-| Windows | `%APPDATA%\总控台\icons\` | 用户上传的图标和站点图标 | 按需 |
-| Windows | `%LOCALAPPDATA%\总控台\` | 应用与总控台运行日志 | 通常不需 |
+| 路径 | 内容 | 备份建议 |
+| --- | --- | --- |
+| `%APPDATA%\总控台\config.json`（及 `.bak`） | 应用、设置和上一份良好配置 | 必须 |
+| `%APPDATA%\总控台\icons\` | 用户上传的图标和站点图标 | 按需 |
+| `%LOCALAPPDATA%\总控台\` | 应用与总控台运行日志 | 通常不需 |
 
-目录权限会收紧为 `0700`，配置、图标和日志文件为 `0600`；Windows 上权限位检查自动跳过，改由 **TokenUser SID 收紧文件 DACL**（私有目录/文件仅当前用户可访问，发布检查会实际验证）。这些文件仍可能含个人路径、完整 shell 命令和日志内容；不应进入 Git，也不应随发行包或故障报告对外传播。
+总控台会按当前用户的 **TokenUser SID 收紧目录和文件 DACL**，发布检查会实际验证当前用户可读写且 ACL 非空。这些文件仍可能包含个人路径、完整 shell 命令和日志内容；不应进入 Git，也不应随发行包或故障报告对外传播。
 
 ### 旧版数据首次迁移
 
-如果新目标目录尚不存在，首次启动会将项目内旧 `data/config.json{,.bak}` 和 `data/icons/` 安全复制到 Application Support，将 `data/logs/` 复制到 Library Logs。迁移使用临时目录后原子落位，并且：
+如果 Windows 目标目录尚不存在，首次启动会将项目内旧 `data/config.json{,.bak}` 和 `data/icons/` 安全复制到 `%APPDATA%\总控台\`，将 `data/logs/` 复制到 `%LOCALAPPDATA%\总控台\`。迁移使用临时目录后原子落位，并且：
 
 - 旧 `data/` 始终保留，不会自动删除。
 - 目标已存在时绝不覆盖或合并，避免把更新的用户数据换回旧版。
 - 符号链接和非普通文件不会被复制。
 - 显式设置 `CONSOLE_DATA_DIR` 或 `CONSOLE_LOG_DIR` 时，对应目录不执行旧数据自动迁移。
 
-需要自定义路径时：
-
-```bash
-CONSOLE_DATA_DIR="/private/path/console-data" \
-CONSOLE_LOG_DIR="/private/path/console-logs" \
-python server.py
-```
-
-Windows（cmd）：
+需要自定义路径时，在 cmd 中执行：
 
 ```bat
 set CONSOLE_DATA_DIR=D:\path\console-data
@@ -193,18 +172,18 @@ set CONSOLE_LOG_DIR=D:\path\console-logs
 python server.py
 ```
 
-自定义值必须是非空的绝对路径，并指向总控台专用的非符号链接子目录；不要直接填 `/`、用户主目录或项目根目录。
+自定义值必须是非空的绝对路径，并指向总控台专用目录；不要直接填写盘符根目录、用户主目录或项目根目录。
 
 ### 备份
 
 1. 不再执行新的启动、停止或编辑操作。
 2. 停止总控台。
-3. 将数据目录（macOS：`~/Library/Application Support/总控台/`；Windows：`%APPDATA%\总控台\`）复制到受保护的备份目录。
+3. 将数据目录（`%APPDATA%\总控台\`）复制到受保护的备份目录。
 4. 记录当前 `VERSION`，以便恢复时匹配配置格式。
 
 ### 恢复
 
-1. 确保总控台已停止，并另存当前数据目录（macOS：`~/Library/Application Support/总控台/`；Windows：`%APPDATA%\总控台\`）。
+1. 确保总控台已停止，并另存当前数据目录（`%APPDATA%\总控台\`）。
 2. 将备份中的 `config.json` 和 `icons/` 复制回对应位置。
 3. 重新启动，逐项确认命令、工作目录和端口。
 
@@ -213,9 +192,9 @@ python server.py
 ## 升级
 
 1. 阅读 `CHANGELOG.md`，确认是否有配置或平台变更。
-2. 停止总控台并完整备份 `~/Library/Application Support/总控台/`。
-3. 用新版本替换程序文件；用户数据保持在 Library 目录中。
-4. 运行 `make check`。
+2. 停止总控台并完整备份 `%APPDATA%\总控台\`。
+3. 用新版本替换程序文件；不要覆盖或删除 `%APPDATA%\总控台\` 与 `%LOCALAPPDATA%\总控台\`。
+4. 在源码目录运行 `python tools\check_project.py`。
 5. 启动后检查应用数量、主题、关注关键字和一个可控服务的完整启停。
 
 配置包含 `schemaVersion`，启动时逐版执行显式、幂等迁移。新程序不会静默降级它不认识的更高 schema；回退程序时仍应同时恢复与该版本匹配的数据备份。
@@ -224,50 +203,50 @@ python server.py
 
 1. 如果不希望已启动的服务继续运行，先在启动台逐个停止它们。
 2. 停止总控台。
-3. 按需导出数据目录（macOS：`~/Library/Application Support/总控台/`；Windows：`%APPDATA%\总控台\`）备份。
-4. 将整个项目目录移到废纸篓。
-5. 确认不再需要数据后，手动删除数据目录（macOS：`~/Library/Application Support/总控台/` 与 `~/Library/Logs/总控台/`；Windows：`%APPDATA%\总控台\` 与 `%LOCALAPPDATA%\总控台\`）。
+3. 按需导出数据目录（`%APPDATA%\总控台\`）备份。
+4. 删除整个项目目录。
+5. 确认不再需要数据后，手动删除 `%APPDATA%\总控台\` 与 `%LOCALAPPDATA%\总控台\`。
 
 程序不会安装系统启动项，卸载时也不会自动删除用户数据。
 
 ## 安全边界
 
-总控台不是多用户服务器或远程管理面板。它能以当前登录用户（Windows / macOS）的权限执行你保存的 shell 命令，因此：
+总控台不是多用户服务器或远程管理面板。它能以当前登录用户的权限执行你保存的 shell 命令，因此：
 
 - 只添加你已检查且信任的命令和工作目录。
 - 不要将服务绑定到 `0.0.0.0`，不要通过反向代理、SSH 隧道或端口映射对外暴露。
 - 不要在共享或不受信任的用户账户中运行。
-- 不要把 Application Support 中的 `config.json`、Library Logs 日志或故障截图未经脱敏就上传。
+- 不要把 `%APPDATA%\总控台\config.json`、`%LOCALAPPDATA%\总控台\` 日志或故障截图未经脱敏就上传。
 - 本地回环绑定只是第一层边界。所有写接口还要求当前用户私有 `control.token` 对应的 `X-Console-Token`；启动器仅通过浏览器 URL fragment 传入令牌，前端会立即从地址栏清除。发布验收时必须执行 `RELEASE_CHECKLIST.md` 中的安全项。
 - 直接输入本地 URL 可以只读查看；页面会显示只读提示，变更请求不会在无令牌时发出。需要通过启动器或托盘的“打开控制台”进入可写页面。
 
-**Windows 平台差异**：
+**Windows 运行语义**：
 
 - Windows 没有 Unix PGID，受控进程识别使用「随机运行 token + 以根 PID 为锚点的进程树回溯」代替 PGID；进程归属则使用 TokenUser SID，无法读取 SID 的进程不会被当作当前用户。写接口还要求私有能力令牌，因此其他本地账户不能仅凭回环端口控制总控台。
 - 受控应用的启动命令通过 `cmd.exe /c` 执行：`service` 请使用前台命令（如 `python -m http.server`、`node server.js`）；需要 Shell 语法时同样可用（`&`、`&&` 等）。
-- 系统通知使用浏览器 Notification API（与 macOS 一致），无需额外依赖。
+- 系统通知使用浏览器 Notification API，无需额外依赖。
 
-## Windows 平台支持矩阵
+## Windows 能力与限制
 
-Windows 为同一代码库的移植版本（平台差异收口在 `sysops.py` 跨平台层）。下表是功能支持与有意取舍的完整清单：
+本仓库只维护 Windows 10/11。操作系统能力集中在 `sysops.py`，下表描述当前 Windows 行为：
 
 | 能力 | Windows | 说明 |
 | --- | --- | --- |
-| 服务/任务启停、重启、日志、诊断 | ✅ 一致 | 与 macOS 同一实现 |
-| 进程溯源、端口发现、attached 认领 | ✅ 一致 | 进程树回溯替代 PGID |
-| favicon 抓取、图标上传 | ✅ 一致 | 见下方限制 |
-| 命令面板、新端口发现、设置中心 | ✅ 一致 | 快捷键显示为 `Ctrl`（macOS 为 `⌘`） |
-| 优雅停止 | ⚠️ 差异 | 无 SIGTERM：带窗口进程走 WM_CLOSE 软通道，无窗口服务只能硬杀（macOS 可被 SIGTERM 捕获落盘） |
+| 服务/任务启停、重启、日志、诊断 | ✅ | 完整支持 |
+| 进程溯源、端口发现、attached 认领 | ✅ | 以 PID、进程树、SID、端口和工作目录联合校验 |
+| favicon 抓取、图标上传 | ✅ | 见下方限制 |
+| 命令面板、新端口发现、设置中心 | ✅ | 快捷键使用 `Ctrl` |
+| 优雅停止 | ⚠️ | 带窗口进程先走 WM_CLOSE；无窗口服务在宽限期后强制结束 |
 | 用户隔离 | ✅ | Windows 以 TokenUser SID 校验进程归属；所有写接口要求当前用户私有 `control.token` 对应的能力令牌 |
-| CPU 口径 | ⚠️ 差异 | 按「占全部逻辑核百分比」（任务管理器口径），`/api/state` 带 `coreCount`；macOS 为单核口径 |
-| Shell 语义 | ⚠️ 差异 | `cmd.exe /c` 包装：`service` 用前台命令，**命令内不要用单引号**（cmd 不识别） |
-| 启动器 | ✅ 等价 | `start.bat`（双击后台运行、首次自动装 psutil、已有实例时显示打开/重启/取消菜单）；运行中显示**系统托盘图标**（左键打开、右键菜单重启/停止，tooltip 显示端口与状态） |
+| CPU 口径 | ✅ | 按「占全部逻辑核百分比」（任务管理器口径），`/api/state` 返回 `coreCount` |
+| Shell 语义 | ⚠️ | `cmd.exe /c` 包装：`service` 用前台命令，**命令内不要用单引号**（cmd 不识别） |
+| 启动器 | ✅ | `start.bat` 与 `LocalOpsConsole.exe`；首次自动安装 psutil，已有实例时提供打开/重启/取消 |
 | 开机自启（autostart） | ✅ 新增 | 服务卡片可标记「开机自启」，总控台启动后按顺序自动拉起（延迟数秒、间隔启动、失败记日志不阻塞） |
 | 端口占用「释放并启动」 | ✅ 新增 | 端口被占用时点启动，确认框展示占用进程信息，确认后终止（仅当前用户）并自动启动 |
 
-**已知限制**（与 macOS 一致或移植固有的）：
+**已知限制**：
 
-- favicon 抓取只对 token 受管进程生效，`attached` 认领的卡片会返回"应用未运行或无可用端口"（上游既有行为，两平台相同）。
+- favicon 抓取只对 token 受管进程生效，`attached` 认领的卡片会返回“应用未运行或无可用端口”。
 - 优雅停止对无窗口服务无效（只能硬杀），涉及落盘的服务建议定期保存。
 - 运行要求：Windows 10/11 + Python 3.12+；唯一运行时依赖 `psutil>=7.2`（`start.bat` / `LocalOpsConsole.exe` 首次启动安装到当前解释器，要求联网）。
 
@@ -282,7 +261,7 @@ Windows 为同一代码库的移植版本（平台差异收口在 `sysops.py` �
 
 ### 9600 打不开
 
-程序可能已选择 9601–9609。查看终端输出或 `%LOCALAPPDATA%\总控台\console.log` 中的实际地址。服务可访问时，`GET /api/health` 会返回程序版本、配置 schema 和降级原因，且不会执行 `ps/lsof` 扫描。
+程序可能已选择 9601–9609。查看终端输出或 `%LOCALAPPDATA%\总控台\console.log` 中的实际地址。服务可访问时，`GET /api/health` 会返回程序版本、配置 schema 和降级原因，且不会执行进程或端口扫描。
 
 ### 应用启动失败
 
@@ -303,18 +282,19 @@ Windows 为同一代码库的移植版本（平台差异收口在 `sysops.py` �
 
 ## 开发
 
-运行时无第三方 Python 依赖。重新生成品牌图标派生文件或图标库时需要开发依赖：
+运行时依赖 `psutil>=7.2`。重新生成品牌图标派生文件或图标库时还需要开发依赖：
 
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python3 -m pip install -r requirements-dev.txt
+```bat
+python -m venv .venv
+.venv\Scripts\activate
+python -m pip install -r requirements-runtime-win.txt
+python -m pip install -r requirements-dev.txt
 ```
 
 主要目录：
 
 ```text
-server.py                 Python 标准库后端
+server.py                 Python 后端主程序（进程能力使用 psutil）
 static/                   原生前端、主题、品牌、图标和字体
 tests/                    后端、前端契约、发布与交付检查
 tools/gen_brand_assets.py 从品牌主图生成 favicon 与图标（.ico/.png）
@@ -327,40 +307,24 @@ data/                      旧版运行数据（仅首次迁移源，不进 Git/
 
 提交前的权威命令是：
 
-```bash
-make check
+```bat
+python tools\check_project.py
 ```
 
-它会检查 Python/JavaScript/Bash/plist/JSON 语法、版本一致性、主题和资源引用、生成的图标是否同步，并显式发现和运行测试。测试数量为 0 时会失败，不会出现“0 tests 也算通过”。
+它会检查 Python/JavaScript/JSON 语法、Windows 启动文件、版本一致性、主题和资源引用、生成的图标是否同步，并显式发现和运行测试。测试数量为 0 时会失败，不会出现“0 tests 也算通过”。
 
-**Windows 开发环境**（无 make 时的等价命令）：
+其他常用检查命令：
 
 ```bat
-:: 提交前全量检查（等价 make check）
-python tools/check_project.py
-:: 仅语法检查（等价 make syntax）
-python tools/check_project.py --skip-tests
-:: 仅后端测试（等价 make test）
+:: 仅语法和项目结构检查
+python tools\check_project.py --skip-tests
+:: 仅后端测试
 python -m unittest discover -s tests -p "test_*.py" -v
+:: macOS 残留扫描（Windows-only 回归防线）
+python tools\check_platform_leaks.py
 ```
 
-只运行后端测试（macOS）：
-
-```bash
-make test
-# 等价的显式命令：
-python3 -m unittest discover -s tests -p 'test_*.py' -v
-```
-
-正式发布前还应运行：
-
-```bash
-make release-check
-```
-
-它会额外检查 Git 状态和不应进入发行范围的文件；不会代替 `RELEASE_CHECKLIST.md` 中的人工验收。
-
-在 Windows 上，`make release-check` 的等价命令还会在临时目录中真实验证私有目录/文件的 DACL 非空，以及当前用户的创建、读取、覆盖和删除权限：
+正式发布前还应运行以下命令；它们会额外检查 Git 状态、发行范围和私有 DACL，但不会代替 `RELEASE_CHECKLIST.md` 中的人工验收：
 
 ```bat
 python tools\build_release.py --check-only
@@ -369,13 +333,13 @@ python tools\check_project.py --release
 
 ### 重新生成资源
 
-```bash
-make generate-icons
-make generate-brand
-make check
+```bat
+python tools\gen_icons.py
+python tools\gen_brand_assets.py
+python tools\check_project.py
 ```
 
-`static/icons.js` 是生成文件，不应手工修改。`generate-brand` 以 `static/assets/console-app-icon.png` 为主源（macOS 开发环境使用系统 `iconutil`；Windows 上 `tools/gen_brand_assets.py` 直接生成 `.ico`）。重新生成品牌图标后，只提交预期的差异，并同步更新 `ASSET_PROVENANCE.md` 的 SHA-256。
+`static/icons.js` 是生成文件，不应手工修改。`generate-brand` 以 `static/assets/console-app-icon.png` 为主源，`tools/gen_brand_assets.py` 直接生成 `.ico` / favicon。重新生成品牌图标后，只提交预期的差异，并同步更新 `ASSET_PROVENANCE.md` 的 SHA-256。
 
 ## 发布
 
@@ -383,7 +347,7 @@ make check
 
 - 与根目录 MIT 许可证一致的版权信息，以及全部第三方素材和项目图像的来源、许可与授权凭证。
 - 干净、可追溯的 Git commit 和带签名版本 Tag。
-- 通过 `make release-check` 和人工 UI/安全/升级/回滚验收。
+- 通过 `python tools\build_release.py --check-only`、`python tools\check_project.py --release` 和人工 UI/安全/升级/回滚验收。
 - 不含任何项目内旧 `data/`、用户数据、日志、绝对路径、token 或缓存的发行包。
 - Windows 发行包（zip）解压后可直接运行：`LocalOpsConsole.exe` 无窗口启动、`start.bat` 备用；按 `RELEASE_CHECKLIST.md` 完成 Windows 全新安装与回退验证（含控制令牌只读/可写切换、ACL 冒烟检查）。
 
@@ -393,14 +357,14 @@ make check
 
 | 衍生版本 | 说明 | 出处 |
 | --- | --- | --- |
-| Windows 10/11 适配（双平台运行） | 共享代码 + 平台分支收敛，不新增运行时依赖，含 Windows 专属测试与 CI | PR [#2](https://github.com/laogou717/local-ops/pull/2)（dontpanic1） |
+| Windows 10/11 适配（上游历史提案） | 上游仓库的双平台适配提案，仅作背景参考 | PR [#2](https://github.com/laogou717/local-ops/pull/2)（dontpanic1） |
 | Windows 11 安全优先移植（Draft） | Job Objects、签名回执、CREATE_SUSPENDED 等更严格的进程所有权模型，含打包体系 | PR [#3](https://github.com/laogou717/local-ops/pull/3)（songconmaisaix31-design） |
 | Windows 后端 `server_win.py` | 独立 Windows 后端（纯标准库），复用本仓库前端 | PR [#4](https://github.com/laogou717/local-ops/pull/4)（Hexvork） |
-| sysops.py 跨平台抽象层方案（Windows 移植版） | psutil 唯一新增依赖，macOS 分支零改动；含系统托盘、无窗口启动器、开机自启、端口释放、控制令牌等 Windows 增强 | [FL411/local-ops](https://github.com/FL411/local-ops) |
+| 总控台 Windows 专用版 | 本仓库。psutil 运行时依赖；系统托盘、无窗口启动器、开机自启、端口释放、控制令牌。不再维护 macOS 路径 | [FL411/local-ops](https://github.com/FL411/local-ops) |
 
 ## 参与贡献与安全
 
-- 提交代码前请阅读 [`CONTRIBUTING.md`](CONTRIBUTING.md) 与上方「维护说明」，并运行 `make check`。
+- 提交代码前请阅读 [`CONTRIBUTING.md`](CONTRIBUTING.md) 与上方「维护说明」，并运行 `python tools\check_project.py`。
 - 行为规范见 [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md)。
 - 安全问题不要作为普通公开 Issue 披露；报告方式和脱敏要求见 [`SECURITY.md`](SECURITY.md)。
 - 新增或替换字体、图标、插画、纹理等素材时，必须同步更新 [`ASSET_PROVENANCE.md`](ASSET_PROVENANCE.md) 和 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)。

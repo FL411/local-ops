@@ -1,6 +1,6 @@
 # 参与贡献
 
-感谢你帮助改进总控台。项目仍处于 Preview / Alpha 阶段，优先接受范围清晰、可验证且不扩大安全边界的改动。
+感谢你帮助改进总控台。项目仍处于 Preview / Alpha 阶段，并且只维护 Windows 10/11。优先接受范围清晰、可验证且不扩大安全边界的改动。
 
 > **维护立场**：本仓库由作者个人维护，PR 不承诺审阅或合入。希望增加功能、适配其他平台的朋友，请优先 Fork 自行修改，并在 Discussions 提交衍生版本说明（详见 README 的「维护说明」与「社区衍生版本」）。以下规范供提交讨论与 Fork 开发参考。
 
@@ -9,27 +9,28 @@
 1. 先搜索已有 Issue 和 Pull Request，避免重复工作。
 2. 较大的功能、配置 schema 变化、进程管理策略或 UI 主题调整，请先开 Issue 说明动机、用户场景和兼容性影响。
 3. 安全漏洞不要公开讨论，按 [`SECURITY.md`](SECURITY.md) 私下报告。
-4. 不要提交本机 `data/`、Application Support、Library Logs、个人路径、完整命令、token、用户图标或未脱敏截图。
+4. 不要提交本机 `data/`、`%APPDATA%\总控台`、`%LOCALAPPDATA%\总控台`、个人路径、完整命令、token、用户图标或未脱敏截图。
 
 ## 开发环境
 
-- macOS 12 或更高版本；
+- Windows 10 或 11；
 - Python 3.12；
 - Node.js，仅用于 JavaScript 语法检查；
-- 运行时无第三方 Python 依赖。
+- 运行时依赖 `psutil>=7.2`（`pip install -r requirements-runtime-win.txt`）。
 
 只有重新生成纹理时才需要开发依赖：
 
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python3 -m pip install -r requirements-dev.txt
+```bat
+python -m venv .venv
+.venv\Scripts\activate
+python -m pip install -r requirements-dev.txt
 ```
 
 ## 修改原则
 
-- 后端保持 Python 标准库实现；前端保持原生 ES Modules、无 CDN、无构建。
-- 不得削弱回环绑定、当前 UID、run token、进程组、Host/Origin 或控制令牌等安全校验。
+- 后端除 `psutil` 外保持 Python 标准库实现；前端保持原生 ES Modules、无 CDN、无构建。
+- 不得削弱回环绑定、TokenUser SID、run token、进程树、Host/Origin 或控制令牌等安全校验。
+- 不引入 macOS/Linux 运行分支；其他平台用户应使用上游项目或自行维护 Fork。
 - 不得按端口直接结束未知进程。
 - 配置变更必须有明确 `schemaVersion`、幂等迁移和升级测试。
 - DOM 列表应按 key 原地更新，避免轮询造成整表闪烁。
@@ -51,14 +52,15 @@ python3 -m pip install -r requirements-dev.txt
 
 提交前运行：
 
-```bash
-make check
+```bat
+python tools\check_project.py
 ```
 
 涉及发行范围、许可证、静态资源或打包逻辑时，再运行：
 
-```bash
-make release-check
+```bat
+python tools\build_release.py --check-only
+python tools\check_project.py --release
 ```
 
 Pull Request 应说明：

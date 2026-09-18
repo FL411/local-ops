@@ -60,11 +60,10 @@
   - `static/assets/favicon-32.png`：`6c1c34a718d9f26737fc1edc2a1a1fd3838e66826e0a19284e116449f031abbb`
   - `static/assets/favicon.ico`：`71b9aa89ea479762f7ed7c54a665c88ef7786089523417119292d446ea12648d`
   - `static/assets/apple-touch-icon.png`：`1108214aa511f206409c2daf7a3f7ac318dd4d2554a95476f2f606bfe8b49621`
-  - `总控台.app/Contents/Resources/AppIcon.icns`：`3ed34bba75ec6a2440d44d9c254ee079ac72b7f2bbc1605a873472131cf56568`
-- 用途：macOS App Icon、浏览器 favicon、Apple Touch Icon 与网页顶栏品牌标识
+- 用途：浏览器 favicon、Apple Touch Icon 与网页顶栏品牌标识
 - 设计：琥珀色“长期服务”轨道与紫色“批处理任务”轨道汇聚到青柠色状态节点，呼应产品的两类本地操作与统一监测
 - 来源：由项目维护者在用户明确选定第三套方向后，于 2026-07-23 在 Codex 中使用 OpenAI Image Generation `image_gen` 工具生成；工具没有向本次会话暴露底层模型版本
-- 修改：主输出经透明通道整理、裁切和安全留白处理形成 `console-app-icon.png` 与 `brand-mark.png`；`tools/gen_brand_assets.py` 使用 Pillow Lanczos 缩放和 macOS `iconutil` 生成网页图标与 ICNS
+- 修改：主输出经透明通道整理、裁切和安全留白处理形成 `console-app-icon.png` 与 `brand-mark.png`；`tools/gen_brand_assets.py` 使用 Pillow Lanczos 缩放生成网页图标
 - 凭证：本地维护档案 `tmp/brand/`（不进入 Git/发行包）、`tools/gen_brand_assets.py`、本文件校验值和 Git 历史
 - 许可：作为项目定向生成的品牌素材使用；公开发行前仍需由发布负责人保存当次 OpenAI 适用条款、生成主体和可再分发结论
 - 状态：`REVIEW_REQUIRED`
