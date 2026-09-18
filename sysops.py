@@ -143,7 +143,7 @@ def default_logs_dir():
 
 
 def _protect_private_windows_dacl(path):
-    """将 Windows 路径 DACL 替换为仅当前 TokenUser SID 的受保护 ACL。"""
+    """将 Windows 路径 owner 和 DACL 收紧到当前 TokenUser SID。"""
     sid = SELF_UID
     if not isinstance(sid, str) or not sid:
         raise OSError("无法读取当前 Windows 用户 SID")
@@ -201,11 +201,13 @@ def _protect_private_windows_dacl(path):
             if error:
                 raise OSError(error, "无法创建 Windows 私有文件 ACL")
             try:
-                # SE_FILE_OBJECT + DACL_SECURITY_INFORMATION +
-                # PROTECTED_DACL_SECURITY_INFORMATION：移除继承和所有旧 ACE。
+                # OWNER_SECURITY_INFORMATION + DACL_SECURITY_INFORMATION +
+                # PROTECTED_DACL_SECURITY_INFORMATION：统一 owner，并移除继承
+                # 和所有旧 ACE。Runner 等管理员令牌可能默认用 Administrators
+                # 作为新文件 owner，不能只改 DACL 后再按 TokenUser 校验 owner。
                 error = advapi32.SetNamedSecurityInfoW(
-                    os.path.abspath(path), 1, 0x80000004,
-                    None, None, acl_ptr, None)
+                    os.path.abspath(path), 1, 0x80000005,
+                    sid_ptr, None, acl_ptr, None)
                 if error:
                     raise OSError(error, "无法设置 Windows 私有文件 ACL")
             finally:

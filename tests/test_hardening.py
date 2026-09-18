@@ -334,6 +334,14 @@ class ControlTokenStorageTests(unittest.TestCase):
             finally:
                 second.server_close()
 
+    def test_private_directory_protection_sets_current_user_owner(self):
+        with tempfile.TemporaryDirectory() as td:
+            private = os.path.join(td, "private")
+            os.mkdir(private)
+            server.sysops.protect_private_directory(private)
+            self.assertTrue(
+                server.sysops.path_owned_by_current_user(private))
+
     def test_existing_token_with_untrusted_owner_is_rejected(self):
         with tempfile.TemporaryDirectory() as td:
             path = os.path.join(td, "control.token")
