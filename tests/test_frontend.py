@@ -105,6 +105,17 @@ class FrontendStructureParser(HTMLParser):
 
 
 class FrontendAccessibilityContractTests(unittest.TestCase):
+    def test_github_link_targets_the_windows_repository(self):
+        html = (ROOT / "static/index.html").read_text(encoding="utf-8")
+        self.assertIn(
+            'id="githubLink" href="https://github.com/FL411/local-ops"',
+            html,
+        )
+        self.assertNotIn(
+            'id="githubLink" href="https://github.com/laogou717/local-ops"',
+            html,
+        )
+
     def test_monitoring_tables_have_named_aria_structure(self):
         parser = FrontendStructureParser()
         parser.feed((ROOT / "static/index.html").read_text(encoding="utf-8"))
