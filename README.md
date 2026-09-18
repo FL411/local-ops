@@ -1,21 +1,21 @@
-# 总控台（Windows 移植版）
+# 总控台（Windows）
 
-> **本仓库是 [laogou717/local-ops](https://github.com/laogou717/local-ops)（总控台）的 Windows 移植衍生版**，面向 Windows 10/11 用户：完整保留原版全部功能，并额外提供系统托盘、无窗口启动器。
-> **macOS 用户请直接使用上游仓库**，本仓库以 Windows 为使用目标。
+> **本仓库是 [laogou717/local-ops](https://github.com/laogou717/local-ops)（总控台）的 Windows 专用衍生版**，只支持 Windows 10/11：保留原版功能，并提供系统托盘与无窗口启动器。
+> **macOS 请使用上游仓库**，本仓库不再提供或测试 macOS 运行路径。
 
 ## 亮点
 
 - **系统托盘**：后台常驻品牌图标，左键打开控制台，右键菜单「打开 / 重启 / 停止 / 退出」，tooltip 实时显示运行状态——摆脱命令行窗口。
-- **无窗口 exe 启动器**：双击 `LocalOpsConsole.exe` 即可后台启动，体验等同 macOS 的 `.app`。
+- **无窗口 exe 启动器**：双击 `LocalOpsConsole.exe` 即可后台启动。
 - **功能完全对齐**：API 层 14 条路由 + 23 个 handler 与上游 100% 覆盖，无功能缺失。
 - **205 项测试全绿**：单实例锁、托盘、平台泄漏扫描、控制令牌与 ACL 保护均已回归固化。
 - **顺带修复上游缺陷**：单实例锁失效、`detect_project` 硬编码 `python3`、Windows 重启后日志丢失等。
 
 **Preview / Alpha · 源码预览**
 
-总控台是一个本地服务与批处理任务快速启动、运行监测工具。它把常用项目命令、长期服务和一次性批处理任务集中到本地网页中，并用 Python 3 提供只绑定回环地址的后端（macOS 仅用标准库；Windows 额外依赖 psutil）；前端是无构建、无 CDN 的原生 HTML/CSS/JavaScript。
+总控台是一个本地服务与批处理任务快速启动、运行监测工具。它把常用项目命令、长期服务和一次性批处理任务集中到本地网页中，并用 Python 3 提供只绑定回环地址的后端（运行时依赖 `psutil`）；前端是无构建、无 CDN 的原生 HTML/CSS/JavaScript。
 
-> 当前版本仍处于 Preview / Alpha 阶段，以源码预览形式提供。接口、配置格式和安装方式仍可能调整。Windows 平台为移植版本，核心功能（服务启停、进程溯源、日志、诊断、新端口发现、控制令牌）已验证可用。
+> 当前版本仍处于 Preview / Alpha 阶段，以源码预览形式提供。接口、配置格式和安装方式仍可能调整。本仓库为 Windows 专用版本，核心功能（服务启停、进程溯源、日志、诊断、新端口发现、控制令牌）已验证可用。
 
 总控台只服务当前电脑和当前用户，不是远程运维、多人协作或公网管理面板。它能够以当前用户权限执行保存的 shell 命令；不要将监听地址、反向代理、SSH 隧道或端口映射暴露到不受信任的网络。
 
@@ -64,18 +64,13 @@
    > 也可手动运行：`python -m pip install "psutil>=7.2"` 后执行 `python server.py`。
 3. 建议将脚本保存在稳定、会单独备份的自动化目录中（参见下文「批处理任务」说明）。
 
-### macOS
-
-> **本仓库不提供 macOS 版本与安装说明**。macOS 用户请直接使用上游仓库
-> <https://github.com/laogou717/local-ops>，安装与使用方式见上游 README。
-
 ## 运行
 
 ### Windows
 
 | 方式 | 操作 | 适用场景 |
 | --- | --- | --- |
-| **exe 启动器** | 双击 `LocalOpsConsole.exe`（项目根已附带；重新编译见 `tools\build_launcher.bat`） | **推荐**。无窗口、无命令行、双击即用（同 macOS `.app`） |
+| **exe 启动器** | 双击 `LocalOpsConsole.exe`（项目根已附带；重新编译见 `tools\build_launcher.bat`） | **推荐**。无窗口、无命令行、双击即用 |
 | 双击脚本 | 双击 `start.bat` | 备用。已运行时直接打开浏览器 |
 | 命令行 | `python server.py` | 调试、脚本化（前台运行，Ctrl+C 停止） |
 
@@ -86,11 +81,7 @@ Windows 后台运行说明：
 - **停止总控台**：打开页面后点击顶栏「停止」（网页按钮，不影响已启动的应用）；或托盘右键「停止总控台」。
 - 首次运行时，`start.bat` 与 `LocalOpsConsole.exe` 都会把 `psutil`（≥ 7.2）装进**当前解释器**的 site-packages，确保 `pythonw` 能导入（仅装到 user-site 会降级运行）。
 
-### macOS
-
-> macOS 用户请使用上游仓库 <https://github.com/laogou717/local-ops>，本仓库不提供 macOS 运行说明。
-
-两个平台通用的命令行参数：
+命令行参数：
 
 ```bash
 python server.py --no-browser        # 只启动服务，不自动打开浏览器
@@ -158,10 +149,6 @@ python server.py --preferred-port 9603  # 在 9600-9609 内指定优先端口
 
 | 平台 | 路径 | 内容 | 备份建议 |
 | --- | --- | --- | --- |
-| macOS | `~/Library/Application Support/总控台/config.json` | 应用命令、本地路径、端口、标记和运行识别信息 | 必须 |
-| macOS | `~/Library/Application Support/总控台/config.json.bak` | 上一份已知良好的配置 | 必须 |
-| macOS | `~/Library/Application Support/总控台/icons/` | 用户上传的图标和站点图标 | 按需 |
-| macOS | `~/Library/Logs/总控台/` | 应用与总控台运行日志 | 通常不需 |
 | Windows | `%APPDATA%\总控台\config.json`（及 `.bak`） | 同 macOS 的 config 两项 | 必须 |
 | Windows | `%APPDATA%\总控台\icons\` | 用户上传的图标和站点图标 | 按需 |
 | Windows | `%LOCALAPPDATA%\总控台\` | 应用与总控台运行日志 | 通常不需 |
@@ -199,12 +186,12 @@ python server.py
 
 1. 不再执行新的启动、停止或编辑操作。
 2. 停止总控台。
-3. 将数据目录（macOS：`~/Library/Application Support/总控台/`；Windows：`%APPDATA%\总控台\`）复制到受保护的备份目录。
+3. 将数据目录（`%APPDATA%\总控台\`）复制到受保护的备份目录。
 4. 记录当前 `VERSION`，以便恢复时匹配配置格式。
 
 ### 恢复
 
-1. 确保总控台已停止，并另存当前数据目录（macOS：`~/Library/Application Support/总控台/`；Windows：`%APPDATA%\总控台\`）。
+1. 确保总控台已停止，并另存当前数据目录（`%APPDATA%\总控台\`）。
 2. 将备份中的 `config.json` 和 `icons/` 复制回对应位置。
 3. 重新启动，逐项确认命令、工作目录和端口。
 
@@ -224,7 +211,7 @@ python server.py
 
 1. 如果不希望已启动的服务继续运行，先在启动台逐个停止它们。
 2. 停止总控台。
-3. 按需导出数据目录（macOS：`~/Library/Application Support/总控台/`；Windows：`%APPDATA%\总控台\`）备份。
+3. 按需导出数据目录（`%APPDATA%\总控台\`）备份。
 4. 将整个项目目录移到废纸篓。
 5. 确认不再需要数据后，手动删除数据目录（macOS：`~/Library/Application Support/总控台/` 与 `~/Library/Logs/总控台/`；Windows：`%APPDATA%\总控台\` 与 `%LOCALAPPDATA%\总控台\`）。
 
@@ -232,7 +219,7 @@ python server.py
 
 ## 安全边界
 
-总控台不是多用户服务器或远程管理面板。它能以当前登录用户（Windows / macOS）的权限执行你保存的 shell 命令，因此：
+总控台不是多用户服务器或远程管理面板。它能以当前登录用户的权限执行你保存的 shell 命令，因此：
 
 - 只添加你已检查且信任的命令和工作目录。
 - 不要将服务绑定到 `0.0.0.0`，不要通过反向代理、SSH 隧道或端口映射对外暴露。
@@ -344,14 +331,6 @@ python tools/check_project.py --skip-tests
 python -m unittest discover -s tests -p "test_*.py" -v
 ```
 
-只运行后端测试（macOS）：
-
-```bash
-make test
-# 等价的显式命令：
-python3 -m unittest discover -s tests -p 'test_*.py' -v
-```
-
 正式发布前还应运行：
 
 ```bash
@@ -375,7 +354,7 @@ make generate-brand
 make check
 ```
 
-`static/icons.js` 是生成文件，不应手工修改。`generate-brand` 以 `static/assets/console-app-icon.png` 为主源（macOS 开发环境使用系统 `iconutil`；Windows 上 `tools/gen_brand_assets.py` 直接生成 `.ico`）。重新生成品牌图标后，只提交预期的差异，并同步更新 `ASSET_PROVENANCE.md` 的 SHA-256。
+`static/icons.js` 是生成文件，不应手工修改。`generate-brand` 以 `static/assets/console-app-icon.png` 为主源，`tools/gen_brand_assets.py` 直接生成 `.ico` / favicon。重新生成品牌图标后，只提交预期的差异，并同步更新 `ASSET_PROVENANCE.md` 的 SHA-256。
 
 ## 发布
 
@@ -396,7 +375,7 @@ make check
 | Windows 10/11 适配（双平台运行） | 共享代码 + 平台分支收敛，不新增运行时依赖，含 Windows 专属测试与 CI | PR [#2](https://github.com/laogou717/local-ops/pull/2)（dontpanic1） |
 | Windows 11 安全优先移植（Draft） | Job Objects、签名回执、CREATE_SUSPENDED 等更严格的进程所有权模型，含打包体系 | PR [#3](https://github.com/laogou717/local-ops/pull/3)（songconmaisaix31-design） |
 | Windows 后端 `server_win.py` | 独立 Windows 后端（纯标准库），复用本仓库前端 | PR [#4](https://github.com/laogou717/local-ops/pull/4)（Hexvork） |
-| sysops.py 跨平台抽象层方案（Windows 移植版） | psutil 唯一新增依赖，macOS 分支零改动；含系统托盘、无窗口启动器、开机自启、端口释放、控制令牌等 Windows 增强 | [FL411/local-ops](https://github.com/FL411/local-ops) |
+| 总控台 Windows 专用版 | 本仓库。psutil 运行时依赖；系统托盘、无窗口启动器、开机自启、端口释放、控制令牌。不再维护 macOS 路径 | [FL411/local-ops](https://github.com/FL411/local-ops) |
 
 ## 参与贡献与安全
 

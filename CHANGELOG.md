@@ -8,6 +8,15 @@
 
 ## [Unreleased]
 
+### Changed
+
+- **仓库定位为纯 Windows 版本**：不再维护 macOS 运行路径。非 Windows 系统启动时立即退出，并引导使用上游 [laogou717/local-ops](https://github.com/laogou717/local-ops)。CI、发布检查与启动器均只覆盖 Windows 10/11。
+
+### Removed
+
+- macOS 交付物 `总控台.app`、`start.command`，以及 ps/lsof/osascript、Homebrew PATH、⌘ 快捷键文案等 macOS 专用实现。
+
+
 ### Fixed
 
 - **启动台卡片「消失」/残留总控台进程**：双击 exe 若碰到卡住的旧 `pythonw`（内存应用列表空、磁盘 `config.json` 仍有卡片，或进程无端口/`/api/state` 超时），不再盲目打开那个坏实例。启动时会自检同一项目目录的总控台进程：异常或残留则清理后拉起新实例；健康实例仍只打开浏览器。运行中若内存列表被掏空，会在刷新状态时从配置文件把卡片读回来（与配置锁共用，不会把刚删掉的卡片救活）。

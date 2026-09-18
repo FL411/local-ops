@@ -45,10 +45,7 @@ export function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c =>
     ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
-/* 平台判定:macOS 用 ⌘/单引号 shell 语义,其余(Windows/Linux)用 Ctrl/cmd 语义。 */
-export const IS_MAC = /Mac|iPhone|iPad|iPod/i.test(
-  navigator.platform || navigator.userAgent);
-export const MOD_KEY = IS_MAC ? '⌘' : 'Ctrl';
+export const MOD_KEY = 'Ctrl';
 export function applyModKeys() {
   document.querySelectorAll('[data-mod-key]').forEach(n => {
     n.textContent = MOD_KEY;
@@ -56,9 +53,7 @@ export function applyModKeys() {
 }
 export function shortHome(p) {
   if (!p) return '';
-  /* macOS: /Users/name/... -> ~/... */
-  if (/^\/Users\/[^/]+/.test(p)) return p.replace(/^\/Users\/[^/]+/, '~');
-  /* Windows: C:\Users\name\... -> ~\... */
+  /* C:\Users\name\... -> ~\... */
   const m = p.match(/^([A-Za-z]:\\Users\\[^\\]+)/);
   if (m) return '~' + p.slice(m[1].length);
   return p;

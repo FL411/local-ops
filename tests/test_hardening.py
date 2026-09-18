@@ -177,7 +177,7 @@ class LauncherCapabilityTokenTests(unittest.TestCase):
 
 
 class EnsureRuntimeTests(unittest.TestCase):
-    def test_posix_skips_psutil_install(self):
+    def test_non_windows_ensure_runtime_fails(self):
         buf = io.StringIO()
         with mock.patch.object(launcher_check.sys, "platform", "darwin"):
             with mock.patch.object(
@@ -185,8 +185,8 @@ class EnsureRuntimeTests(unittest.TestCase):
                 with mock.patch.object(launcher_check, "_install_psutil") as install:
                     with mock.patch("sys.stdout", buf):
                         rc = launcher_check.ensure_runtime()
-        self.assertEqual(rc, 0)
-        self.assertEqual(buf.getvalue().strip(), "OK")
+        self.assertEqual(rc, 1)
+        self.assertIn("Windows-only", buf.getvalue())
         buf.getvalue().encode("ascii")
         probe.assert_not_called()
         install.assert_not_called()
@@ -504,8 +504,9 @@ class AppConfigurationTests(unittest.TestCase):
 class OperationLockTests(unittest.TestCase):
     def setUp(self):
         self.h = HttpHarness()
+        command = "%s -c \"import time; time.sleep(10)\"" % server._quote_win(sys.executable)
         app = {**server.Config.APP_DEFAULT,
-               "id": "deadbeef", "name": "Service", "command": "sleep 10",
+               "id": "deadbeef", "name": "Service", "command": command,
                "kind": "service", "cwd": self.h.tmp.name}
         self.h.cfg.update(lambda data: data["apps"].append(app))
 
@@ -538,7 +539,7 @@ class OperationLockTests(unittest.TestCase):
                 mock.patch.object(server, "persist_started_app", return_value=True):
             thread = threading.Thread(target=first_request)
             thread.start()
-            self.assertTrue(entered.wait(1))
+            self.assertTrue(entered.wait(3))
             status, body, _ = self.h.request(
                 "POST", "/api/apps/deadbeef/start", "{}",
                 {"Content-Type": "application/json"})
@@ -606,8 +607,9 @@ class ProcessLifecycleHardeningTests(unittest.TestCase):
     def test_manual_stop_waits_then_clears_without_recording_last_exit(self):
         with tempfile.TemporaryDirectory() as td, \
                 mock.patch.object(server, "LOGS_DIR", td):
+            command = "%s -c \"import time; time.sleep(20)\"" % server._quote_win(sys.executable)
             base = {**server.Config.APP_DEFAULT, "id": "deadbeef",
-                    "name": "Service", "command": "sleep 20", "cwd": td}
+                    "name": "Service", "command": command, "cwd": td}
             cfg = self._config_with_app(td, base)
             ok, error, proc, pgid, token = server.start_app(base)
             self.assertTrue(ok, error)
@@ -626,7 +628,7 @@ class ProcessLifecycleHardeningTests(unittest.TestCase):
                 if server.stop_target_alive(
                         {"kind": "group", "id": pgid, "members": [proc.pid]}):
                     try:
-                        os.killpg(pgid, signal.SIGKILL)
+                        server.sysops.kill_process(proc.pid, force=True)
                     except OSError:
                         pass
 
@@ -634,8 +636,9 @@ class ProcessLifecycleHardeningTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td, \
                 mock.patch.object(server, "LOGS_DIR", td):
             previous = {"code": 0, "at": 123, "durationSec": 0.1}
+            command = "%s -c \"import time; time.sleep(20)\"" % server._quote_win(sys.executable)
             base = {**server.Config.APP_DEFAULT, "id": "deadbeef",
-                    "name": "Task", "kind": "task", "command": "sleep 20",
+                    "name": "Task", "kind": "task", "command": command,
                     "cwd": td, "lastExit": previous}
             cfg = self._config_with_app(td, base)
             ok, error, proc, pgid, token = server.start_app(base)
@@ -659,44 +662,10 @@ class ProcessLifecycleHardeningTests(unittest.TestCase):
                 if server.stop_target_alive(
                         {"kind": "group", "id": pgid, "members": [proc.pid]}):
                     try:
-                        os.killpg(pgid, signal.SIGKILL)
+                        server.sysops.kill_process(proc.pid, force=True)
                     except OSError:
                         pass
 
-    @unittest.skipIf(
-        sys.platform == "win32",
-        "Windows terminate() is not an ignorable POSIX SIGTERM")
-    def test_sigterm_timeout_retains_runtime_identity_for_retry(self):
-        command = (
-            "python3 -c 'import signal,time; "
-            "signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(20)'")
-        with tempfile.TemporaryDirectory() as td, \
-                mock.patch.object(server, "LOGS_DIR", td):
-            base = {**server.Config.APP_DEFAULT, "id": "deadbeef",
-                    "name": "Stubborn", "command": command, "cwd": td}
-            cfg = self._config_with_app(td, base)
-            ok, error, proc, pgid, token = server.start_app(base)
-            self.assertTrue(ok, error)
-            server.persist_started_app(cfg, base["id"], proc, pgid, token)
-            tracked = server.find_app(cfg.snapshot(), base["id"])
-            try:
-                # Let the child install its SIGTERM handler before exercising
-                # the timeout path (the real start endpoint probes for 250ms).
-                time.sleep(0.6)
-                stopped, error = server.stop_app_and_clear(
-                    cfg, tracked, timeout=0.35)
-                self.assertFalse(stopped)
-                self.assertIn("保留管理状态", error)
-                result = server.find_app(cfg.snapshot(), base["id"])
-                self.assertEqual(result["runToken"], token)
-                self.assertEqual(result["lastPgid"], pgid)
-                self.assertTrue(server.stop_target_alive(
-                    {"kind": "group", "id": pgid, "members": [proc.pid]}))
-            finally:
-                try:
-                    os.killpg(pgid, signal.SIGKILL)
-                except OSError:
-                    pass
 
 
 class SingleInstanceTests(unittest.TestCase):
@@ -772,7 +741,12 @@ class StaticFileServingTests(unittest.TestCase):
                 f.write("secret")
             static = os.path.join(td, "static")
             os.mkdir(static)
-            os.symlink(outside, os.path.join(static, "leak.txt"))
+            try:
+                os.symlink(outside, os.path.join(static, "leak.txt"))
+            except OSError as exc:
+                if getattr(exc, "winerror", None) == 1314:
+                    self.skipTest("当前账户没有创建符号链接的权限")
+                raise
             with mock.patch.object(server, "STATIC_DIR", static):
                 status, body, _ = self.h.request("GET", "/leak.txt")
             self.assertEqual(status, 404)
@@ -1247,8 +1221,7 @@ class WindowsProcessSnapshotTests(unittest.TestCase):
             return proc
 
         fake_psutil.Process.side_effect = process_for
-        with mock.patch.object(server.sysops, "IS_POSIX", False), \
-                mock.patch.object(server.sysops, "_psutil",
+        with mock.patch.object(server.sysops, "_psutil",
                                   return_value=fake_psutil), \
                 mock.patch.object(
                     server.sysops, "_group_members_windows",

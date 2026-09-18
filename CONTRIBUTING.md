@@ -9,21 +9,21 @@
 1. 先搜索已有 Issue 和 Pull Request，避免重复工作。
 2. 较大的功能、配置 schema 变化、进程管理策略或 UI 主题调整，请先开 Issue 说明动机、用户场景和兼容性影响。
 3. 安全漏洞不要公开讨论，按 [`SECURITY.md`](SECURITY.md) 私下报告。
-4. 不要提交本机 `data/`、Application Support、Library Logs、个人路径、完整命令、token、用户图标或未脱敏截图。
+4. 不要提交本机 `data/`、`%APPDATA%\总控台`、`%LOCALAPPDATA%\总控台`、个人路径、完整命令、token、用户图标或未脱敏截图。
 
 ## 开发环境
 
-- macOS 12 或更高版本；
+- Windows 10 或 11；
 - Python 3.12；
 - Node.js，仅用于 JavaScript 语法检查；
-- 运行时无第三方 Python 依赖。
+- 运行时依赖 `psutil>=7.2`（`pip install -r requirements-runtime-win.txt`）。
 
 只有重新生成纹理时才需要开发依赖：
 
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python3 -m pip install -r requirements-dev.txt
+```bat
+python -m venv .venv
+.venv\Scripts\activate
+python -m pip install -r requirements-dev.txt
 ```
 
 ## 修改原则
@@ -51,14 +51,15 @@ python3 -m pip install -r requirements-dev.txt
 
 提交前运行：
 
-```bash
-make check
+```bat
+python tools\check_project.py
 ```
 
 涉及发行范围、许可证、静态资源或打包逻辑时，再运行：
 
-```bash
-make release-check
+```bat
+python tools\build_release.py --check-only
+python tools\check_project.py --release
 ```
 
 Pull Request 应说明：

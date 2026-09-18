@@ -4,7 +4,7 @@
 
 ## 1. 项目是什么
 
-GitHub `laogou717/local-ops`(中文名"总控台")的 **macOS → Windows 移植版**。功能:本地服务/批处理任务监控与快速启动台(网页 UI,后端 Python,零构建前端)。原版只支持 macOS(依赖 ps/lsof/osascript);本移植让它在 Windows 10/11 上完整可用。
+GitHub `laogou717/local-ops`(中文名"总控台")的 **Windows 专用衍生版**。功能:本地服务/批处理任务监控与快速启动台(网页 UI,后端 Python,零构建前端)。本仓库不再维护 macOS 运行路径。
 
 - **位置**:项目根目录(有 `.git`)
 - **版本**:1.0.0(VERSION 文件)
@@ -15,7 +15,7 @@ GitHub `laogou717/local-ops`(中文名"总控台")的 **macOS → Windows 移植
 | 文件 | 行数 | 职责 |
 |---|---|---|
 | `server.py` | ~4200 | 后端主程序(HTTP + 状态构建 + 进程管理 + 启动器逻辑) |
-| `sysops.py` | ~800 | **跨平台系统操作层**(本次移植核心):macOS 走 ps/lsof/osascript(POSIX 分支,零依赖);Windows 走 psutil |
+| `sysops.py` | ~800 | **Windows 系统操作层**:psutil 进程/端口/进程树, SID, 文件锁, 对话框 |
 | `start.bat` | 63 | Windows 启动器:探测 Python → 自动装 psutil → pythonw 无窗口后台运行 |
 | `static/` | — | 原生前端(HTML/CSS/JS,无构建),无需改动 |
 | `requirements-runtime-win.txt` | — | Windows 唯一运行时依赖:psutil |

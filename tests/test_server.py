@@ -1,6 +1,5 @@
 import json
 import os
-import shlex
 import signal
 import subprocess
 import sys
@@ -11,10 +10,6 @@ import unittest
 from unittest import mock
 
 import server
-
-# Windows 移植:macOS 专属语义(lsof 解析/bash 包装/chmod 执行位/posix 路径)
-# 的用例在 Windows 跳过;跨平台逻辑用 server.PYTHON_CMD 条件化断言。
-IS_POSIX = server.sysops.IS_POSIX
 
 
 class ParsingTests(unittest.TestCase):
@@ -30,22 +25,6 @@ class ParsingTests(unittest.TestCase):
         self.assertIsNotNone(server.validate_port(True)[1])
         self.assertIsNotNone(server.validate_port(70000)[1])
 
-    @unittest.skipUnless(IS_POSIX, "lsof 输出解析为 macOS 专属逻辑")
-    def test_listener_scan_preserves_ipv6_loopback_for_open_links(self):
-        output = """COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME
-node 101 user 1u IPv6 0x0 0t0 TCP [::1]:5173 (LISTEN)
-node 202 user 2u IPv4 0x0 0t0 TCP 127.0.0.1:8000 (LISTEN)
-node 303 user 3u IPv6 0x0 0t0 TCP *:3000 (LISTEN)
-"""
-        with mock.patch.object(server, "run_cmd", return_value=output):
-            listeners = server.scan_listeners()
-        self.assertEqual(listeners[(101, 5173)], {"::1"})
-        self.assertEqual(
-            server.listener_open_host(listeners, 5173, {101}), "localhost")
-        self.assertEqual(
-            server.listener_open_host(listeners, 8000, {202}), "127.0.0.1")
-        self.assertEqual(
-            server.listener_open_host(listeners, 3000, {303}), "127.0.0.1")
 
 
 class OriginAttributionTests(unittest.TestCase):
@@ -100,10 +79,9 @@ class OriginAttributionTests(unittest.TestCase):
         origin = server.attribute_origin(100, table)
         self.assertEqual(origin, {"label": "mise", "icon": "package"})
 
-    def test_launchd_parent_reports_system(self):
+    def test_root_parent_reports_system(self):
         table = self.table(
-            (100, 90, "redis-server"),
-            (90, 1, "launchd"),
+            (100, 1, "redis-server"),
         )
         origin = server.attribute_origin(100, table)
         self.assertEqual(origin, {"label": "系统", "icon": "server"})
@@ -131,46 +109,8 @@ class OriginAttributionTests(unittest.TestCase):
         self.assertEqual(origin, {"label": "Claude Code", "icon": "bot"})
 
 
-@unittest.skipUnless(IS_POSIX,
-                     "bash/zsh 包装与 chmod 执行位为 macOS 语义")
-class ScriptCommandTests(unittest.TestCase):
-    def test_script_extensions_choose_the_expected_runtime_and_quote_paths(self):
-        cases = {
-            ".py": "python3",
-            ".zsh": "/bin/zsh",
-            ".sh": "/bin/bash",
-            ".bash": "/bin/bash",
-        }
-        with tempfile.TemporaryDirectory() as td:
-            for suffix, runner in cases.items():
-                with self.subTest(suffix=suffix):
-                    path = os.path.join(td, "job's file" + suffix)
-                    with open(path, "w", encoding="utf-8") as handle:
-                        handle.write("echo ok\n")
-                    parts = shlex.split(server.command_for_script(path))
-                    self.assertEqual(parts, [runner, "--", path])
-
-    def test_executable_command_is_invoked_directly(self):
-        with tempfile.TemporaryDirectory() as td:
-            path = os.path.join(td, "nightly job.command")
-            with open(path, "w", encoding="utf-8") as handle:
-                handle.write("#!/bin/zsh\necho ok\n")
-            os.chmod(path, 0o700)
-            self.assertEqual(
-                shlex.split(server.command_for_script(path)), [path])
-
-    def test_non_executable_command_uses_bash(self):
-        with tempfile.TemporaryDirectory() as td:
-            path = os.path.join(td, "nightly job.command")
-            with open(path, "w", encoding="utf-8") as handle:
-                handle.write("echo ok\n")
-            os.chmod(path, 0o600)
-            self.assertEqual(
-                shlex.split(server.command_for_script(path)),
-                ["/bin/bash", "--", path])
 
 
-@unittest.skipUnless(not IS_POSIX, "Windows 脚本命令语义")
 class WindowsScriptCommandTests(unittest.TestCase):
     def test_selected_python_script_with_spaces_is_checked(self):
         with tempfile.TemporaryDirectory() as td:
@@ -217,45 +157,12 @@ class WindowsScriptCommandTests(unittest.TestCase):
 
 
 class AppHealthTests(unittest.TestCase):
-    @unittest.skipUnless(IS_POSIX, "脚本执行位/shebang 语义为 macOS 专属")
-    def test_python_script_with_spaces_is_checked_without_running_it(self):
-        with tempfile.TemporaryDirectory() as td:
-            path = os.path.join(td, "daily task.py")
-            with open(path, "w", encoding="utf-8") as handle:
-                handle.write("raise RuntimeError('must not execute')\n")
-            app = {"id": "deadbeef", "kind": "task", "cwd": td,
-                   "command": server.command_for_script(path)}
-            self.assertEqual(server.inspect_app_health(app)["status"], "ok")
-            os.unlink(path)
-            health = server.inspect_app_health(app)
 
-        self.assertTrue(health["blocking"])
-        self.assertEqual(health["issues"][0]["kind"], "script-missing")
-        self.assertEqual(health["issues"][0]["action"], "pick-script")
 
-    @unittest.skipUnless(IS_POSIX, "/bin/bash 包装为 macOS 语义")
-    def test_relative_script_uses_configured_working_directory(self):
-        with tempfile.TemporaryDirectory() as td:
-            path = os.path.join(td, "job.sh")
-            with open(path, "w", encoding="utf-8") as handle:
-                handle.write("echo ok\n")
-            app = {"command": "/bin/bash -- job.sh", "cwd": td}
-            self.assertFalse(server.inspect_app_health(app)["blocking"])
-
-    @unittest.skipUnless(IS_POSIX, "/bin/bash 包装为 macOS 语义")
-    def test_missing_cwd_does_not_cascade_for_relative_script(self):
-        with tempfile.TemporaryDirectory() as td:
-            missing = os.path.join(td, "gone")
-            health = server.inspect_app_health({
-                "command": "/bin/bash -- job.sh", "cwd": missing})
-        self.assertEqual([item["kind"] for item in health["issues"]],
-                         ["cwd-missing"])
 
     def test_complex_or_dynamic_command_is_unknown_and_not_blocked(self):
-        commands = ("python3 job.py && echo done", "python3 '$JOB'",
-                    "python3 'unterminated") if IS_POSIX else (
-                        "python app.py && echo done", "python %SCRIPT%",
-                        'python "unterminated')
+        commands = ("python app.py && echo done", "python %SCRIPT%",
+                    'python "unterminated')
         for command in commands:
             with self.subTest(command=command):
                 health = server.inspect_app_health(
@@ -277,36 +184,14 @@ class AppHealthTests(unittest.TestCase):
                 {"command": "definitely-not-installed --version", "cwd": None})
         self.assertEqual(health["issues"][0]["kind"], "runtime-missing")
 
-    @unittest.skipUnless(IS_POSIX, "chmod 执行位语义为 macOS 专属")
-    def test_direct_script_requires_execute_permission_but_bash_script_does_not(self):
-        with tempfile.TemporaryDirectory() as td:
-            path = os.path.join(td, "job.command")
-            with open(path, "w", encoding="utf-8") as handle:
-                handle.write("echo ok\n")
-            os.chmod(path, 0o600)
-            direct = server.inspect_app_health(
-                {"command": shlex.quote(path), "cwd": td})
-            wrapped = server.inspect_app_health(
-                {"command": "/bin/bash -- " + shlex.quote(path), "cwd": td})
-        self.assertEqual(direct["issues"][0]["kind"], "script-not-executable")
-        self.assertFalse(wrapped["blocking"])
 
-    @unittest.skipUnless(IS_POSIX, "os.symlink 语义为 macOS 专属")
-    def test_broken_script_symlink_is_unavailable(self):
-        with tempfile.TemporaryDirectory() as td:
-            link = os.path.join(td, "job.py")
-            os.symlink(os.path.join(td, "missing.py"), link)
-            health = server.inspect_app_health(
-                {"command": server.command_for_script(link), "cwd": td})
-        self.assertEqual(health["issues"][0]["kind"], "script-missing")
 
     def test_task_cancel_exit_code_survives_shell_wrapper(self):
         with tempfile.TemporaryDirectory() as td, \
                 mock.patch.object(server, "LOGS_DIR", td):
             # Windows 的 cmd 包装不识别单引号,改用 cmd 内建 exit /b 130;
             # POSIX 用 python 显式退出 130。
-            command = ("exit /b 130" if not IS_POSIX
-                       else server.PYTHON_CMD + " -c 'raise SystemExit(130)'")
+            command = "exit /b 130"
             app = {"id": "deadbeef", "cwd": td, "command": command}
             ok, error, proc, _, _ = server.start_app(app)
             self.assertTrue(ok, error)
@@ -510,10 +395,6 @@ class ConfigTests(unittest.TestCase):
                 backup = json.load(f)
             self.assertEqual(current["watchedKeywords"], ["node", "ffmpeg"])
             self.assertEqual(backup["watchedKeywords"], ["node"])
-            if IS_POSIX:
-                self.assertEqual(oct(os.stat(path).st_mode & 0o777), "0o600")
-                self.assertEqual(oct(os.stat(path + ".bak").st_mode & 0o777),
-                                 "0o600")
 
     def test_load_falls_back_to_backup(self):
         with tempfile.TemporaryDirectory() as td:
@@ -628,11 +509,6 @@ class RuntimeStorageTests(unittest.TestCase):
             with open(os.path.join(logs, "deadbeef.log"), "rb") as f:
                 self.assertEqual(f.read(), b"log")
             self.assertTrue(os.path.isfile(os.path.join(legacy, "config.json")))
-            if IS_POSIX:
-                self.assertEqual(oct(os.stat(target).st_mode & 0o777), "0o700")
-                self.assertEqual(
-                    oct(os.stat(os.path.join(target, "config.json")).st_mode & 0o777),
-                    "0o600")
 
             # 已存在的目标绝不被旧项目目录二次覆盖。
             with open(os.path.join(legacy, "config.json"), "w",
@@ -719,11 +595,51 @@ class RuntimeStorageTests(unittest.TestCase):
             log_path = os.path.join(logs, "console.log")
             with open(log_path, encoding="utf-8") as f:
                 self.assertEqual(f.read(), "launcher-log-ready\n")
-            if IS_POSIX:
-                self.assertEqual(os.stat(log_path).st_mode & 0o777, 0o600)
 
 
 class ProcessIdentityTests(unittest.TestCase):
+
+    def test_real_started_process_is_identified_and_stoppable(self):
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.object(server, "LOGS_DIR", td):
+            command = "%s -c \"import time; time.sleep(20)\"" % server._quote_win(sys.executable)
+            app = {"id": "deadbeef", "command": command, "cwd": td}
+            ok, error, proc, pgid, token = server.start_app(app)
+            self.assertTrue(ok, error)
+            tracked = dict(app, lastPid=proc.pid, lastPgid=pgid, runToken=token)
+            try:
+                time.sleep(0.3)
+                self.assertIn(proc.pid, server.managed_pids(tracked))
+                self.assertEqual(
+                    server.managed_pids(dict(tracked, runToken="wrong")), [])
+                target, error = server.resolve_app_stop_target(tracked)
+                self.assertIsNone(error, error)
+                stopped, error = server.signal_app_stop(target)
+                self.assertTrue(stopped, error)
+                proc.wait(timeout=5)
+            finally:
+                if proc.poll() is None:
+                    try:
+                        server.sysops.kill_process(proc.pid, force=True)
+                    except Exception:
+                        pass
+                    proc.wait(timeout=5)
+
+
+    def test_verified_legacy_process_can_be_stopped_without_port_kill(self):
+        app = {"id": "legacy", "lastPid": 999, "lastPgid": None,
+               "runToken": None, "port": 8080, "cwd": r"C:\\tmp\\project"}
+        with mock.patch.object(server, "managed_pids", return_value=[]), \
+                mock.patch.object(server, "legacy_managed_pid", return_value=999), \
+                mock.patch.object(server.sysops, "kill_process",
+                                  return_value=(True, None)) as stop:
+            target, error = server.resolve_app_stop_target(
+                app, {(999, 8080)})
+            self.assertIsNone(error)
+            stopped, error = server.signal_app_stop(target)
+            self.assertTrue(stopped, error)
+        stop.assert_called_once_with(999, force=False)
+
     def test_random_marker_is_required_for_whole_process_group(self):
         app = {"id": "a", "lastPid": 42, "lastPgid": 42, "runToken": "right"}
         groups = {42: [42, 43]}
@@ -738,45 +654,7 @@ class ProcessIdentityTests(unittest.TestCase):
             index, _, _ = server.managed_process_index([stale], groups)
             self.assertEqual(index["a"], [])
 
-    @unittest.skipUnless(IS_POSIX, "sleep 命令与 os.killpg 为 POSIX 语义")
-    def test_real_started_process_is_identified_and_stoppable(self):
-        with tempfile.TemporaryDirectory() as td, \
-                mock.patch.object(server, "LOGS_DIR", td):
-            app = {"id": "deadbeef", "command": "sleep 20", "cwd": td}
-            ok, error, proc, pgid, token = server.start_app(app)
-            self.assertTrue(ok, error)
-            tracked = dict(app, lastPid=proc.pid, lastPgid=pgid, runToken=token)
-            try:
-                time.sleep(0.15)
-                self.assertIn(proc.pid, server.managed_pids(tracked))
-                self.assertEqual(
-                    server.managed_pids(dict(tracked, runToken="wrong")), [])
-                target, error = server.resolve_app_stop_target(tracked)
-                self.assertIsNotNone(target, error)
-                stopped, error = server.signal_app_stop(target)
-                self.assertTrue(stopped, error)
-                proc.wait(timeout=3)
-            finally:
-                if proc.poll() is None:
-                    try:
-                        os.killpg(proc.pid, signal.SIGKILL)
-                    except OSError:
-                        pass
-                    proc.wait(timeout=3)
 
-    @unittest.skipUnless(IS_POSIX, "os.getpgid/posix 路径为 macOS 语义")
-    def test_verified_legacy_process_can_be_stopped_without_port_kill(self):
-        app = {"id": "legacy", "lastPid": 999, "lastPgid": None,
-               "runToken": None, "port": 8080, "cwd": "/tmp/project"}
-        with mock.patch.object(server, "managed_pids", return_value=[]), \
-                mock.patch.object(server, "legacy_managed_pid", return_value=999), \
-                mock.patch.object(server.os, "kill") as stop:
-            target, error = server.resolve_app_stop_target(
-                app, {(999, 8080)})
-            self.assertIsNone(error)
-            stopped, error = server.signal_app_stop(target)
-            self.assertTrue(stopped, error)
-        stop.assert_called_once_with(999, signal.SIGTERM)
 
     def test_running_app_can_be_stopped_in_place_before_update(self):
         cfg = mock.Mock()
@@ -1028,22 +906,23 @@ class ProcessIdentityTests(unittest.TestCase):
 
 
 class LaunchEnvironmentTests(unittest.TestCase):
-    @unittest.skipUnless(IS_POSIX, "homebrew/nvm 路径为 macOS 专属")
     def test_headless_launch_path_includes_common_user_node_locations(self):
-        with mock.patch.object(server.os.path, "expanduser", return_value="/Users/example"), \
+        home = r"C:\Users\example"
+        with mock.patch.object(server.os.path, "expanduser", return_value=home), \
+                mock.patch.dict(server.os.environ, {"APPDATA": home + r"\AppData\Roaming",
+                                                    "SystemRoot": r"C:\Windows"}, clear=False), \
                 mock.patch.object(server.glob, "glob", side_effect=[
-                    ["/Users/example/.nvm/versions/node/v22/bin"],
-                    ["/Users/example/.fnm/node-versions/v20/installation/bin"],
+                    [home + r"\.nvm\versions\node\v22"],
+                    [home + r"\.fnm\node-versions\v20\installation"],
                 ]):
-            env = server.build_launch_env("secret", {"PATH": "/usr/bin:/bin"})
+            env = server.build_launch_env("secret", {"PATH": r"C:\Windows\System32"})
 
         paths = env["PATH"].split(os.pathsep)
-        self.assertIn("/Users/example/.local/bin", paths)
-        self.assertIn("/usr/local/bin", paths)
-        self.assertIn("/opt/homebrew/bin", paths)
-        self.assertIn("/Users/example/.nvm/versions/node/v22/bin", paths)
+        self.assertIn(os.path.join(home, "AppData", "Roaming", "npm"), paths)
+        self.assertIn(home + r"\.nvm\versions\node\v22", paths)
         self.assertEqual(len(paths), len(set(paths)))
         self.assertEqual(env[server.RUN_TOKEN_ENV], "secret")
+
 
     def test_immediate_failure_message_uses_last_log_line(self):
         with tempfile.TemporaryDirectory() as td, \
@@ -1382,16 +1261,6 @@ class DiagnoseTests(unittest.TestCase):
         r = self._run(app, log="ok")
         self.assertFalse(any(i["kind"] == "quick-exit" for i in r["issues"]))
 
-    @unittest.skipUnless(IS_POSIX, "command_for_script 的脚本缺失语义为 macOS 专属")
-    def test_static_health_issue_is_included_before_a_failed_run(self):
-        with tempfile.TemporaryDirectory() as td:
-            missing = os.path.join(td, "missing.py")
-            app = {"id": "aabbccdd", "kind": "task", "cwd": td,
-                   "command": server.command_for_script(missing),
-                   "port": None, "lastExit": None}
-            r = self._run(app)
-        issue = next(i for i in r["issues"] if i["kind"] == "script-missing")
-        self.assertEqual(issue["action"], "pick-script")
 
 
 class ThemeTests(unittest.TestCase):

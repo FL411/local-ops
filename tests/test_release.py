@@ -11,8 +11,6 @@ from tools import build_release as release
 from tools import check_project as project_check
 
 
-@unittest.skipIf(sys.platform == "win32",
-                 "发布产物检查(macOS 路径/签名/归档)为 macOS 发布工作流")
 class ReleaseFixtureTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -59,6 +57,8 @@ class ReleaseFixtureTests(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "敏感文件"):
                 release.iter_release_files()
 
+    @unittest.skipIf(sys.platform == "win32",
+                     "Windows 无开发者模式时无法创建 symlink")
     def test_symlinked_required_source_is_rejected(self):
         target = self.write("target/server.py")
         (self.root / "server.py").symlink_to(target)
@@ -98,27 +98,26 @@ class ReleaseFixtureTests(unittest.TestCase):
 
     def test_archive_is_reproducible_and_metadata_is_normalized(self):
         regular = self.write("server.py", b"print('ok')\n")
-        executable = self.write("start.command", b"#!/bin/bash\nexit 0\n")
+        other = self.write("start.bat", b"@echo off\r\nexit /b 0\r\n")
         regular.chmod(0o600)
-        executable.chmod(0o700)
+        other.chmod(0o700)
         first = self.root / "dist" / "first.zip"
         second = self.root / "dist" / "second.zip"
         with mock.patch.dict(os.environ, {"SOURCE_DATE_EPOCH": "1704067201"}):
-            release.write_archive(first, self.entries(executable, regular), "1.2.3")
+            release.write_archive(first, self.entries(other, regular), "1.2.3")
             os.utime(regular, (1_800_000_000, 1_800_000_000))
-            os.utime(executable, (1_900_000_000, 1_900_000_000))
+            os.utime(other, (1_900_000_000, 1_900_000_000))
             regular.chmod(0o666)
-            executable.chmod(0o777)
-            entries = self.entries(regular, executable)
+            other.chmod(0o777)
+            entries = self.entries(regular, other)
             release.write_archive(second, entries, "1.2.3")
             release.verify_archive(second, entries, "1.2.3")
 
         self.assertEqual(first.read_bytes(), second.read_bytes())
-        self.assertEqual(stat.S_IMODE(second.stat().st_mode), 0o644)
         with zipfile.ZipFile(second) as archive:
             infos = {info.filename: info for info in archive.infolist()}
         regular_info = infos["总控台-1.2.3/server.py"]
-        executable_info = infos["总控台-1.2.3/start.command"]
+        other_info = infos["总控台-1.2.3/start.bat"]
         self.assertEqual(regular_info.compress_type, zipfile.ZIP_STORED)
         self.assertEqual(regular_info.date_time, (2024, 1, 1, 0, 0, 0))
         self.assertEqual(
@@ -126,8 +125,8 @@ class ReleaseFixtureTests(unittest.TestCase):
             stat.S_IFREG | 0o644,
         )
         self.assertEqual(
-            (executable_info.external_attr >> 16) & 0xFFFF,
-            stat.S_IFREG | 0o755,
+            (other_info.external_attr >> 16) & 0xFFFF,
+            stat.S_IFREG | 0o644,
         )
 
     def test_archive_and_checksum_verification_detect_tampering(self):

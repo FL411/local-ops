@@ -12,7 +12,6 @@ import ast
 import hashlib
 import json
 import os
-import plistlib
 import re
 import shutil
 import subprocess
@@ -23,7 +22,6 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 STATIC = ROOT / "static"
-INFO_PLIST = ROOT / "总控台.app" / "Contents" / "Info.plist"
 WINDOWS_RUNTIME_FILES = (
     "sysops.py",
     "tray.py",
@@ -131,15 +129,12 @@ def check_required_files() -> str:
         "requirements-dev.txt",
         "Makefile",
         "server.py",
-        "start.command",
         *WINDOWS_RUNTIME_FILES,
         "tests/test_server.py",
         "docs/screenshots/ops-launchpad.jpg",
         "docs/screenshots/ops-services.jpg",
         "static/index.html",
         "static/app.js",
-        "总控台.app/Contents/Info.plist",
-        "总控台.app/Contents/MacOS/launcher",
     )
     missing = [name for name in required if not (ROOT / name).is_file()]
     require(not missing, "缺少必要文件: " + ", ".join(missing))
@@ -156,7 +151,6 @@ def check_asset_provenance() -> str:
         for item in sorted(folder.rglob("*"))
         if item.is_file()
     ]
-    tracked.append(ROOT / "总控台.app" / "Contents" / "Resources" / "AppIcon.icns")
     missing = [
         item.relative_to(ROOT).as_posix()
         for item in tracked
@@ -216,23 +210,11 @@ def read_version() -> str:
 
 def check_version() -> str:
     version = read_version()
-    with INFO_PLIST.open("rb") as handle:
-        info = plistlib.load(handle)
-    short = str(info.get("CFBundleShortVersionString", "")).strip()
-    build = str(info.get("CFBundleVersion", "")).strip()
-    version_major_minor = tuple(version.split("-", 1)[0].split(".")[:2])
-    short_parts = tuple(short.split(".")[:2])
-    require(
-        len(short_parts) == 2 and short_parts == version_major_minor,
-        f"Info.plist 版本 {short!r} 与 VERSION {version!r} 的 major.minor 不一致",
-    )
-    require(build.isdigit() and int(build) > 0, "CFBundleVersion 必须是正整数")
-    require(info.get("CFBundleExecutable") == "launcher", "CFBundleExecutable 不是 launcher")
-    return f"VERSION={version}, app={short} ({build})"
+    return f"VERSION={version}"
 
 
 def check_python_syntax() -> str:
-    paths = [ROOT / "server.py"]
+    paths = [ROOT / name for name in ("server.py", "sysops.py", "tray.py", "launcher_check.py")]
     paths.extend(sorted((ROOT / "tools").glob("*.py")))
     paths.extend(sorted((ROOT / "tests").glob("test_*.py")))
     for path in paths:
@@ -413,27 +395,14 @@ def check_javascript_bindings() -> str:
 
 
 def check_shell_and_plist() -> str:
-    if os.name == "nt":
-        missing = [name for name in WINDOWS_RUNTIME_FILES
-                   if not (ROOT / name).is_file()]
-        require(not missing, "缺少 Windows 启动文件: " + ", ".join(missing))
-        launcher = (ROOT / "start.bat").read_text(
-            encoding="utf-8", errors="replace")
-        require("launcher_check.py" in launcher,
-                "start.bat 未调用 launcher_check.py")
-        return f"Windows {len(WINDOWS_RUNTIME_FILES)} 个启动/运行时文件"
-    if sys.platform != "darwin":
-        return "当前平台不执行 macOS 启动器语法检查"
-    shell_files = (
-        ROOT / "start.command",
-        ROOT / "总控台.app" / "Contents" / "MacOS" / "launcher",
-    )
-    for path in shell_files:
-        command_output(["/bin/bash", "-n", str(path)])
-        require(os.access(path, os.X_OK), f"{path.relative_to(ROOT)} 没有可执行权限")
-    plutil = shutil.which("plutil") or "/usr/bin/plutil"
-    command_output([plutil, "-lint", str(INFO_PLIST)])
-    return "2 个启动脚本 + Info.plist"
+    missing = [name for name in WINDOWS_RUNTIME_FILES
+               if not (ROOT / name).is_file()]
+    require(not missing, "缺少 Windows 启动文件: " + ", ".join(missing))
+    launcher = (ROOT / "start.bat").read_text(
+        encoding="utf-8", errors="replace")
+    require("launcher_check.py" in launcher,
+            "start.bat 未调用 launcher_check.py")
+    return f"Windows {len(WINDOWS_RUNTIME_FILES)} 个启动/运行时文件"
 
 
 def check_windows_acl_smoke() -> str:
@@ -619,11 +588,12 @@ def check_javascript_tests() -> str:
     files = sorted(str(path) for path in (ROOT / "tests" / "js").glob("*.test.mjs"))
     require(bool(files), "tests/js/ 下没有 .test.mjs 测试文件")
     output = command_output([node, "--test", *files])
-    match = re.search(r"# (pass)\s+(\d+)", output)
-    require(match is not None, "无法确认 node --test 结果")
-    passed = int(match.group(2))
-    require("# fail" not in output or re.search(r"# fail\s+0$", output, re.M),
-            "JavaScript 测试存在失败项")
+    passed_match = re.search(r"pass\s+(\d+)", output)
+    failed_match = re.search(r"fail\s+(\d+)", output)
+    require(passed_match is not None, "无法确认 node --test 结果")
+    passed = int(passed_match.group(1))
+    failed = int(failed_match.group(1)) if failed_match else 0
+    require(failed == 0, "JavaScript 测试存在失败项")
     return f"{passed} 个测试"
 
 

@@ -10,7 +10,7 @@
 - [ ] 候选 commit：`____________`
 - [ ] 发布范围已明确：个人备份 / 内部交付 / 公开发布 / 商业分发
 - [ ] `CHANGELOG.md` 已将本次变更从 Unreleased 移入对应版本和日期。
-- [ ] `VERSION`、`Info.plist`、发行包名、标签和发行说明的版本一致。
+- [ ] `VERSION`、发行包名、标签和发布说明的版本一致。
 - [ ] 根目录 MIT License 的版权主体与发布说明一致，发行负责人已确认其适用于本次项目自有代码和文档。
 - [ ] commit 作者、提交者和签名均为真实可追溯身份，不含 `your-email@example.com` 等占位信息。
 - [ ] 如果公开仓库名称、产品名或 Bundle ID 有变化，已在首个公开 Tag 前冻结并完成一致性核对。
@@ -18,9 +18,9 @@
 ## 2. 源码与自动检查
 
 - [ ] Git 工作区干净，没有未审查的改动。
-- [ ] `make release-check` 通过，完整输出已归档。
+- [ ] `python tools/check_project.py --release` 通过，完整输出已归档。
 - [ ] 测试数量大于 0，失败与错误均为 0。
-- [ ] Python、JavaScript、Bash、plist 和主题 JSON 语法检查通过。
+- [ ] Python、JavaScript 和主题 JSON 语法检查通过。
 - [ ] `static/icons.js` 与 `static/icons/*.svg` 同步。
 - [ ] 所有引用的静态字体、图像、主题和模块都存在。
 - [ ] `SECURITY.md`、`CONTRIBUTING.md`、`CODE_OF_CONDUCT.md` 和 `ASSET_PROVENANCE.md` 已通过复核并进入发行范围。
@@ -37,7 +37,7 @@
 - [ ] 两个总控台实例不能同时写同一配置，或已证明跨进程锁/合并策略正确。
 - [ ] 不会按端口误杀外部进程；所有 kill 都验证当前 UID 和受控身份。
 - [ ] 配置、日志和运行目录使用最小化权限，不对其他本机用户可读。
-- [ ] Windows 发布冒烟检查已通过：临时私有目录和文件的实际 DACL 非空，当前 SID 可创建、读取、覆盖和删除；`make release-check`（或 Windows 等价命令）已执行。
+- [ ] Windows 发布冒烟检查已通过：临时私有目录和文件的实际 DACL 非空，当前 SID 可创建、读取、覆盖和删除；`python tools/check_project.py --release`（或 Windows 等价命令）已执行。
 - [ ] `/api/health` 不执行 `ps/lsof`，并与 `/api/state` 一致返回当前 `VERSION`、`schemaVersion` 和降级原因。
 - [ ] 缺失的工作目录、脚本或运行时会在启动前阻止运行；服务重启预检失败时旧进程保持运行。
 - [ ] 任务 exit 0 / 130 / 其他非零 / 总控台中止分别显示成功 / 取消 / 失败 / 中止。
@@ -69,14 +69,14 @@
 - [ ] 用户向上滚动阅读日志时，自动刷新不会强制拉回底部。
 - [ ] `prefers-reduced-motion` 与高对比度/键盘焦点验收通过。
 
-## 6. macOS 安装包
+## 6. Windows 安装包
 
-- [ ] 在未安装开发工具、不存在旧 `data/` 的目标 macOS 版本上完成全新安装。
-- [ ] 如果交付声称“独立 App”，发行包已捆绑 Python 和所有必要文件，单独复制 `.app` 也能运行。
-- [ ] 如果仍是“完整项目目录”交付，README 和安装界面已明确说明 Python 3.12 和目录关系。
-- [ ] 缺少或版本不符的 Python 会显示可理解、可操作的错误，不会静默退出。
-- [ ] App 具有正确的 bundle id、版本、build 号、最低系统版本和图标。
-- [ ] 对外分发包已使用 Developer ID 签名、提交公证并完成 Gatekeeper 验证。
+- [ ] 在未预装开发工具、不存在旧用户数据的 Windows 10/11 上完成全新安装。
+- [ ] 发行包解压后可直接运行：`LocalOpsConsole.exe` 无窗口启动、`start.bat` 备用。
+- [ ] README 已明确说明需要 Python 3.12+，并勾选 Add python.exe to PATH。
+- [ ] 缺少或版本不符的 Python 会显示可理解、可操作的错误，不会静默崩溃。
+- [ ] 首次启动会把 `psutil>=7.2` 装进当前解释器；服务监控不出现「降级运行」。
+- [ ] 控制令牌仅当前用户可读；ACL 冒烟检查已通过。
 
 ## 7. 许可、隐私与发行包内容
 
@@ -86,7 +86,7 @@
 - [ ] 发行包只包含台账中已登记的字体；系统字体栈不以字体文件形式捆绑。
 - [ ] Logo、favicon 与 App Icon 来自同一获准发布的品牌主源，原始设计、导出过程、小尺寸验收和授权范围均已归档。
 - [ ] AI 生成插画已记录生成操作人、平台/模型、生成日期、原始输出、修改过程、适用条款和再分发依据；无法补齐者已替换。
-- [ ] 发行包不包含旧 `data/`、任何用户 Application Support/Library Logs 数据、`tmp/`、`__pycache__/`、`.DS_Store`、本地虚拟环境或覆盖率文件。
+- [ ] 发行包不包含旧 `data/`、任何 `%APPDATA%\总控台` / `%LOCALAPPDATA%\总控台` 用户数据、`tmp/`、`__pycache__/`、桌面.ini / Thumbs.db、本地虚拟环境或覆盖率文件。
 - [ ] 发行包不包含个人绝对路径、shell 命令、PID、run token、日志或用户图标。
 - [ ] README、Issue/PR 模板、示例 JSON、截图和录屏中的用户名、主目录和真实服务信息均已脱敏。
 - [ ] 用解压后的最终产物而不是开发工作区完成了验收。

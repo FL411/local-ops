@@ -5,7 +5,7 @@
 import { $, el, setText, setChildren, icon, escapeHtml,
   post, put, del, act, toast, openLayer, closeLayer,
   GLYPHS, findApp, bumpMutationEpoch, controlRequestHeaders,
-  controlTokenAvailable, CONTROL_READONLY_TEXT, IS_MAC } from './core.js';
+  controlTokenAvailable, CONTROL_READONLY_TEXT } from './core.js';
 
 /* ---------------- DOM 引用 ---------------- */
 const appModalMask = $('#appModalMask'), appModal = $('#appModal'), appModalTitle = $('#appModalTitle');
@@ -39,18 +39,8 @@ export function bumpIconVer(id) { iconVer.set(id, (iconVer.get(id) || 0) + 1); }
 export function getIconVer(id) { return iconVer.get(id) || 0; }
 
 /* 兼容尚未重启的旧后端；新后端会返回经过同样规则生成的 command。 */
-function shellQuotePath(path) {
-  return "'" + String(path).replace(/'/g, "'\"'\"'") + "'";
-}
 function fallbackScriptCommand(path) {
   const suffix = (String(path).match(/(\.[^./\\]+)$/) || [])[1]?.toLowerCase();
-  if (IS_MAC) {
-    const quoted = shellQuotePath(path);
-    if (suffix === '.py') return 'python3 -- ' + quoted;
-    if (suffix === '.zsh') return '/bin/zsh -- ' + quoted;
-    return '/bin/bash -- ' + quoted;
-  }
-  /* Windows:cmd 不识别单引号,用双引号;.bat/.cmd 直接执行。 */
   const quoted = '"' + String(path).replace(/"/g, '\\"') + '"';
   if (suffix === '.py') return 'python -- ' + quoted;
   if (suffix === '.ps1') return 'powershell -NoProfile -ExecutionPolicy Bypass -File ' + quoted;

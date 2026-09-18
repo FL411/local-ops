@@ -124,8 +124,8 @@ def ensure_runtime():
         print("ERROR Python 3.12+ required")
         return 1
     if sys.platform != "win32":
-        print("OK")
-        return 0
+        print("ERROR this build is Windows-only")
+        return 1
     if _psutil_importable_without_user_site():
         print("OK")
         return 0

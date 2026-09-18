@@ -1,38 +1,36 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""总控台跨平台系统操作层。
+"""总控台 Windows 系统操作层。
 
 在 server.py 与操作系统之间提供统一接口：进程快照、监听端口、进程
-工作目录、进程组识别、UID 概念、信号终止、单实例锁、系统对话框。
+工作目录、进程树识别、SID 归属、信号终止、单实例锁、系统对话框。
 
-设计原则：
-- POSIX（macOS）分支保持原实现：调用系统自带 ps/lsof/osascript，
-  保持“运行时零第三方依赖”；
-- Windows 分支基于 psutil（唯一运行时第三方依赖，pip install psutil），
-  用进程树（root pid 为锚点、沿 ppid 向上回溯）模拟 macOS 的
-  进程组语义；
-- 对外函数签名与返回结构与 server.py 原有调用保持一致，两个平台
-  的调用方代码无需分叉。
+本仓库是 Windows 专用版本。进程扫描基于 psutil（唯一运行时第三方依赖），
+用进程树（root pid 为锚点、沿 ppid 向上回溯）表达受控进程组。
+非 Windows 平台在导入时立即退出，并引导 macOS 用户使用上游仓库。
 """
 
 from __future__ import annotations
 
-import errno
 import os
-import re
 import signal
 import subprocess
 import sys
 import threading
 import time
 
+if sys.platform != "win32":
+    sys.stderr.write(
+        "总控台是 Windows 专用版本。macOS 请使用上游仓库: "
+        "https://github.com/laogou717/local-ops\n")
+    raise SystemExit(2)
+
 try:
     import psutil
-except ImportError:  # pragma: no cover - 仅 Windows 需要
+except ImportError:  # pragma: no cover - 首次启动由启动器安装
     psutil = None
 
-IS_WINDOWS = sys.platform == "win32"
-IS_POSIX = os.name == "posix"
+IS_WINDOWS = True
 
 LOG_LOCK = threading.RLock()
 
@@ -41,8 +39,6 @@ LOG_LOCK = threading.RLock()
 
 def _windows_process_sid(pid):
     """返回 Windows 进程 TokenUser SID 字符串；无法可靠读取时返回 None。"""
-    if not IS_WINDOWS:
-        return None
     try:
         import ctypes
         import ctypes.wintypes as wt
@@ -116,9 +112,7 @@ def _windows_process_sid(pid):
 
 
 def self_uid():
-    """当前用户身份标识（POSIX uid / Windows TokenUser SID）。"""
-    if IS_POSIX:
-        return os.getuid()
+    """当前用户身份标识（Windows TokenUser SID）。"""
     return _windows_process_sid(os.getpid())
 
 
@@ -139,23 +133,17 @@ def windows_system_dirs():
 
 
 def default_data_dir():
-    if IS_POSIX:
-        return os.path.expanduser("~/Library/Application Support/总控台")
     base = os.environ.get("APPDATA") or os.path.expanduser("~/AppData/Roaming")
     return os.path.join(base, "总控台")
 
 
 def default_logs_dir():
-    if IS_POSIX:
-        return os.path.expanduser("~/Library/Logs/总控台")
     base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~/AppData/Local")
     return os.path.join(base, "总控台")
 
 
 def _protect_private_windows_dacl(path):
     """将 Windows 路径 DACL 替换为仅当前 TokenUser SID 的受保护 ACL。"""
-    if not IS_WINDOWS:
-        return
     sid = SELF_UID
     if not isinstance(sid, str) or not sid:
         raise OSError("无法读取当前 Windows 用户 SID")
@@ -234,21 +222,17 @@ def _protect_private_windows_dacl(path):
 def protect_private_file(path):
     """将私有文件限制为当前用户可读写。"""
     os.chmod(path, 0o600)
-    if IS_WINDOWS:
-        _protect_private_windows_dacl(path)
+    _protect_private_windows_dacl(path)
 
 
 def protect_private_directory(path):
     """将私有目录限制为当前用户可访问，阻止令牌被替换或预先放置。"""
     os.chmod(path, 0o700)
-    if IS_WINDOWS:
-        _protect_private_windows_dacl(path)
+    _protect_private_windows_dacl(path)
 
 
 def windows_acl_ace_count(path):
-    """返回 Windows 路径实际 DACL 的 ACE 数量；非 Windows 返回 None。"""
-    if not IS_WINDOWS:
-        return None
+    """返回 Windows 路径实际 DACL 的 ACE 数量。"""
     try:
         import ctypes
         import ctypes.wintypes as wt
@@ -324,8 +308,7 @@ def windows_acl_ace_count(path):
 def acquire_lock(path):
     """获取单实例文件锁，返回保持打开的锁对象（进程退出自动释放）。
 
-    POSIX 用 flock；Windows 用 msvcrt.locking 锁首字节。
-    返回 None 表示已被其他实例持有。
+    Windows 用 msvcrt.locking 锁首字节。返回 None 表示已被其他实例持有。
     """
     directory = os.path.dirname(path) or "."
     try:
@@ -334,27 +317,6 @@ def acquire_lock(path):
     except OSError:
         return None
     lock_file = os.fdopen(fd, "r+", encoding="ascii")
-    if IS_POSIX:
-        import fcntl
-        try:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError as e:
-            lock_file.close()
-            if e.errno in (errno.EACCES, errno.EAGAIN):
-                return None
-            raise
-        try:
-            lock_file.seek(0)
-            lock_file.truncate()
-            lock_file.write("%d\n" % os.getpid())
-            lock_file.flush()
-            os.fsync(lock_file.fileno())
-        except OSError:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-            lock_file.close()
-            raise
-        return lock_file
-    # Windows: msvcrt.locking 一次锁 1 字节。
     # 先锁字节 0（固定位置）再写 pid：锁位置与 pid 字符串长度无关，
     # 避免不同位数 pid 的实例锁到不同字节导致单实例失效。
     # 未获锁的进程会在此抛 PermissionError，必须优雅返回 None；
@@ -383,16 +345,12 @@ def release_lock(lock_file):
     if lock_file is None:
         return
     try:
-        if IS_POSIX:
-            import fcntl
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-        else:
-            import msvcrt
-            try:
-                lock_file.seek(0)
-                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
-            except OSError:
-                pass
+        import msvcrt
+        try:
+            lock_file.seek(0)
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+        except OSError:
+            pass
     finally:
         try:
             lock_file.close()
@@ -424,14 +382,6 @@ def pid_alive(pid):
         return False
     if pid <= 0:
         return False
-    if IS_POSIX:
-        try:
-            os.kill(pid, 0)
-            return True
-        except PermissionError:
-            return True
-        except OSError:
-            return False
     try:
         return _psutil().pid_exists(pid)
     except Exception:
@@ -439,28 +389,12 @@ def pid_alive(pid):
 
 
 def process_uid(pid):
-    """返回进程 uid；进程不存在或不可读返回 None。"""
-    if IS_POSIX:
-        try:
-            r = subprocess.run(
-                ["ps", "-o", "uid=", "-p", str(int(pid))],
-                capture_output=True, text=True, timeout=5)
-        except Exception:
-            return None
-        toks = r.stdout.split()
-        if not toks:
-            return None
-        try:
-            return int(toks[0])
-        except ValueError:
-            return None
+    """返回进程 SID；进程不存在或不可读返回 None。"""
     return _windows_process_sid(pid)
 
 
 def _windows_path_owner_sid(path):
     """返回文件/目录所有者 SID；无法可靠读取时返回 None。"""
-    if not IS_WINDOWS:
-        return None
     try:
         import ctypes
         import ctypes.wintypes as wt
@@ -503,8 +437,6 @@ def _windows_path_owner_sid(path):
 def path_owned_by_current_user(path):
     """路径是否明确由当前用户拥有；身份未知必须返回 False。"""
     try:
-        if IS_POSIX:
-            return os.stat(path, follow_symlinks=False).st_uid == SELF_UID
         owner = _windows_path_owner_sid(path)
         return owner is not None and SELF_UID is not None and owner == SELF_UID
     except OSError:
@@ -512,90 +444,6 @@ def path_owned_by_current_user(path):
 
 
 # ------------------------------------------------------------------ 进程快照
-
-
-def _ps_snapshot_posix(pids=None, with_uid=True):
-    """原 macOS 实现：ps -ax -o pid[,uid],etime,%cpu,%mem,comm + pid,args。"""
-    def run(args):
-        try:
-            r = subprocess.run(args, capture_output=True, text=True,
-                               errors="replace", timeout=5)
-            return r.stdout or ""
-        except Exception:
-            return ""
-
-    base = ["ps"]
-    if pids is None:
-        base.append("-ax")
-    else:
-        pids = [int(p) for p in pids]
-        if not pids:
-            return {}
-        base += ["-p", ",".join(str(p) for p in pids)]
-    fields = ["pid"] + (["uid"] if with_uid else []) + \
-             ["etime", "%cpu", "%mem", "comm"]
-    out1 = run(base + ["-o", ",".join(fields)])
-    out2 = run(base + ["-o", "pid,args"])
-
-    def parse_etime(s):
-        try:
-            s = s.strip()
-            days = 0
-            if "-" in s:
-                d, s = s.split("-", 1)
-                days = int(d)
-            parts = [int(p) for p in s.split(":")]
-            if len(parts) == 2:
-                hours, minutes, secs = 0, parts[0], parts[1]
-            elif len(parts) == 3:
-                hours, minutes, secs = parts
-            else:
-                return 0
-            return days * 86400 + hours * 3600 + minutes * 60 + secs
-        except Exception:
-            return 0
-
-    snap = {}
-    fixed = 5 if with_uid else 4
-    for line in out1.splitlines():
-        toks = line.split()
-        if len(toks) < fixed + 1:
-            continue
-        try:
-            pid = int(toks[0])
-        except ValueError:
-            continue
-        i = 1
-        entry = {"args": ""}
-        if with_uid:
-            try:
-                entry["uid"] = int(toks[1])
-            except ValueError:
-                entry["uid"] = -1
-            i = 2
-        entry["etime"] = parse_etime(toks[i])
-        try:
-            entry["cpu"] = float(toks[i + 1])
-        except (TypeError, ValueError):
-            entry["cpu"] = 0.0
-        try:
-            entry["mem"] = float(toks[i + 2])
-        except (TypeError, ValueError):
-            entry["mem"] = 0.0
-        entry["comm"] = " ".join(toks[i + 3:])
-        snap[pid] = entry
-    for line in out2.splitlines():
-        toks = line.split(None, 1)
-        if not toks:
-            continue
-        try:
-            pid = int(toks[0])
-        except ValueError:
-            continue
-        if pid in snap:
-            snap[pid]["args"] = toks[1] if len(toks) > 1 else ""
-    return snap
-
 
 def _ps_snapshot_windows(pids=None, with_uid=True):
     """Windows 实现：psutil 遍历，etime 为秒（与 POSIX 语义一致）。
@@ -672,18 +520,14 @@ _CORE_COUNT = None
 
 
 def core_count():
-    """逻辑核心数。Windows 用于把 CPU 归一为「占全部核心百分比」，
-    与任务管理器口径一致（吃满 1 核 = 100/核心数 %）；macOS 保持
-    单核口径返回 1，避免改变原有展示语义。
+    """逻辑核心数。用于把 CPU 归一为「占全部核心百分比」，
+    与任务管理器口径一致（吃满 1 核 = 100/核心数 %）。
     """
     global _CORE_COUNT
     if _CORE_COUNT is None:
-        if IS_WINDOWS:
-            try:
-                _CORE_COUNT = _psutil().cpu_count() or 1
-            except Exception:
-                _CORE_COUNT = 1
-        else:
+        try:
+            _CORE_COUNT = _psutil().cpu_count() or 1
+        except Exception:
             _CORE_COUNT = 1
     return _CORE_COUNT
 
@@ -716,9 +560,7 @@ def _diff_cpu_windows(mono, samples):
 
 
 def ps_snapshot(pids=None, with_uid=True):
-    """批量进程信息 → {pid: {"uid","comm","args","cpu","mem","etime"}}。"""
-    if IS_POSIX:
-        return _ps_snapshot_posix(pids, with_uid)
+    """批量进程信息 → {pid: {"uid","comm","args","cpu","mem","etime","ctime"}}。"""
     return _ps_snapshot_windows(pids, with_uid)
 
 
@@ -726,43 +568,7 @@ def ps_snapshot(pids=None, with_uid=True):
 
 
 def scan_listeners():
-    """监听快照 → {(pid, port): {bind_host, ...}}。
-
-    POSIX 用 lsof；Windows 用 psutil.net_connections。
-    """
-    if IS_POSIX:
-        try:
-            r = subprocess.run(
-                ["lsof", "-iTCP", "-sTCP:LISTEN", "-P", "-n"],
-                capture_output=True, text=True, errors="replace", timeout=5)
-        except Exception:
-            return {}
-        found = {}
-        for line in r.stdout.splitlines():
-            if not line or line.startswith("COMMAND"):
-                continue
-            parts = line.split()
-            if len(parts) < 9:
-                continue
-            try:
-                pid = int(parts[1])
-            except ValueError:
-                continue
-            port = None
-            bind_host = None
-            for tok in reversed(parts):
-                m = re.search(r":(\d+)$", tok)
-                if m:
-                    port = int(m.group(1))
-                    bind_host = tok[:m.start()]
-                    if bind_host.startswith("[") and bind_host.endswith("]"):
-                        bind_host = bind_host[1:-1]
-                    break
-            if port is None:
-                continue
-            found.setdefault((pid, port), set()).add(bind_host or "")
-        return found
-
+    """监听快照 → {(pid, port): {bind_host, ...}}。"""
     mod = _psutil()
     found = {}
     try:
@@ -785,29 +591,10 @@ def scan_listeners():
 
 
 def lsof_cwds(pids):
-    """{pid: cwd}。POSIX 用 lsof -d cwd；Windows 用 psutil.Process.cwd()。"""
+    """{pid: cwd}。"""
     pids = [int(p) for p in pids]
     if not pids:
         return {}
-    if IS_POSIX:
-        try:
-            r = subprocess.run(
-                ["lsof", "-a", "-p", ",".join(str(p) for p in pids),
-                 "-d", "cwd", "-Fn"],
-                capture_output=True, text=True, errors="replace", timeout=5)
-        except Exception:
-            return {}
-        result = {}
-        cur = None
-        for line in r.stdout.splitlines():
-            if line.startswith("p"):
-                try:
-                    cur = int(line[1:])
-                except ValueError:
-                    cur = None
-            elif line.startswith("n") and cur is not None:
-                result[cur] = line[1:]
-        return result
     mod = _psutil()
     result = {}
     for pid in pids:
@@ -821,26 +608,6 @@ def lsof_cwds(pids):
 
 
 # ------------------------------------------------------------------ 进程组（PGID 语义）
-
-
-def _pgid_map_posix():
-    """ps -axo pid=,pgid= → {pgid: [pid, ...]}（macOS 原逻辑）。"""
-    groups = {}
-    try:
-        r = subprocess.run(["ps", "-axo", "pid=,pgid="],
-                           capture_output=True, text=True, timeout=5)
-    except Exception:
-        return groups
-    for line in r.stdout.splitlines():
-        parts = line.split()
-        if len(parts) != 2:
-            continue
-        try:
-            pid, pgid = int(parts[0]), int(parts[1])
-        except ValueError:
-            continue
-        groups.setdefault(pgid, []).append(pid)
-    return groups
 
 
 def _group_members_windows(root):
@@ -881,19 +648,12 @@ def _group_members_windows(root):
 
 
 def group_members(pgid):
-    """返回进程组/进程树的全部成员 pid 列表（不含过滤，含根）。"""
-    if IS_POSIX:
-        return _pgid_map_posix().get(int(pgid), [])
+    """返回进程树的全部成员 pid 列表（不含过滤，含根）。"""
     return _group_members_windows(pgid)
 
 
 def process_group_id(pid):
-    """返回进程所在进程组 id；POSIX 为 pgid，Windows 返回进程自身。"""
-    if IS_POSIX:
-        try:
-            return os.getpgid(int(pid))
-        except (ProcessLookupError, PermissionError, OSError):
-            return None
+    """返回进程组锚点；Windows 以进程自身 pid 为锚点。"""
     if pid_alive(pid):
         return int(pid)
     return None
@@ -923,36 +683,24 @@ def _wm_close_soft(pid):
 
 
 def signal_group(pgid, sig=signal.SIGTERM, members=None):
-    """向进程组/进程树发信号。返回 (ok, error)。
+    """向进程树发信号。返回 (ok, error)。
 
-    POSIX：os.killpg；Windows：对调用方已验证的冻结成员列表（未提供时
-    才重新扫描）逐个终止。非 force 时先走 WM_CLOSE 软通道（带窗口进程
-    可自行清理），宽限后对仍存活成员执行硬杀兜底。
+    对调用方已验证的冻结成员列表（未提供时才重新扫描）逐个终止。
+    非 force 时先走 WM_CLOSE 软通道（带窗口进程可自行清理），宽限后
+    对仍存活成员执行硬杀兜底。
     """
-    if IS_POSIX:
-        try:
-            os.killpg(int(pgid), sig)
-            return True, None
-        except ProcessLookupError:
-            return True, None
-        except PermissionError:
-            return False, "没有权限停止受控进程组"
-        except OSError as e:
-            return False, "停止受控进程组失败: %s" % e
     mod = _psutil()
-    # Windows 的 signal 模块没有 SIGKILL 常量（POSIX 专属），用数值 9 等价判断
+    # Windows 的 signal 模块没有 SIGKILL 常量，用数值 9 等价判断
     force = (sig == getattr(signal, "SIGKILL", 9))
     members = (list(members) if members is not None
                else _group_members_windows(pgid))
     if not members:
         return True, None
     if not force:
-        # 软终止阶段：WM_CLOSE 通道优先；无窗口进程静默失败。
         for pid in reversed(members):
             _wm_close_soft(pid)
         time.sleep(GRACE_SOFT_STOP_SEC)
     errors = []
-    # 完整树已冻结；从叶子到根终止，避免父进程先退出后丢失后代关联。
     for pid in reversed(members):
         try:
             proc = mod.Process(pid)
@@ -972,35 +720,15 @@ def signal_group(pgid, sig=signal.SIGTERM, members=None):
 
 
 def group_alive(pgid):
-    """进程组/树中是否仍有存活成员。"""
-    if IS_POSIX:
-        try:
-            os.killpg(int(pgid), 0)
-            return True
-        except ProcessLookupError:
-            return False
-        except (PermissionError, OSError):
-            return True
+    """进程树中是否仍有存活成员。"""
     return any(pid_alive(p) for p in _group_members_windows(pgid))
 
 
 def kill_process(pid, force):
     """结束单个进程。返回 (ok, error)；调用方需先完成用户归属校验。"""
     pid = int(pid)
-    if IS_POSIX:
-        sig = signal.SIGKILL if force else signal.SIGTERM
-        try:
-            os.kill(pid, sig)
-            return True, None
-        except ProcessLookupError:
-            return False, "进程不存在"
-        except PermissionError:
-            return False, "没有权限结束该进程"
-        except OSError as e:
-            return False, "结束失败: %s" % e
     mod = _psutil()
     if not force:
-        # 软终止阶段：WM_CLOSE 通道优先；进程若已退出则视为成功（幂等）。
         _wm_close_soft(pid)
         try:
             proc = mod.Process(pid)
@@ -1031,20 +759,11 @@ def kill_process(pid, force):
 def spawn_managed(command, cwd, env, marker, log_fd):
     """启动受控应用进程，返回 Popen 对象。
 
-    POSIX：双层 bash 包装（外层持有随机标记、等待内层后台作业），
-    独立会话（setsid）。Windows：cmd /c "echo <marker> & <command>"，
-    CREATE_NEW_PROCESS_GROUP + DETACHED_PROCESS 脱离控制台。
+    cmd /c "echo <marker> & <command>"，CREATE_NEW_PROCESS_GROUP +
+    DETACHED_PROCESS 脱离控制台。/c 后的命令必须作为原始命令行传给
+    CreateProcess；若使用 argv 列表，subprocess 会把内层引号转义成 \",
+    cmd 会将带空格的可执行路径误当成字面命令名。
     """
-    if IS_POSIX:
-        outer_script = '/bin/bash -c "$1"\nconsole_status=$?\nexit "$console_status"'
-        inner_script = (command + '\nconsole_status=$?\nwait\nexit "$console_status"')
-        return subprocess.Popen(
-            ["/bin/bash", "-c", outer_script, marker, inner_script],
-            cwd=cwd, stdout=log_fd, stderr=subprocess.STDOUT,
-            start_new_session=True, env=env)
-    # Windows：cmd 常驻外层，echo 携带标记供受控校验。/c 后的命令必须
-    # 作为原始命令行传给 CreateProcess；若使用 argv 列表，subprocess 会把
-    # 内层引号转义成 \"，cmd 会将带空格的可执行路径误当成字面命令名。
     inner = "echo %s & %s" % (marker, command)
     command_line = 'cmd.exe /d /s /c "%s"' % inner
     creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | \
@@ -1061,19 +780,6 @@ def spawn_managed(command, cwd, env, marker, log_fd):
 
 def pick_path(what):
     """打开系统文件/目录选择框。返回 (path|None, canceled)。"""
-    if IS_POSIX:
-        if what == "dir":
-            script = 'POSIX path of (choose folder with prompt "选择工作目录")'
-        else:
-            script = 'POSIX path of (choose file with prompt "选择批处理脚本")'
-        try:
-            r = subprocess.run(["osascript", "-e", script],
-                               capture_output=True, text=True, timeout=180)
-        except Exception:
-            return None, False
-        if r.returncode != 0:
-            return None, True
-        return r.stdout.strip().rstrip("/") or None, False
     return _pick_path_windows(what)
 
 
@@ -1102,23 +808,10 @@ def _pick_path_windows(what):
 
 def launcher_dialog(message):
     """多选对话框：返回 "取消"/"重新启动"/"打开控制台" 之一；失败返回 None。"""
-    if IS_POSIX:
-        script = """on run argv
-set messageText to item 1 of argv
-display dialog messageText with title "总控台" buttons {"取消", "重新启动", "打开控制台"} default button "打开控制台" cancel button "取消" with icon note
-return button returned of result
-end run"""
-        try:
-            r = subprocess.run(["osascript", "-e", script, message],
-                               capture_output=True, text=True, timeout=180)
-        except (OSError, subprocess.TimeoutExpired):
-            return None
-        return r.stdout.strip() if r.returncode == 0 else None
     try:
         import ctypes
         res = ctypes.windll.user32.MessageBoxW(
             0, message, "总控台", 0x00000040 | 0x00000002 | 0x00000000)
-        # 0x2 = AbortRetryIgnore 风格映射：3=重试(重新启动) 4=忽略(打开控制台)
         if res == 3:
             return "重新启动"
         if res == 4:
@@ -1130,16 +823,6 @@ end run"""
 
 def launcher_alert(message):
     """错误提示对话框；失败静默。"""
-    if IS_POSIX:
-        script = """on run argv
-display alert "总控台" message (item 1 of argv) as critical
-end run"""
-        try:
-            subprocess.run(["osascript", "-e", script, message],
-                           capture_output=True, timeout=30)
-        except (OSError, subprocess.TimeoutExpired):
-            pass
-        return
     try:
         import ctypes
         ctypes.windll.user32.MessageBoxW(0, message, "总控台", 0x00000010)
@@ -1148,10 +831,7 @@ end run"""
 
 
 def spawn_detached(args, cwd):
-    """启动完全脱离当前进程的新进程（POSIX 独立会话；Windows 独立进程组）。"""
-    if IS_POSIX:
-        return subprocess.Popen(args, cwd=cwd, start_new_session=True,
-                                close_fds=True)
+    """启动完全脱离当前进程的新进程（独立进程组、无窗口）。"""
     creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | \
         getattr(subprocess, "DETACHED_PROCESS", 0) | \
         getattr(subprocess, "CREATE_NO_WINDOW", 0)

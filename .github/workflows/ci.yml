@@ -9,48 +9,13 @@ permissions:
   contents: read
 
 jobs:
-  check-and-release:
-    name: Check and release audit
-    runs-on: macos-15
-    timeout-minutes: 20
-    env:
-      PYTHONDONTWRITEBYTECODE: "1"
-      SOURCE_DATE_EPOCH: "1704067200"
-
-    steps:
-      - name: Check out source
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          persist-credentials: false
-
-      - name: Set up Python 3.12
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
-        with:
-          python-version: "3.12"
-
-      - name: Show toolchain
-        run: |
-          python --version
-          node --version
-
-      - name: Run project checks
-        run: make check PYTHON=python
-
-      - name: Build and verify release
-        run: |
-          make release PYTHON=python
-          make release-verify PYTHON=python
-          cp dist/console-*.zip "$RUNNER_TEMP/console-first.zip"
-          make release PYTHON=python
-          cmp "$RUNNER_TEMP/console-first.zip" dist/console-*.zip
-          make release-verify PYTHON=python
-
-  windows-release-smoke:
-    name: Windows release smoke
+  windows-check:
+    name: Windows check and release audit
     runs-on: windows-latest
     timeout-minutes: 20
     env:
       PYTHONDONTWRITEBYTECODE: "1"
+      SOURCE_DATE_EPOCH: "1704067200"
 
     steps:
       - name: Check out source
@@ -71,7 +36,10 @@ jobs:
           python --version
           node --version
 
-      - name: Run Windows release checks
+      - name: Run project checks
+        run: python tools\check_project.py
+
+      - name: Build and verify release
         run: |
           python tools\build_release.py --check-only
           python tools\check_project.py --release
