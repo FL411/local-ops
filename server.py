@@ -479,6 +479,16 @@ def migrate_config(raw):
     return migrated, source_version
 
 
+def _load_config_raw(path):
+    """Read a config JSON object. Missing or invalid files return None."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+        return None
+    return raw if isinstance(raw, dict) else None
+
+
 class Config:
     """配置读写：显式 schema 迁移 + 原子写 + 上一份良好备份。"""
 
@@ -596,38 +606,43 @@ class Config:
             LOG.exception("配置恢复/迁移落盘失败")
 
 
+    def _apps_from_raw(self, raw):
+        restored = []
+        if not isinstance(raw, dict) or not isinstance(raw.get("apps"), list):
+            return restored
+        for item in raw["apps"]:
+            if not isinstance(item, dict) or not item.get("id"):
+                continue
+            app = dict(self.APP_DEFAULT)
+            for key in app:
+                if key in item:
+                    app[key] = item[key]
+            restored.append(app)
+        return restored
+
+    def _read_disk_apps(self):
+        """Read launchpad cards from this config path. Backup only if main is unreadable."""
+        raw = _load_config_raw(self._path)
+        if raw is None:
+            raw = _load_config_raw(self._path + ".bak")
+        return self._apps_from_raw(raw)
+
     def restore_apps_from_disk_if_empty(self):
         """内存应用列表为空但磁盘仍有卡片时，只把 apps 从文件读回。
 
         与 update() 共用 _lock：删光卡片的落盘会先完成，随后读到的也是空列表，
-        不会把用户刚删除的卡片救回来。
+        不会把用户刚删除的卡片救回来。主文件可读且为空时不以备份覆盖。
         """
         with self._lock:
             if self._data.get("apps"):
                 return False
-            try:
-                with open(self._path, "r", encoding="utf-8") as f:
-                    raw = json.load(f)
-            except (OSError, UnicodeError, json.JSONDecodeError,
-                    TypeError, ValueError):
-                return False
-            if not isinstance(raw, dict) or not isinstance(raw.get("apps"), list):
-                return False
-            restored = []
-            for item in raw["apps"]:
-                if not isinstance(item, dict) or not item.get("id"):
-                    continue
-                app = dict(self.APP_DEFAULT)
-                for key in app:
-                    if key in item:
-                        app[key] = item[key]
-                restored.append(app)
+            restored = self._read_disk_apps()
             if not restored:
                 return False
             self._data["apps"] = restored
             LOG.warning(
-                "restored %d apps from disk (in-memory list was empty)",
-                len(restored))
+                "restored %d apps from disk (in-memory list was empty): %s",
+                len(restored), self._path)
             return True
 
     def snapshot(self):
@@ -646,6 +661,9 @@ class Config:
                 "recoveredFromBackup": self._recovered_from_backup,
                 "migratedFromSchema": self._migration_from,
                 "issues": list(self._health_issues),
+                "configPath": self._path,
+                "memoryAppCount": len(self._data.get("apps") or []),
+                "diskAppCount": _disk_configured_app_count(self._path),
             }
 
     def update(self, fn):
@@ -656,6 +674,16 @@ class Config:
             previous = json.loads(json.dumps(self._data, ensure_ascii=False))
             try:
                 result = fn(self._data)
+                # 内存与修改前都没有卡片时，不要把磁盘上仍在的卡片写成空列表。
+                # 真正删光最后一张卡片时 previous["apps"] 非空，仍会正常落盘。
+                if (not (self._data.get("apps") or [])
+                        and not (previous.get("apps") or [])):
+                    disk_apps = self._read_disk_apps()
+                    if disk_apps:
+                        self._data["apps"] = disk_apps
+                        LOG.warning(
+                            "kept %d disk apps while persisting config (memory list was empty)",
+                            len(disk_apps))
                 payload = self._payload(self._data)
                 previous_payload = self._payload(previous)
                 # 先保存上一份良好内容，再替换主文件。
@@ -1570,11 +1598,14 @@ def _finish_state_refresh(state, generation):
 
 def _refresh_state(cfg, console_port, generation, raise_errors=False):
     try:
-        restore = getattr(cfg, "restore_apps_from_disk_if_empty", None)
-        if callable(restore):
-            restore()
-        # Config 锁与缓存锁绝不同时持有。
+        # 先 snapshot，再按需恢复：避免 update() 持锁等待 snapshot 时
+        # restore() 先抢同一把配置锁造成死锁。
         cfg_snapshot = cfg.snapshot()
+        restore = getattr(cfg, "restore_apps_from_disk_if_empty", None)
+        if callable(restore) and not (cfg_snapshot.get("apps") or []):
+            if restore():
+                cfg_snapshot = cfg.snapshot()
+        # Config 锁与缓存锁绝不同时持有。
         config_health = cfg.health_info()
         state = build_state(cfg_snapshot, console_port, config_health)
         attached_repairs = state.pop("_attachedRepairs", [])
@@ -1619,16 +1650,30 @@ def warm_state_cache(cfg, console_port):
     return True
 
 
+def _snapshot_lacks_disk_apps(cfg, cached):
+    """True when a launchpad snapshot is empty but this config file still has cards."""
+    if not isinstance(cached, dict) or "apps" not in cached:
+        return False
+    if cached.get("apps"):
+        return False
+    path = getattr(cfg, "path", None)
+    if not isinstance(path, str) or not path:
+        return False
+    return _disk_configured_app_count(path) > 0
+
+
 def get_state_snapshot(cfg, console_port):
     now = time.monotonic()
     build_here = False
     start_background = False
     with _state_cache_ready:
         cached = _state_cache.get("state")
-        if (cached is not None
+        usable = (cached is not None
+                  and not _snapshot_lacks_disk_apps(cfg, cached))
+        if (usable
                 and now - _state_cache.get("mono", 0.0) < STATE_CACHE_TTL):
             return cached
-        if cached is not None:
+        if usable:
             if not _state_cache.get("building"):
                 generation = _state_cache.get("generation", 0)
                 _state_cache["building"] = True
@@ -1641,14 +1686,16 @@ def get_state_snapshot(cfg, console_port):
             build_here = True
         else:
             deadline = time.monotonic() + STATE_CACHE_INITIAL_WAIT
-            while (_state_cache.get("state") is None
+            while ((_state_cache.get("state") is None
+                    or _snapshot_lacks_disk_apps(cfg, _state_cache.get("state")))
                    and _state_cache.get("building")):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise TimeoutError("等待首份状态快照超时")
+                    break
                 _state_cache_ready.wait(remaining)
             cached = _state_cache.get("state")
-            if cached is not None:
+            if (cached is not None
+                    and not _snapshot_lacks_disk_apps(cfg, cached)):
                 return cached
             generation = _state_cache.get("generation", 0)
             _state_cache["building"] = True
@@ -4280,11 +4327,7 @@ def find_console_instances():
 def _disk_configured_app_count(path=None):
     """Count app cards in the on-disk config without mutating memory."""
     path = path or CONFIG_PATH
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            raw = json.load(f)
-    except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
-        return 0
+    raw = _load_config_raw(path)
     if not isinstance(raw, dict) or not isinstance(raw.get("apps"), list):
         return 0
     return sum(1 for item in raw["apps"]
@@ -4520,7 +4563,14 @@ def _run_console(preferred_port=None, open_browser=True):
     start_log_maintenance()
     cfg = Config(CONFIG_PATH)
     cfg.restore_apps_from_disk_if_empty()
-    print("已加载 %d 个应用卡片" % len(cfg.snapshot().get("apps") or []), flush=True)
+    loaded = len(cfg.snapshot().get("apps") or [])
+    disk_apps = _disk_configured_app_count(cfg.path)
+    print("已加载 %d 个应用卡片（磁盘 %d，%s）" %
+          (loaded, disk_apps, cfg.path), flush=True)
+    if loaded == 0 and disk_apps > 0:
+        LOG.warning(
+            "launchpad still empty after restore: memory=0 disk=%d path=%s",
+            disk_apps, cfg.path)
     control_token = load_control_token(os.path.join(DATA_DIR, "control.token"))
 
     server, port = None, None
