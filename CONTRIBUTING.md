@@ -1,6 +1,6 @@
 # 参与贡献
 
-感谢你帮助改进总控台。项目仍处于 Preview / Alpha 阶段，优先接受范围清晰、可验证且不扩大安全边界的改动。
+感谢你帮助改进总控台。项目仍处于 Preview / Alpha 阶段，并且只维护 Windows 10/11。优先接受范围清晰、可验证且不扩大安全边界的改动。
 
 > **维护立场**：本仓库由作者个人维护，PR 不承诺审阅或合入。希望增加功能、适配其他平台的朋友，请优先 Fork 自行修改，并在 Discussions 提交衍生版本说明（详见 README 的「维护说明」与「社区衍生版本」）。以下规范供提交讨论与 Fork 开发参考。
 
@@ -28,8 +28,9 @@ python -m pip install -r requirements-dev.txt
 
 ## 修改原则
 
-- 后端保持 Python 标准库实现；前端保持原生 ES Modules、无 CDN、无构建。
-- 不得削弱回环绑定、当前 UID、run token、进程组、Host/Origin 或控制令牌等安全校验。
+- 后端除 `psutil` 外保持 Python 标准库实现；前端保持原生 ES Modules、无 CDN、无构建。
+- 不得削弱回环绑定、TokenUser SID、run token、进程树、Host/Origin 或控制令牌等安全校验。
+- 不引入 macOS/Linux 运行分支；其他平台用户应使用上游项目或自行维护 Fork。
 - 不得按端口直接结束未知进程。
 - 配置变更必须有明确 `schemaVersion`、幂等迁移和升级测试。
 - DOM 列表应按 key 原地更新，避免轮询造成整表闪烁。

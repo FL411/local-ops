@@ -1,6 +1,7 @@
-# 交接文档 — local-ops(总控台)Windows 移植版
+# 历史交接记录 — local-ops（总控台）Windows 移植
 
-> 最后更新:2026-08-13 03:00 | 接手前请先通读本文件 + `README.md` + `CHANGELOG.md`
+> **历史资料，不代表当前支持范围或待办状态。** 当前仓库仅支持 Windows 10/11；现行开发约束以 `README.md`、`AGENTS.md`、`CONTRIBUTING.md` 与 `CHANGELOG.md` 为准。
+> 原记录最后更新:2026-08-13 03:00。
 
 ## 1. 项目是什么
 

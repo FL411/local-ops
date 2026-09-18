@@ -11,6 +11,7 @@
 ### Changed
 
 - **仓库定位为纯 Windows 版本**：不再维护 macOS 运行路径。非 Windows 系统启动时立即退出，并引导使用上游 [laogou717/local-ops](https://github.com/laogou717/local-ops)。CI、发布检查与启动器均只覆盖 Windows 10/11。
+- **仓库说明统一为 Windows-only**：README、贡献指南、安全政策、发布清单、PR 模板与 GitHub About 统一使用 Windows 数据目录、TokenUser SID、进程树和 Windows 验证命令；旧移植/审计文档明确标注为历史资料。
 - **启动台配置以磁盘为准**：`/api/state` 的进程/端口扫描仍使用缓存，但每次响应都从磁盘 `config.json` 重建启动台卡片；`Config.snapshot()` 与 `Config.update()` 也会先同步磁盘，避免旧进程内存或缓存中的空 `apps` 覆盖已保存卡片。
 
 ### Removed
