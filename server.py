@@ -147,6 +147,9 @@ def configure_console_encoding():
             pass
 
 
+configure_console_encoding()
+
+
 def is_current_user(identity):
     """严格判断进程身份是否属于当前用户。
 

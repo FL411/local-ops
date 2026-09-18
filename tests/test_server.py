@@ -549,7 +549,8 @@ class RuntimeStorageTests(unittest.TestCase):
                        CONSOLE_LOG_DIR=logs)
             result = subprocess.run(
                 [sys.executable, server.__file__, "--prepare-storage"],
-                cwd=td, env=env, capture_output=True, text=True, timeout=5)
+                cwd=td, env=env, capture_output=True, text=True,
+                encoding="utf-8", timeout=5)
 
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertTrue(os.path.isdir(target))
@@ -569,7 +570,8 @@ class RuntimeStorageTests(unittest.TestCase):
                        CONSOLE_LOG_DIR=os.path.join(td, "logs"))
             result = subprocess.run(
                 [sys.executable, server.__file__, "--prepare-storage"],
-                cwd=td, env=env, capture_output=True, text=True, timeout=5)
+                cwd=td, env=env, capture_output=True, text=True,
+                encoding="utf-8", timeout=5)
             self.assertNotEqual(result.returncode, 0)
             self.assertNotIn("总控台已启动", result.stdout + result.stderr)
 
@@ -588,7 +590,8 @@ class RuntimeStorageTests(unittest.TestCase):
             )
             result = subprocess.run(
                 [sys.executable, "-c", script], cwd=server.BASE_DIR,
-                env=env, capture_output=True, text=True, timeout=5)
+                env=env, capture_output=True, text=True,
+                encoding="utf-8", timeout=5)
 
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout, "")
@@ -1329,6 +1332,16 @@ class ConsoleStartupTests(unittest.TestCase):
             encoding="utf-8", errors="replace")
         stderr.reconfigure.assert_called_once_with(
             encoding="utf-8", errors="replace")
+
+    def test_module_import_upgrades_cp1252_console_to_utf8(self):
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "cp1252"
+        completed = subprocess.run(
+            [sys.executable, "-c",
+             r"import server; print('\u53d1\u73b0\u6b8b\u7559')"],
+            cwd=server.BASE_DIR, env=env, capture_output=True, timeout=15)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("发现残留", completed.stdout.decode("utf-8"))
 
     def test_default_config_opens_browser(self):
         self.assertEqual(self._run_console(open_browser=True), 1)
