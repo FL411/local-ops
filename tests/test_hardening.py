@@ -1095,7 +1095,7 @@ class StateCacheTests(unittest.TestCase):
             third = server.get_state_snapshot(cfg, 9600)
         self.assertEqual(third, {"built": 1, "port": 9600})
 
-    def test_empty_cached_state_rebuilds_when_disk_has_apps(self):
+    def test_cached_state_overlays_disk_apps_without_rebuild(self):
         with tempfile.TemporaryDirectory() as td:
             path = os.path.join(td, "config.json")
             payload = {
@@ -1115,24 +1115,31 @@ class StateCacheTests(unittest.TestCase):
             cfg._data["apps"] = []
             server._state_cache.update({
                 "mono": time.monotonic(),
-                "state": {"apps": [], "services": []},
+                "state": {"apps": [], "services": [{"pid": 1}],
+                           "port": 9600},
+                "listeners": set(),
+                "groups": {},
                 "building": False,
                 "generation": 0,
             })
-            calls = []
 
-            def fake_build(cfg_snapshot, port, health=None):
-                calls.append(len(cfg_snapshot.get("apps") or []))
-                return {
-                    "apps": list(cfg_snapshot.get("apps") or []),
-                    "port": port,
-                }
+            def fake_build_apps(cfg_snapshot, listeners, groups=None,
+                                attached_repairs=None):
+                return [{
+                    "id": app["id"],
+                    "name": app.get("name"),
+                    "running": False,
+                } for app in cfg_snapshot.get("apps") or []]
 
-            with mock.patch.object(server, "build_state", side_effect=fake_build):
+            with mock.patch.object(server, "build_state") as build_state, \
+                    mock.patch.object(server, "build_apps",
+                                      side_effect=fake_build_apps) as build_apps:
                 state = server.get_state_snapshot(cfg, 9600)
-            self.assertEqual(calls, [1])
+            build_state.assert_not_called()
+            self.assertTrue(build_apps.called)
             self.assertEqual(len(state["apps"]), 1)
             self.assertEqual(state["apps"][0]["id"], "abcd1234")
+            self.assertEqual(state["services"], [{"pid": 1}])
 
     def test_config_update_invalidates_cache(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1146,7 +1153,9 @@ class StateCacheTests(unittest.TestCase):
                 self.assertEqual(len(calls), 1)
                 cfg.update(lambda d: d.__setitem__("uiTheme", "custom"))
                 stale = server.get_state_snapshot(cfg, 9600)
-                self.assertEqual(stale, {"built": 1, "port": 9600})
+                self.assertEqual(stale["built"], 1)
+                self.assertEqual(stale["port"], 9600)
+                self.assertEqual(stale["uiTheme"], "custom")
                 deadline = time.monotonic() + 2
                 while server._state_cache.get("building") and time.monotonic() < deadline:
                     time.sleep(0.01)
@@ -1359,6 +1368,51 @@ class ConsoleSelfHealTests(unittest.TestCase):
             cfg = server.Config(path)
             cfg._data["apps"] = []
             self.assertFalse(cfg.restore_apps_from_disk_if_empty())
+            self.assertEqual(cfg.snapshot()["apps"], [])
+
+    def test_snapshot_rereads_apps_from_disk_without_restore(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "config.json")
+            payload = {
+                "schemaVersion": 1,
+                "apps": [{
+                    "id": "abcd1234", "name": "demo",
+                    "command": "python app.py",
+                    "cwd": td, "port": 8000, "kind": "service",
+                }],
+                "hidden": [], "pinned": [], "promoted": [],
+                "watchedKeywords": [], "uiTheme": "ops",
+                "openBrowser": True,
+            }
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh)
+            cfg = server.Config(path)
+            cfg._data["apps"] = []
+            snap = cfg.snapshot()
+            self.assertEqual(snap["apps"][0]["id"], "abcd1234")
+            self.assertEqual(cfg._data["apps"][0]["id"], "abcd1234")
+
+    def test_snapshot_ignores_backup_when_main_is_empty(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "config.json")
+            empty = {
+                "schemaVersion": 1,
+                "apps": [],
+                "hidden": [], "pinned": [], "promoted": [],
+                "watchedKeywords": [], "uiTheme": "ops",
+                "openBrowser": True,
+            }
+            backup = dict(empty)
+            backup["apps"] = [{
+                "id": "abcd1234", "name": "demo",
+                "command": "python app.py",
+                "cwd": td, "port": 8000, "kind": "service",
+            }]
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(empty, fh)
+            with open(path + ".bak", "w", encoding="utf-8") as fh:
+                json.dump(backup, fh)
+            cfg = server.Config(path)
             self.assertEqual(cfg.snapshot()["apps"], [])
 
     def test_restore_uses_backup_only_if_main_unreadable(self):
