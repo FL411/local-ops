@@ -490,7 +490,8 @@ def _ps_snapshot_windows(pids=None, with_uid=True):
             cmdline = info["cmdline"] or []
             if not cmdline and wanted is not None:
                 cmdline = [info["name"] or ""]
-            args = " ".join(str(t) for t in cmdline)
+            argv = [str(t) for t in cmdline]
+            args = " ".join(argv)
             comm = info["exe"] or info["name"] or ""
             create_time = info["create_time"]
             etime = int(max(0.0, now - create_time)) if create_time else 0
@@ -500,6 +501,9 @@ def _ps_snapshot_windows(pids=None, with_uid=True):
                 "uid": _windows_process_sid(pid) if with_uid else -1,
                 "comm": comm,
                 "args": args,
+                # Preserve argument boundaries for security-sensitive process
+                # identification. The display-oriented args string is lossy.
+                "argv": argv,
                 "cpu": cpu_by_pid.get(pid, 0.0),
                 "mem": round(info["memory_percent"] or 0.0, 2),
                 "etime": etime,
@@ -562,7 +566,7 @@ def _diff_cpu_windows(mono, samples):
 
 
 def ps_snapshot(pids=None, with_uid=True):
-    """批量进程信息 → {pid: {"uid","comm","args","cpu","mem","etime","ctime"}}。"""
+    """批量进程信息，包含展示用 args 与保留参数边界的 argv。"""
     return _ps_snapshot_windows(pids, with_uid)
 
 

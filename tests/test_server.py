@@ -40,33 +40,25 @@ class OriginAttributionTests(unittest.TestCase):
             (100, 90, "node server.mjs --open"),
             (90, 80, "node npm exec"),
             (80, 70, "pnpm dev"),
-            (70, 60, "-zsh"),
-            (60, 1, "/usr/local/bin/codex"),
+            (70, 60, "node.exe wrapper.js"),
+            (60, 1, r"C:\Tools\codex.exe"),
         )
         origin = server.attribute_origin(100, table)
         self.assertEqual(origin, {"label": "Codex", "icon": "bot"})
 
-    def test_vscode_bundle_is_named_and_uses_code_icon(self):
+    def test_vscode_executable_is_named_and_uses_code_icon(self):
         table = self.table(
-            (100, 90, "python3 -m http.server 8000"),
-            (90, 80, "-zsh"),
-            (80, 1, "/Applications/Visual Studio Code.app/Contents/MacOS/Electron"),
+            (100, 90, "python.exe -m http.server 8000"),
+            (90, 80, "node.exe wrapper.js"),
+            (80, 1, r'"C:\Program Files\Microsoft VS Code\Code.exe"'),
         )
         origin = server.attribute_origin(100, table)
         self.assertEqual(origin, {"label": "VS Code", "icon": "code"})
 
-    def test_iterm_bundle_uses_terminal_icon(self):
-        table = self.table(
-            (100, 90, "-zsh"),
-            (90, 1, "/Applications/iTerm.app/Contents/MacOS/iTerm2"),
-        )
-        origin = server.attribute_origin(100, table)
-        self.assertEqual(origin, {"label": "iTerm", "icon": "terminal"})
-
     def test_console_run_token_marks_console_as_origin(self):
         table = self.table(
-            (100, 90, "python3 -m http.server 8377"),
-            (90, 1, "/bin/bash -c outer console-run:tok123 inner"),
+            (100, 90, "python.exe -m http.server 8377"),
+            (90, 1, "cmd.exe /d /s /c outer console-run:tok123 inner"),
         )
         origin = server.attribute_origin(100, table)
         self.assertEqual(origin, {"label": "总控台", "icon": "rocket"})
@@ -74,7 +66,7 @@ class OriginAttributionTests(unittest.TestCase):
     def test_unknown_middle_process_is_named_honestly(self):
         table = self.table(
             (100, 90, "node server.js"),
-            (90, 1, "/opt/homebrew/bin/mise run dev"),
+            (90, 1, r"C:\Tools\mise.exe run dev"),
         )
         origin = server.attribute_origin(100, table)
         self.assertEqual(origin, {"label": "mise", "icon": "package"})
@@ -102,8 +94,8 @@ class OriginAttributionTests(unittest.TestCase):
         # 未识别的中间层继续上爬，优先报告真正的 AI 助手
         table = self.table(
             (100, 90, "node server.js"),
-            (90, 80, "/opt/homebrew/bin/mise run dev"),
-            (80, 1, "/usr/local/bin/claude"),
+            (90, 80, r"C:\Tools\mise.exe run dev"),
+            (80, 1, r"C:\Tools\claude.exe"),
         )
         origin = server.attribute_origin(100, table)
         self.assertEqual(origin, {"label": "Claude Code", "icon": "bot"})
@@ -1176,14 +1168,18 @@ class IconTests(unittest.TestCase):
 class ConsoleRestartTests(unittest.TestCase):
     def test_instance_discovery_is_limited_to_same_project(self):
         snap = {
-            71001: {"uid": server.SELF_UID, "args": "python3 server.py",
-                    "etime": 10},
-            71002: {"uid": server.SELF_UID, "args": "python3 server.py",
-                    "etime": 20},
-            71003: {"uid": str(server.SELF_UID) + "-other", "args": "python3 server.py",
-                    "etime": 30},
-            71004: {"uid": server.SELF_UID, "args": "python3 server.py --launcher",
-                    "etime": 40},
+            71001: {"uid": server.SELF_UID, "comm": "pythonw.exe",
+                    "argv": ["pythonw.exe", "server.py"],
+                    "args": "pythonw.exe server.py", "etime": 10},
+            71002: {"uid": server.SELF_UID, "comm": "python.exe",
+                    "argv": ["python.exe", "server.py"],
+                    "args": "python.exe server.py", "etime": 20},
+            71003: {"uid": str(server.SELF_UID) + "-other",
+                    "comm": "python.exe", "argv": ["python.exe", "server.py"],
+                    "args": "python.exe server.py", "etime": 30},
+            71004: {"uid": server.SELF_UID, "comm": "python3.12.exe",
+                    "argv": ["python3.12.exe", "server.py", "--launcher"],
+                    "args": "python3.12.exe server.py --launcher", "etime": 40},
         }
         with mock.patch.object(server, "ps_snapshot", return_value=snap), \
                 mock.patch.object(server, "lsof_cwds", return_value={
@@ -1197,6 +1193,24 @@ class ConsoleRestartTests(unittest.TestCase):
         self.assertEqual([item["pid"] for item in found], [71001, 71004])
         self.assertEqual(found[0]["ports"], [9600])
         self.assertEqual(found[1]["ports"], [9601])
+
+    def test_instance_discovery_rejects_commands_that_only_mention_server(self):
+        snap = {
+            71011: {"uid": server.SELF_UID, "comm": "pwsh.exe",
+                    "argv": ["pwsh.exe", "-Command", "inspect server.py"],
+                    "args": "pwsh.exe -Command inspect server.py", "etime": 1},
+            71012: {"uid": server.SELF_UID, "comm": "python.exe",
+                    "argv": ["python.exe", "-c", "print('server.py')"],
+                    "args": "python.exe -c print('server.py')", "etime": 1},
+            71013: {"uid": server.SELF_UID, "comm": "python.exe",
+                    "argv": ["python.exe", "server.py", "--restart-helper"],
+                    "args": "python.exe server.py --restart-helper", "etime": 1},
+        }
+        with mock.patch.object(server, "ps_snapshot", return_value=snap), \
+                mock.patch.object(server, "lsof_cwds") as cwds, \
+                mock.patch.object(server, "scan_listeners", return_value={}):
+            self.assertEqual(server.find_console_instances(), [])
+        cwds.assert_not_called()
 
     def test_panel_restart_spawns_helper_before_shutdown(self):
         class FakeServer:

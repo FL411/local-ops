@@ -153,8 +153,8 @@ configure_console_encoding()
 def is_current_user(identity):
     """严格判断进程身份是否属于当前用户。
 
-    Windows 使用 SID，POSIX 使用 uid。身份未知时必须拒绝，不能把
-    ``None == None`` 误判为同一用户。
+    Windows 使用 SID。身份未知时必须拒绝，不能把 ``None == None``
+    误判为同一用户。
     """
     return identity is not None and SELF_UID is not None and identity == SELF_UID
 
@@ -297,7 +297,7 @@ def migrate_legacy_runtime_data(
         legacy_data_dir=LEGACY_DATA_DIR,
         data_overridden=DATA_DIR_OVERRIDDEN,
         logs_overridden=LOGS_DIR_OVERRIDDEN):
-    """首次运行时将项目内旧数据复制到 macOS 用户目录。
+    """首次运行时将项目内旧数据复制到 Windows 用户数据目录。
 
     只在对应目标完全不存在且没有显式环境变量覆盖时执行。
     旧文件不会被删除或改权限。
@@ -686,24 +686,6 @@ class Config:
             self._migration_from = source_version
         return True
 
-    def restore_apps_from_disk_if_empty(self):
-        """内存应用列表为空但磁盘仍有卡片时，把配置从文件读回。
-
-        与 update() 共用 _lock：删光卡片的落盘会先完成，随后读到的也是空列表，
-        不会把用户刚删除的卡片救回来。主文件可读且为空时不以备份覆盖。
-        """
-        with self._lock:
-            if self._data.get("apps"):
-                return False
-            self._reload_from_disk_unlocked()
-            restored = self._data.get("apps") or []
-            if not restored:
-                return False
-            LOG.warning(
-                "restored %d apps from disk (in-memory list was empty): %s",
-                len(restored), self._path)
-            return True
-
     def snapshot(self):
         """返回当前磁盘配置的深拷贝（数据均为 JSON 可序列化）。"""
         with self._lock:
@@ -794,7 +776,7 @@ def acquire_instance_lock(path=INSTANCE_LOCK_PATH):
     Port fallback alone is not a single-instance guarantee: two servers on
     :9600/:9601 would still update the same config.  The lock ties exclusivity
     to this data directory and is released automatically if the process
-    crashes (POSIX flock / Windows msvcrt 均由 sysops 封装)。
+    crashes (Windows msvcrt locking 由 sysops 封装)。
     """
     return sysops.acquire_lock(path)
 
@@ -855,8 +837,8 @@ def scan_listeners():
 def listener_open_host(listeners, port, pids=None):
     """返回浏览器访问监听端口时应使用的本地主机名。
 
-    macOS 上有些开发服务器只绑定 IPv6 回环 ``::1``；这时
-    ``127.0.0.1`` 会直接拒绝连接，而 ``localhost`` 能正确解析到它。
+    有些开发服务器只绑定 IPv6 回环 ``::1``；这时 ``127.0.0.1``
+    会直接拒绝连接，而 ``localhost`` 能正确解析到它。
     对旧测试/旧调用传入的 set 快照则保持原来的 IPv4 默认值。
     """
     if not isinstance(listeners, dict):
@@ -881,7 +863,7 @@ def listener_open_host(listeners, port, pids=None):
 
 
 def ps_snapshot(pids=None, with_uid=True):
-    """批量进程信息 → {pid: {"uid","comm","args","cpu","mem","etime"}}。
+    """批量进程信息，包含展示用 args 与保留参数边界的 argv。
 
     平台实现见 sysops：psutil（comm 为 exe 路径，etime 单位为秒）。
     """
@@ -953,7 +935,7 @@ def project_name(cwd):
 
 # ---------------------------------------------------------------- 进程溯源
 # 沿 PPID 链向上识别「是谁启动了这个服务」：AI 编程助手、编辑器、终端、
-# 总控台自身或 launchd。结果只是展示用的尽力判断，不影响任何启停逻辑。
+# 总控台自身。结果只是展示用的尽力判断，不影响任何启停逻辑。
 
 # 向上爬时要跳过的包装层（按 argv[0] 基名匹配）：壳、包管理器与任务执行器
 _ORIGIN_SKIP_NAMES = {
@@ -982,36 +964,7 @@ _ORIGIN_AGENT_PATTERNS = (
     (re.compile(r"\bcodebuddy\b", re.I), "CodeBuddy"),
 )
 
-# .app 包名 → (展示名, 图标)。未列出的包按原名 + package 图标展示
-_ORIGIN_APP_ALIASES = {
-    "visual studio code": ("VS Code", "code"),
-    "visual studio code - insiders": ("VS Code", "code"),
-    "cursor": ("Cursor", "code"),
-    "trae": ("Trae", "code"),
-    "windsurf": ("Windsurf", "code"),
-    "zed": ("Zed", "code"),
-    "sublime text": ("Sublime", "code"),
-    "webstorm": ("WebStorm", "code"),
-    "intellij idea": ("IDEA", "code"),
-    "goland": ("GoLand", "code"),
-    "pycharm": ("PyCharm", "code"),
-    "nova": ("Nova", "code"),
-    "xcode": ("Xcode", "code"),
-    "iterm2": ("iTerm", "terminal"),
-    "iterm": ("iTerm", "terminal"),
-    "terminal": ("终端", "terminal"),
-    "warp": ("Warp", "terminal"),
-    "kitty": ("kitty", "terminal"),
-    "alacritty": ("Alacritty", "terminal"),
-    "wezterm": ("WezTerm", "terminal"),
-    "docker": ("Docker", "package"),
-    "ollama": ("Ollama", "package"),
-    "obsidian": ("Obsidian", "package"),
-}
-_ORIGIN_BUNDLE_RE = re.compile(r"/([^/]+)\.app/Contents/MacOS/", re.I)
-
 # Windows 可执行文件名（去掉 .exe 后的小写基名）→ (展示名, 图标)。
-# 与 macOS 的 .app 别名表对应，让溯源标签在 Windows 上同样可读。
 _WINDOWS_ORIGIN_ALIASES = {
     "code": ("VS Code", "code"),
     "code - insiders": ("VS Code", "code"),
@@ -1066,7 +1019,6 @@ def origin_snapshot(pids=None):
     """
     table = {}
     mod = sysops._psutil()
-    mod = sysops._psutil()
     if pids is None:
         processes = mod.process_iter(["pid", "ppid", "cmdline"])
         for proc in processes:
@@ -1104,7 +1056,7 @@ def attribute_origin(pid, table):
     祖先 args 中带有总控台 run-token 前缀（console-run:）即判定为
     「总控台启动」——本机任一总控台实例的受管进程组都持有该标记。
     未识别的中间层先记为候选并继续上爬；AI 助手 / 编辑器 / 终端 /
-    总控台 / launchd 是更优答案，都没有时才以最近的未识别进程命名。
+    总控台是更优答案，都没有时才以最近的未识别进程命名。
     最多上爬 12 层，遇到环或缺失即终止。
     """
     cur, seen, candidate = pid, set(), None
@@ -1125,12 +1077,6 @@ def attribute_origin(pid, table):
         for pattern, label in _ORIGIN_AGENT_PATTERNS:
             if pattern.search(hay):
                 return {"label": label, "icon": "bot"}
-        bundle = _ORIGIN_BUNDLE_RE.search(parent_args)
-        if bundle:
-            app_name = bundle.group(1)
-            label, icon = _ORIGIN_APP_ALIASES.get(
-                app_name.casefold(), (app_name, "package"))
-            return {"label": label, "icon": icon}
         # 可执行路径可能含空格并被引号包裹，split()[0] 会截断；
         # 用引号感知解析出完整 exe 路径。
         m = re.match(r'\s*(?:"([^"]*)"|(\S+))', parent_args)
@@ -1569,8 +1515,8 @@ def build_state(cfg, console_port, config_health=None):
         "uiTheme": cfg.get("uiTheme") or DEFAULT_UI_THEME,
         "openBrowser": bool(cfg.get("openBrowser", True)),
         "themes": list_themes(),
-        # Windows 上 CPU 为「占全部核心百分比」（任务管理器口径），
-        # coreCount 供前端把迷你条还原为相对满核宽度；macOS 为 1 保持原语义。
+        # CPU 为「占全部核心百分比」（任务管理器口径），coreCount 供前端
+        # 把迷你条还原为相对满核宽度。
         "coreCount": sysops.core_count(),
     }
     # 仅在有可修复身份时附带内部字段；_refresh_state 在序列化前取走它。
@@ -4321,17 +4267,40 @@ def open_browser_later(port, token, delay=0.8):
     threading.Thread(target=_open, daemon=True).start()
 
 
+_PYTHON_PROCESS_RE = re.compile(
+    r"python(?:w)?(?:\d+(?:\.\d+)*)?\.exe\Z", re.IGNORECASE)
+
+
+def _is_console_server_process(info):
+    """只识别解释器直接执行本项目 server.py 的进程。
+
+    args 是为展示拼接的字符串，参数边界已经丢失，不能用于决定是否杀进程。
+    argv 来自 psutil.cmdline()，因此 PowerShell 文本或 ``python -c`` 代码里
+    即使出现 server.py 也不会被误判。
+    """
+    executable = os.path.basename(info.get("comm") or "")
+    argv = info.get("argv")
+    if not _PYTHON_PROCESS_RE.fullmatch(executable):
+        return False
+    if not isinstance(argv, list) or len(argv) < 2:
+        return False
+    script = argv[1]
+    return (isinstance(script, str)
+            and os.path.basename(script).casefold() == "server.py")
+
+
 def find_console_instances():
     """查找从同一项目目录启动的总控台，用于双击启动器去重。"""
     snap = ps_snapshot(None, with_uid=True)
     candidates = []
     for pid, info in snap.items():
-        args = info.get("args") or ""
         if (pid == SELF_PID or not is_current_user(info.get("uid"))
-                or "server.py" not in args
-                or "--restart-helper" in args):
+                or not _is_console_server_process(info)
+                or "--restart-helper" in (info.get("argv") or [])):
             continue
         candidates.append(pid)
+    if not candidates:
+        return []
     cwds = lsof_cwds(candidates)
     listener_map = {}
     for pid, port in scan_listeners():
@@ -4471,8 +4440,8 @@ def _reap_console_pids(pids, force=False):
 def reap_stale_console_processes():
     """Kill same-project leftover/unhealthy console processes.
 
-    Only current-user processes whose cwd is this project and whose command
-    contains server.py. Returns True if any stale process was reaped.
+    Only current-user Python processes directly executing this project's
+    server.py are eligible. Returns True if any stale process was reaped.
     """
     instances = find_console_instances()
     if not instances:
@@ -4644,7 +4613,6 @@ def _run_console(preferred_port=None, open_browser=True,
     startup_disk_apps = require_expected_disk_apps(
         CONFIG_PATH, expected_app_count)
     cfg = Config(CONFIG_PATH)
-    cfg.restore_apps_from_disk_if_empty()
     loaded = len(cfg.snapshot().get("apps") or [])
     disk_apps = _disk_configured_app_count(cfg.path)
     required_apps = max(int(expected_app_count), startup_disk_apps)

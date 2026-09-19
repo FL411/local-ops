@@ -1384,6 +1384,12 @@ class WindowsProcessSnapshotTests(unittest.TestCase):
             server.sysops.process_uid(os.getpid()), server.sysops.SELF_UID)
         self.assertFalse(server.is_current_user(None))
 
+    def test_snapshot_preserves_argv_boundaries(self):
+        snapshot = server.sysops._ps_snapshot_windows({os.getpid()})
+        self.assertIn(os.getpid(), snapshot)
+        self.assertIsInstance(snapshot[os.getpid()]["argv"], list)
+        self.assertGreaterEqual(len(snapshot[os.getpid()]["argv"]), 1)
+
     def test_targeted_snapshot_skips_pid_that_exits_before_lookup(self):
         fake_psutil = mock.Mock()
         fake_psutil.Process.side_effect = server.sysops.psutil.NoSuchProcess(
@@ -1580,36 +1586,6 @@ class ConsoleSelfHealTests(unittest.TestCase):
                         self.assertTrue(server.reap_stale_console_processes())
                         reap.assert_called_once_with([22], force=True)
 
-    def test_restore_apps_from_disk_when_memory_empty(self):
-        with tempfile.TemporaryDirectory() as td:
-            path = os.path.join(td, "config.json")
-            payload = {
-                "schemaVersion": 1,
-                "apps": [{
-                    "id": "abcd1234", "name": "demo",
-                    "command": "python app.py",
-                    "cwd": td, "port": 8000, "kind": "service",
-                }],
-                "hidden": [], "pinned": [], "promoted": [],
-                "watchedKeywords": [], "uiTheme": "ops",
-                "openBrowser": True,
-            }
-            with open(path, "w", encoding="utf-8") as fh:
-                json.dump(payload, fh)
-            cfg = server.Config(path)
-            cfg._data["apps"] = []
-            self.assertTrue(cfg.restore_apps_from_disk_if_empty())
-            self.assertEqual(cfg.snapshot()["apps"][0]["id"], "abcd1234")
-            self.assertFalse(cfg.restore_apps_from_disk_if_empty())
-
-    def test_restore_does_not_invent_apps_when_disk_empty(self):
-        with tempfile.TemporaryDirectory() as td:
-            path = os.path.join(td, "config.json")
-            cfg = server.Config(path)
-            cfg._data["apps"] = []
-            self.assertFalse(cfg.restore_apps_from_disk_if_empty())
-            self.assertEqual(cfg.snapshot()["apps"], [])
-
     def test_snapshot_rereads_apps_from_disk_without_restore(self):
         with tempfile.TemporaryDirectory() as td:
             path = os.path.join(td, "config.json")
@@ -1655,7 +1631,7 @@ class ConsoleSelfHealTests(unittest.TestCase):
             cfg = server.Config(path)
             self.assertEqual(cfg.snapshot()["apps"], [])
 
-    def test_restore_uses_backup_only_if_main_unreadable(self):
+    def test_snapshot_uses_backup_only_if_main_unreadable(self):
         with tempfile.TemporaryDirectory() as td:
             path = os.path.join(td, "config.json")
             payload = {
@@ -1678,7 +1654,6 @@ class ConsoleSelfHealTests(unittest.TestCase):
             with open(path, "w", encoding="utf-8") as fh:
                 fh.write("{")
             cfg._data["apps"] = []
-            self.assertTrue(cfg.restore_apps_from_disk_if_empty())
             self.assertEqual(cfg.snapshot()["apps"][0]["id"], "abcd1234")
 
     def test_update_does_not_clobber_disk_apps_when_memory_empty(self):
