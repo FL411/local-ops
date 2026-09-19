@@ -79,16 +79,36 @@ def _read_json(port, path, timeout):
 
 
 def _configured_app_count():
-    try:
-        with open(_config_path(), "r", encoding="utf-8") as fh:
-            raw = json.load(fh)
-    except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
-        return 0
-    apps = raw.get("apps") if isinstance(raw, dict) else None
-    if not isinstance(apps, list):
-        return 0
-    return sum(1 for app in apps
-               if isinstance(app, dict) and app.get("id"))
+    """Return disk card count, or None when an existing config is unreadable.
+
+    A missing config is a valid first-run empty state. If the main file is
+    unreadable, a valid backup is still accepted; only when every existing
+    candidate is unreadable do we return None so startup fails closed instead
+    of silently presenting an empty console.
+    """
+    paths = (_config_path(), _config_path() + ".bak")
+    found_candidate = False
+    for path in paths:
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                raw = json.load(fh)
+        except FileNotFoundError:
+            continue
+        except (OSError, UnicodeError, json.JSONDecodeError, TypeError,
+                ValueError):
+            found_candidate = True
+            continue
+        found_candidate = True
+        if not isinstance(raw, dict):
+            continue
+        apps = raw.get("apps")
+        if not isinstance(apps, list):
+            # Config.normalize treats a missing/non-list apps field as the
+            # default empty list, so this is still a valid empty config.
+            return 0
+        return sum(1 for app in apps
+                   if isinstance(app, dict) and app.get("id"))
+    return None if found_candidate else 0
 
 
 def _console_status(port, disk_app_count=None):
@@ -98,6 +118,8 @@ def _console_status(port, disk_app_count=None):
         return None
     if disk_app_count is None:
         disk_app_count = _configured_app_count()
+    if disk_app_count is None:
+        return "STALE"
     if disk_app_count <= 0:
         return "RUNNING"
 
@@ -167,11 +189,16 @@ def _start_console_candidate(expected_app_count, preferred_port=None):
 def launch_console(preferred_port=None, attempts=LAUNCH_ATTEMPTS,
                    wait_sec=LAUNCH_WAIT_SEC):
     """Start and verify a non-empty console, retrying one stale candidate."""
-    expected_app_count = _configured_app_count()
     for _ in range(max(1, int(attempts))):
         status, port = find_console_status()
         if status == "RUNNING":
             return port
+        # Read immediately before each candidate. This is intentionally not
+        # inherited from the old server process: a restart can be triggered
+        # precisely while that process has a stale in-memory snapshot.
+        expected_app_count = _configured_app_count()
+        if expected_app_count is None:
+            return None
         try:
             candidate = _start_console_candidate(
                 expected_app_count, preferred_port)

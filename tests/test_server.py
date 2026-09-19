@@ -1188,7 +1188,22 @@ class ConsoleRestartTests(unittest.TestCase):
         self.assertEqual(helper_pid, 72001)
         command = popen.call_args.args[0]
         self.assertIn("--restart-helper", command)
-        self.assertEqual(command[-2:], ["9603", "1"])
+        self.assertEqual(command[-2:], [str(server.SELF_PID), "9603"])
+        fake_server.cfg.snapshot.assert_not_called()
+
+    def test_restart_helper_delegates_to_disk_aware_launcher(self):
+        fake_proc = mock.Mock()
+        with mock.patch.object(server, "pid_alive", return_value=False), \
+                mock.patch.object(server.subprocess, "Popen",
+                                  return_value=fake_proc) as popen:
+            self.assertEqual(server.restart_helper(71001, 9603), 0)
+
+        command = popen.call_args.args[0]
+        self.assertEqual(
+            command[-3:],
+            [os.path.join(server.BASE_DIR, "launcher_check.py"),
+             "launch", "9603"])
+        self.assertNotIn("--expected-app-count", command)
 
     def test_panel_stop_shuts_down_after_response_window(self):
         class FakeServer:

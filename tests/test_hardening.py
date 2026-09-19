@@ -226,6 +226,26 @@ class LauncherCapabilityTokenTests(unittest.TestCase):
         self.assertEqual(start.call_count, 2)
         start.assert_has_calls([mock.call(1, None), mock.call(1, None)])
 
+    def test_unreadable_existing_config_fails_closed(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "config.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("{not-json")
+            with mock.patch.object(launcher_check, "_config_path",
+                                   return_value=path):
+                self.assertIsNone(launcher_check._configured_app_count())
+
+    def test_valid_backup_is_used_when_main_config_is_unreadable(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "config.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("{not-json")
+            with open(path + ".bak", "w", encoding="utf-8") as fh:
+                json.dump({"apps": [{"id": "saved-card"}]}, fh)
+            with mock.patch.object(launcher_check, "_config_path",
+                                   return_value=path):
+                self.assertEqual(launcher_check._configured_app_count(), 1)
+
     def test_candidate_receives_expected_count_and_never_opens_browser(self):
         process = mock.Mock()
         with mock.patch.object(launcher_check, "_pythonw_executable",

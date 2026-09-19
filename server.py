@@ -498,7 +498,10 @@ def _load_config_raw(path):
     try:
         with open(path, "r", encoding="utf-8") as f:
             raw = json.load(f)
+    except FileNotFoundError:
+        return None
     except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+        LOG.warning("读取配置失败: %s", path, exc_info=True)
         return None
     return raw if isinstance(raw, dict) else None
 
@@ -4480,11 +4483,9 @@ def launcher_main():
 
 def schedule_console_restart(server, preferred_port):
     """启动独立 helper，响应发出后关闭当前 HTTP 服务。"""
-    expected_app_count = len(server.cfg.snapshot().get("apps") or [])
     helper = sysops.spawn_detached(
         [sys.executable, os.path.abspath(__file__), "--restart-helper",
-         str(SELF_PID), str(int(preferred_port)),
-         str(expected_app_count)], BASE_DIR)
+         str(SELF_PID), str(int(preferred_port))], BASE_DIR)
 
     def _shutdown():
         time.sleep(0.25)
@@ -4501,20 +4502,28 @@ def schedule_console_stop(server):
     threading.Thread(target=_shutdown, daemon=True).start()
 
 
-def restart_helper(old_pid, preferred_port, expected_app_count=0):
-    """等旧进程释放端口后，原地重启新总控台（Windows 用独立进程接管）。"""
+def restart_helper(old_pid, preferred_port):
+    """等旧进程退出后，交给独立启动器重新读盘并启动总控台。"""
     deadline = time.monotonic() + 12.0
     while time.monotonic() < deadline and pid_alive(old_pid):
         time.sleep(0.1)
     if pid_alive(old_pid):
         return 1
-    args = [sys.executable, os.path.abspath(__file__),
-            "--preferred-port", str(int(preferred_port)), "--no-browser",
-            "--expected-app-count", str(max(0, int(expected_app_count)))]
-    # pythonw 无控制台：必须带 --log-to-file 重定向 stdout/stderr，
-    # 否则 print/logging 写入无效句柄，日志不可见且可能拖垮请求线程。
-    args.append("--log-to-file")
-    subprocess.Popen(args, cwd=BASE_DIR, close_fds=True)
+    launcher_python = sys.executable
+    if os.path.basename(launcher_python).lower() == "pythonw.exe":
+        console_python = os.path.join(os.path.dirname(launcher_python),
+                                      "python.exe")
+        if os.path.isfile(console_python):
+            launcher_python = console_python
+    args = [launcher_python, os.path.join(BASE_DIR, "launcher_check.py"),
+            "launch", str(int(preferred_port))]
+    # 让独立启动器重新读取磁盘配置，并由它计算 expected-app-count。
+    # 标准输出不继承 pythonw 的无效句柄；候选服务自己会写 console.log。
+    subprocess.Popen(
+        args, cwd=BASE_DIR, close_fds=True,
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     return 0
 
 
@@ -4711,10 +4720,9 @@ if __name__ == "__main__":
         try:
             old = int(sys.argv[index + 1])
             preferred = int(sys.argv[index + 2])
-            expected = int(sys.argv[index + 3])
         except (ValueError, IndexError):
             sys.exit(2)
-        sys.exit(restart_helper(old, preferred, expected))
+        sys.exit(restart_helper(old, preferred))
     else:
         preferred = None
         if "--preferred-port" in sys.argv:
