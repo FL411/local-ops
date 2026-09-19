@@ -7,6 +7,7 @@
 
     python launcher_check.py status          -> RUNNING <port> | STALE <port> | STOPPED
     python launcher_check.py ensure-runtime  -> OK | ERROR ...
+    python launcher_check.py launch [port]   -> RUNNING <port> | ERROR ...
     python launcher_check.py open <port>     -> 打开浏览器
     python launcher_check.py restart <port>  -> POST /api/console/restart
 
@@ -21,13 +22,17 @@ import subprocess
 import sys
 import re
 import sysconfig
+import time
 import urllib.parse
 import urllib.request
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PORT_START = 9600
 PORT_TRIES = 10
 HEALTH_TIMEOUT = 1.0
 STATE_TIMEOUT = 5.0
+LAUNCH_ATTEMPTS = 2
+LAUNCH_WAIT_SEC = 15.0
 CONTROL_TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{32,128}\Z")
 
 
@@ -141,6 +146,49 @@ def find_console_port():
     return port
 
 
+def _pythonw_executable():
+    candidate = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+    return candidate if os.path.isfile(candidate) else sys.executable
+
+
+def _start_console_candidate(expected_app_count, preferred_port=None):
+    args = [
+        _pythonw_executable(), os.path.join(BASE_DIR, "server.py"),
+        "--no-browser", "--log-to-file",
+        "--expected-app-count", str(max(0, int(expected_app_count))),
+    ]
+    if isinstance(preferred_port, int):
+        args.extend(["--preferred-port", str(preferred_port)])
+    return subprocess.Popen(
+        args, cwd=BASE_DIR, close_fds=True,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+
+
+def launch_console(preferred_port=None, attempts=LAUNCH_ATTEMPTS,
+                   wait_sec=LAUNCH_WAIT_SEC):
+    """Start and verify a non-empty console, retrying one stale candidate."""
+    expected_app_count = _configured_app_count()
+    for _ in range(max(1, int(attempts))):
+        status, port = find_console_status()
+        if status == "RUNNING":
+            return port
+        try:
+            candidate = _start_console_candidate(
+                expected_app_count, preferred_port)
+        except OSError:
+            continue
+        deadline = time.monotonic() + max(0.1, float(wait_sec))
+        while time.monotonic() < deadline:
+            status, port = find_console_status()
+            if status == "RUNNING":
+                return port
+            if candidate.poll() is not None:
+                break
+            time.sleep(0.25)
+    status, port = find_console_status()
+    return port if status == "RUNNING" else None
+
+
 PSUTIL_SPEC = "psutil>=7.2"
 
 
@@ -214,6 +262,14 @@ def main(argv):
             port = None
     if port is None:
         port = find_console_port()
+
+    if action == "launch":
+        port = launch_console(port)
+        if port is None:
+            print("ERROR console failed readiness check")
+            return 1
+        print("RUNNING %d" % port)
+        return 0
 
     if action == "open":
         if port is None:

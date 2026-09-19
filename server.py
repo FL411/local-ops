@@ -4303,6 +4303,26 @@ def _disk_configured_app_count(path=None):
                if isinstance(item, dict) and item.get("id"))
 
 
+def require_expected_disk_apps(path, expected_count, timeout=3.0):
+    """Refuse to expose an empty console when the launcher saw disk cards."""
+    try:
+        expected_count = max(0, int(expected_count))
+    except (TypeError, ValueError):
+        expected_count = 0
+    if expected_count == 0:
+        return 0
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    while True:
+        actual = _disk_configured_app_count(path)
+        if actual >= expected_count:
+            return actual
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                "启动前配置校验失败：启动器检测到 %d 张卡片，当前进程只读到 %d 张" %
+                (expected_count, actual))
+        time.sleep(0.1)
+
+
 def _http_json_localhost(port, path, timeout):
     url = "http://127.0.0.1:%d%s" % (int(port), path)
     try:
@@ -4460,9 +4480,11 @@ def launcher_main():
 
 def schedule_console_restart(server, preferred_port):
     """启动独立 helper，响应发出后关闭当前 HTTP 服务。"""
+    expected_app_count = len(server.cfg.snapshot().get("apps") or [])
     helper = sysops.spawn_detached(
         [sys.executable, os.path.abspath(__file__), "--restart-helper",
-         str(SELF_PID), str(int(preferred_port))], BASE_DIR)
+         str(SELF_PID), str(int(preferred_port)),
+         str(expected_app_count)], BASE_DIR)
 
     def _shutdown():
         time.sleep(0.25)
@@ -4479,7 +4501,7 @@ def schedule_console_stop(server):
     threading.Thread(target=_shutdown, daemon=True).start()
 
 
-def restart_helper(old_pid, preferred_port):
+def restart_helper(old_pid, preferred_port, expected_app_count=0):
     """等旧进程释放端口后，原地重启新总控台（Windows 用独立进程接管）。"""
     deadline = time.monotonic() + 12.0
     while time.monotonic() < deadline and pid_alive(old_pid):
@@ -4487,7 +4509,8 @@ def restart_helper(old_pid, preferred_port):
     if pid_alive(old_pid):
         return 1
     args = [sys.executable, os.path.abspath(__file__),
-            "--preferred-port", str(int(preferred_port)), "--no-browser"]
+            "--preferred-port", str(int(preferred_port)), "--no-browser",
+            "--expected-app-count", str(max(0, int(expected_app_count)))]
     # pythonw 无控制台：必须带 --log-to-file 重定向 stdout/stderr，
     # 否则 print/logging 写入无效句柄，日志不可见且可能拖垮请求线程。
     args.append("--log-to-file")
@@ -4528,7 +4551,8 @@ def _start_autostart_thread(cfg):
                      name="console-autostart", daemon=True).start()
 
 
-def _run_console(preferred_port=None, open_browser=True):
+def _run_console(preferred_port=None, open_browser=True,
+                 expected_app_count=0):
     configure_console_encoding()
     logging.basicConfig(
         level=logging.INFO,
@@ -4536,6 +4560,7 @@ def _run_console(preferred_port=None, open_browser=True):
     for private_dir in (DATA_DIR, ICONS_DIR, LOGS_DIR):
         _ensure_private_dir(private_dir)
     start_log_maintenance()
+    require_expected_disk_apps(CONFIG_PATH, expected_app_count)
     cfg = Config(CONFIG_PATH)
     cfg.restore_apps_from_disk_if_empty()
     loaded = len(cfg.snapshot().get("apps") or [])
@@ -4637,7 +4662,8 @@ def redirect_console_output():
         os.close(fd)
 
 
-def main(preferred_port=None, open_browser=True, log_to_file=False):
+def main(preferred_port=None, open_browser=True, log_to_file=False,
+         expected_app_count=0):
     """Run exactly one console for this project/data directory."""
     configure_console_encoding()
     migration = prepare_runtime_storage()
@@ -4668,7 +4694,7 @@ def main(preferred_port=None, open_browser=True, log_to_file=False):
             print("发现残留总控台进程，正在清理: %s" %
                   ", ".join(str(pid) for pid in pids), flush=True)
             _reap_console_pids(pids, force=True)
-        _run_console(preferred_port, open_browser)
+        _run_console(preferred_port, open_browser, expected_app_count)
         return True
     finally:
         release_instance_lock(instance_lock)
@@ -4685,9 +4711,10 @@ if __name__ == "__main__":
         try:
             old = int(sys.argv[index + 1])
             preferred = int(sys.argv[index + 2])
+            expected = int(sys.argv[index + 3])
         except (ValueError, IndexError):
             sys.exit(2)
-        sys.exit(restart_helper(old, preferred))
+        sys.exit(restart_helper(old, preferred, expected))
     else:
         preferred = None
         if "--preferred-port" in sys.argv:
@@ -4696,9 +4723,17 @@ if __name__ == "__main__":
                 preferred = int(sys.argv[index + 1])
             except (ValueError, IndexError):
                 sys.exit(2)
+        expected_app_count = 0
+        if "--expected-app-count" in sys.argv:
+            index = sys.argv.index("--expected-app-count")
+            try:
+                expected_app_count = max(0, int(sys.argv[index + 1]))
+            except (ValueError, IndexError):
+                sys.exit(2)
         # --log-to-file：无窗口后台运行（Windows pythonw / start.bat），
         # 输出写入 LOGS_DIR/console.log，避免无控制台时 print 崩溃。
         log_to_file = "--log-to-file" in sys.argv
         main(preferred_port=preferred,
              open_browser="--no-browser" not in sys.argv,
-             log_to_file=log_to_file)
+             log_to_file=log_to_file,
+             expected_app_count=expected_app_count)

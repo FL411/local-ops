@@ -1172,6 +1172,9 @@ class ConsoleRestartTests(unittest.TestCase):
         class FakeServer:
             def __init__(self):
                 self.stopped = threading.Event()
+                self.cfg = mock.Mock()
+                self.cfg.snapshot.return_value = {
+                    "apps": [{"id": "saved-card"}]}
 
             def shutdown(self):
                 self.stopped.set()
@@ -1185,7 +1188,7 @@ class ConsoleRestartTests(unittest.TestCase):
         self.assertEqual(helper_pid, 72001)
         command = popen.call_args.args[0]
         self.assertIn("--restart-helper", command)
-        self.assertEqual(command[-1], "9603")
+        self.assertEqual(command[-2:], ["9603", "1"])
 
     def test_panel_stop_shuts_down_after_response_window(self):
         class FakeServer:

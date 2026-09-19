@@ -1,8 +1,7 @@
 // LocalOps console launcher
 // Double-click LocalOpsConsole.exe to start the console in background:
-// it probes pythonw (py launcher -> PATH python), starts
-// "pythonw server.py --log-to-file" with no window, and exits.
-// If the console is already running, server.py itself opens the browser.
+// it probes Python (py launcher -> PATH python), starts and verifies the
+// background server, then opens only a ready console.
 // Build: see build_launcher.bat (uses system .NET Framework csc.exe).
 using System;
 using System.Diagnostics;
@@ -21,14 +20,12 @@ public static class Launcher
                             "LocalOps Console", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             return 1;
         }
-        // 参数透传:支持 --no-browser(静默启动,不自动打开浏览器)等 server 参数。
-        string extra = "";
+        bool noBrowser = Array.IndexOf(args, "--no-browser") >= 0;
+        string preferredPort = "";
         foreach (string a in args)
         {
-            if (a == "--no-browser" || a.StartsWith("--preferred-port="))
-            {
-                extra += " " + a;
-            }
+            if (a.StartsWith("--preferred-port="))
+                preferredPort = a.Substring("--preferred-port=".Length);
         }
         string pyexe = ProbePython();
         if (string.IsNullOrEmpty(pyexe) || !File.Exists(pyexe))
@@ -40,7 +37,6 @@ public static class Launcher
         string status = RunLauncherCheck(pyexe, root, "status", 10000);
         if (status.StartsWith("RUNNING "))
         {
-            bool noBrowser = Array.IndexOf(args, "--no-browser") >= 0;
             if (noBrowser) return 0;
             string port = status.Substring("RUNNING ".Length).Trim();
             string opened = RunLauncherCheck(pyexe, root, "open " + port, 10000);
@@ -50,18 +46,24 @@ public static class Launcher
                             "LocalOps Console", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             return 1;
         }
-        // STOPPED starts normally. STALE deliberately starts a candidate;
-        // server.py will validate and replace only the unhealthy same-project instance.
+        // The helper starts candidates without opening a browser, verifies disk-backed
+        // card readiness, and retries once if the first process is stale.
         if (!EnsureRuntime(pyexe, root)) return 1;
-        string pythonw = pyexe.Replace("python.exe", "pythonw.exe");
-        if (!File.Exists(pythonw)) pythonw = pyexe;
-        Process p = new Process();
-        p.StartInfo.FileName = pythonw;
-        p.StartInfo.Arguments = "server.py --log-to-file" + extra;
-        p.StartInfo.WorkingDirectory = root;
-        p.StartInfo.UseShellExecute = false;
-        p.Start();
-        return 0;
+        string launchArgs = "launch";
+        if (preferredPort.Length > 0) launchArgs += " " + preferredPort;
+        string launched = RunLauncherCheck(pyexe, root, launchArgs, 45000);
+        if (!launched.StartsWith("RUNNING "))
+        {
+            MessageBox.Show("The console failed its startup readiness check. " +
+                            "Your saved cards were not overwritten. See console.log.",
+                            "LocalOps Console", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            return 1;
+        }
+        if (noBrowser) return 0;
+        string launchedPort = launched.Substring("RUNNING ".Length).Trim();
+        string launchOpened = RunLauncherCheck(
+            pyexe, root, "open " + launchedPort, 10000);
+        return launchOpened.StartsWith("OPENED ") ? 0 : 1;
     }
 
     private static string RunLauncherCheck(string pyexe, string root,
@@ -80,13 +82,13 @@ public static class Launcher
             using (Process p = Process.Start(psi))
             {
                 if (p == null) return "";
-                string output = p.StandardOutput.ReadToEnd().Trim();
-                p.StandardError.ReadToEnd();
                 if (!p.WaitForExit(timeoutMs))
                 {
                     try { p.Kill(); } catch { }
                     return "";
                 }
+                string output = p.StandardOutput.ReadToEnd().Trim();
+                p.StandardError.ReadToEnd();
                 return p.ExitCode == 0 ? output : "";
             }
         }

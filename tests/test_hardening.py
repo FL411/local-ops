@@ -207,6 +207,50 @@ class LauncherCapabilityTokenTests(unittest.TestCase):
                 launcher_check.main(["launcher_check.py", "status"]), 0)
         self.assertEqual(stdout.getvalue().strip(), "STALE 9600")
 
+    def test_launch_retries_a_stale_candidate_and_requires_ready_state(self):
+        candidate = mock.Mock()
+        candidate.poll.return_value = 1
+        statuses = [
+            ("STOPPED", None), ("STALE", 9600),
+            ("STOPPED", None), ("RUNNING", 9600),
+        ]
+        with mock.patch.object(launcher_check, "_configured_app_count",
+                               return_value=1), \
+                mock.patch.object(launcher_check, "find_console_status",
+                                  side_effect=statuses), \
+                mock.patch.object(launcher_check, "_start_console_candidate",
+                                  return_value=candidate) as start:
+            port = launcher_check.launch_console(attempts=2, wait_sec=1)
+
+        self.assertEqual(port, 9600)
+        self.assertEqual(start.call_count, 2)
+        start.assert_has_calls([mock.call(1, None), mock.call(1, None)])
+
+    def test_candidate_receives_expected_count_and_never_opens_browser(self):
+        process = mock.Mock()
+        with mock.patch.object(launcher_check, "_pythonw_executable",
+                               return_value="pythonw.exe"), \
+                mock.patch.object(launcher_check.subprocess, "Popen",
+                                  return_value=process) as popen:
+            self.assertIs(
+                launcher_check._start_console_candidate(2, 9601), process)
+
+        args = popen.call_args.args[0]
+        self.assertIn("--no-browser", args)
+        self.assertIn("--expected-app-count", args)
+        self.assertEqual(args[args.index("--expected-app-count") + 1], "2")
+        self.assertEqual(args[args.index("--preferred-port") + 1], "9601")
+
+    def test_main_launch_reports_only_a_ready_console(self):
+        with mock.patch.object(launcher_check, "find_console_port",
+                               return_value=None), \
+                mock.patch.object(launcher_check, "launch_console",
+                                  return_value=9600), \
+                mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            self.assertEqual(
+                launcher_check.main(["launcher_check.py", "launch"]), 0)
+        self.assertEqual(stdout.getvalue().strip(), "RUNNING 9600")
+
 
 
 class EnsureRuntimeTests(unittest.TestCase):
@@ -349,6 +393,9 @@ class EnsureRuntimeTests(unittest.TestCase):
         self.assertIn("launcher_check.py\" status", bat)
         self.assertIn('"status"', cs)
         self.assertIn('StartsWith("RUNNING ")', cs)
+        self.assertIn("launcher_check.py\" launch", bat)
+        self.assertIn('"launch"', cs)
+        self.assertNotIn('"server.py --log-to-file"', cs)
 
 
 class ControlTokenStorageTests(unittest.TestCase):
@@ -1320,6 +1367,21 @@ class WindowsProcessSnapshotTests(unittest.TestCase):
 @unittest.skipUnless(server.sysops.IS_WINDOWS,
                      "Windows 专属:msvcrt 单实例锁")
 class ConsoleSelfHealTests(unittest.TestCase):
+    def test_expected_disk_cards_are_read_before_startup_continues(self):
+        with mock.patch.object(server, "_disk_configured_app_count",
+                               side_effect=[0, 1]), \
+                mock.patch.object(server.time, "sleep") as sleep:
+            self.assertEqual(
+                server.require_expected_disk_apps("config.json", 1), 1)
+        sleep.assert_called_once_with(0.1)
+
+    def test_expected_disk_cards_fail_closed_instead_of_showing_empty(self):
+        with mock.patch.object(server, "_disk_configured_app_count",
+                               return_value=0):
+            with self.assertRaisesRegex(RuntimeError, "启动前配置校验失败"):
+                server.require_expected_disk_apps(
+                    "config.json", 1, timeout=0)
+
     def test_orphan_without_port_is_stale(self):
         self.assertEqual(
             server.console_instance_status({"pid": 9, "ports": []}, 1),
