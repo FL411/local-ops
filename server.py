@@ -153,8 +153,8 @@ configure_console_encoding()
 def is_current_user(identity):
     """严格判断进程身份是否属于当前用户。
 
-    Windows 使用 SID，POSIX 使用 uid。身份未知时必须拒绝，不能把
-    ``None == None`` 误判为同一用户。
+    Windows 使用 SID。身份未知时必须拒绝，不能把 ``None == None``
+    误判为同一用户。
     """
     return identity is not None and SELF_UID is not None and identity == SELF_UID
 
@@ -297,7 +297,7 @@ def migrate_legacy_runtime_data(
         legacy_data_dir=LEGACY_DATA_DIR,
         data_overridden=DATA_DIR_OVERRIDDEN,
         logs_overridden=LOGS_DIR_OVERRIDDEN):
-    """首次运行时将项目内旧数据复制到 macOS 用户目录。
+    """首次运行时将项目内旧数据复制到 Windows 用户数据目录。
 
     只在对应目标完全不存在且没有显式环境变量覆盖时执行。
     旧文件不会被删除或改权限。
@@ -498,7 +498,10 @@ def _load_config_raw(path):
     try:
         with open(path, "r", encoding="utf-8") as f:
             raw = json.load(f)
+    except FileNotFoundError:
+        return None
     except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+        LOG.warning("读取配置失败: %s", path, exc_info=True)
         return None
     return raw if isinstance(raw, dict) else None
 
@@ -596,6 +599,15 @@ class Config:
             self._health_issues.append(
                 "主配置与备份均不可读，已进入只读保护状态")
             return data
+        control_token = os.path.join(
+            os.path.dirname(os.path.abspath(self._path)), "control.token")
+        if os.path.lexists(control_token):
+            # An established installation must not be reset merely because
+            # the roaming profile was temporarily unavailable at sign-in.
+            self._writable = False
+            self._health_issues.append(
+                "已有控制凭据但配置暂时不可见，已进入只读保护状态")
+            return data
         try:
             self._write_atomic(self._path, self._payload(data))
         except OSError as e:
@@ -674,24 +686,6 @@ class Config:
             self._migration_from = source_version
         return True
 
-    def restore_apps_from_disk_if_empty(self):
-        """内存应用列表为空但磁盘仍有卡片时，把配置从文件读回。
-
-        与 update() 共用 _lock：删光卡片的落盘会先完成，随后读到的也是空列表，
-        不会把用户刚删除的卡片救回来。主文件可读且为空时不以备份覆盖。
-        """
-        with self._lock:
-            if self._data.get("apps"):
-                return False
-            self._reload_from_disk_unlocked()
-            restored = self._data.get("apps") or []
-            if not restored:
-                return False
-            LOG.warning(
-                "restored %d apps from disk (in-memory list was empty): %s",
-                len(restored), self._path)
-            return True
-
     def snapshot(self):
         """返回当前磁盘配置的深拷贝（数据均为 JSON 可序列化）。"""
         with self._lock:
@@ -704,14 +698,18 @@ class Config:
 
     def health_info(self):
         with self._lock:
+            disk_app_count = _disk_configured_app_count(self._path)
+            issues = list(self._health_issues)
+            if disk_app_count is None:
+                issues.append("磁盘配置与备份当前均不可读")
             return {
                 "writable": self._writable,
                 "recoveredFromBackup": self._recovered_from_backup,
                 "migratedFromSchema": self._migration_from,
-                "issues": list(self._health_issues),
+                "issues": issues,
                 "configPath": self._path,
                 "memoryAppCount": len(self._data.get("apps") or []),
-                "diskAppCount": _disk_configured_app_count(self._path),
+                "diskAppCount": disk_app_count,
             }
 
     def update(self, fn):
@@ -778,7 +776,7 @@ def acquire_instance_lock(path=INSTANCE_LOCK_PATH):
     Port fallback alone is not a single-instance guarantee: two servers on
     :9600/:9601 would still update the same config.  The lock ties exclusivity
     to this data directory and is released automatically if the process
-    crashes (POSIX flock / Windows msvcrt 均由 sysops 封装)。
+    crashes (Windows msvcrt locking 由 sysops 封装)。
     """
     return sysops.acquire_lock(path)
 
@@ -839,8 +837,8 @@ def scan_listeners():
 def listener_open_host(listeners, port, pids=None):
     """返回浏览器访问监听端口时应使用的本地主机名。
 
-    macOS 上有些开发服务器只绑定 IPv6 回环 ``::1``；这时
-    ``127.0.0.1`` 会直接拒绝连接，而 ``localhost`` 能正确解析到它。
+    有些开发服务器只绑定 IPv6 回环 ``::1``；这时 ``127.0.0.1``
+    会直接拒绝连接，而 ``localhost`` 能正确解析到它。
     对旧测试/旧调用传入的 set 快照则保持原来的 IPv4 默认值。
     """
     if not isinstance(listeners, dict):
@@ -865,7 +863,7 @@ def listener_open_host(listeners, port, pids=None):
 
 
 def ps_snapshot(pids=None, with_uid=True):
-    """批量进程信息 → {pid: {"uid","comm","args","cpu","mem","etime"}}。
+    """批量进程信息，包含展示用 args 与保留参数边界的 argv。
 
     平台实现见 sysops：psutil（comm 为 exe 路径，etime 单位为秒）。
     """
@@ -937,7 +935,7 @@ def project_name(cwd):
 
 # ---------------------------------------------------------------- 进程溯源
 # 沿 PPID 链向上识别「是谁启动了这个服务」：AI 编程助手、编辑器、终端、
-# 总控台自身或 launchd。结果只是展示用的尽力判断，不影响任何启停逻辑。
+# 总控台自身。结果只是展示用的尽力判断，不影响任何启停逻辑。
 
 # 向上爬时要跳过的包装层（按 argv[0] 基名匹配）：壳、包管理器与任务执行器
 _ORIGIN_SKIP_NAMES = {
@@ -966,36 +964,7 @@ _ORIGIN_AGENT_PATTERNS = (
     (re.compile(r"\bcodebuddy\b", re.I), "CodeBuddy"),
 )
 
-# .app 包名 → (展示名, 图标)。未列出的包按原名 + package 图标展示
-_ORIGIN_APP_ALIASES = {
-    "visual studio code": ("VS Code", "code"),
-    "visual studio code - insiders": ("VS Code", "code"),
-    "cursor": ("Cursor", "code"),
-    "trae": ("Trae", "code"),
-    "windsurf": ("Windsurf", "code"),
-    "zed": ("Zed", "code"),
-    "sublime text": ("Sublime", "code"),
-    "webstorm": ("WebStorm", "code"),
-    "intellij idea": ("IDEA", "code"),
-    "goland": ("GoLand", "code"),
-    "pycharm": ("PyCharm", "code"),
-    "nova": ("Nova", "code"),
-    "xcode": ("Xcode", "code"),
-    "iterm2": ("iTerm", "terminal"),
-    "iterm": ("iTerm", "terminal"),
-    "terminal": ("终端", "terminal"),
-    "warp": ("Warp", "terminal"),
-    "kitty": ("kitty", "terminal"),
-    "alacritty": ("Alacritty", "terminal"),
-    "wezterm": ("WezTerm", "terminal"),
-    "docker": ("Docker", "package"),
-    "ollama": ("Ollama", "package"),
-    "obsidian": ("Obsidian", "package"),
-}
-_ORIGIN_BUNDLE_RE = re.compile(r"/([^/]+)\.app/Contents/MacOS/", re.I)
-
 # Windows 可执行文件名（去掉 .exe 后的小写基名）→ (展示名, 图标)。
-# 与 macOS 的 .app 别名表对应，让溯源标签在 Windows 上同样可读。
 _WINDOWS_ORIGIN_ALIASES = {
     "code": ("VS Code", "code"),
     "code - insiders": ("VS Code", "code"),
@@ -1050,7 +1019,6 @@ def origin_snapshot(pids=None):
     """
     table = {}
     mod = sysops._psutil()
-    mod = sysops._psutil()
     if pids is None:
         processes = mod.process_iter(["pid", "ppid", "cmdline"])
         for proc in processes:
@@ -1088,7 +1056,7 @@ def attribute_origin(pid, table):
     祖先 args 中带有总控台 run-token 前缀（console-run:）即判定为
     「总控台启动」——本机任一总控台实例的受管进程组都持有该标记。
     未识别的中间层先记为候选并继续上爬；AI 助手 / 编辑器 / 终端 /
-    总控台 / launchd 是更优答案，都没有时才以最近的未识别进程命名。
+    总控台是更优答案，都没有时才以最近的未识别进程命名。
     最多上爬 12 层，遇到环或缺失即终止。
     """
     cur, seen, candidate = pid, set(), None
@@ -1109,12 +1077,6 @@ def attribute_origin(pid, table):
         for pattern, label in _ORIGIN_AGENT_PATTERNS:
             if pattern.search(hay):
                 return {"label": label, "icon": "bot"}
-        bundle = _ORIGIN_BUNDLE_RE.search(parent_args)
-        if bundle:
-            app_name = bundle.group(1)
-            label, icon = _ORIGIN_APP_ALIASES.get(
-                app_name.casefold(), (app_name, "package"))
-            return {"label": label, "icon": icon}
         # 可执行路径可能含空格并被引号包裹，split()[0] 会截断；
         # 用引号感知解析出完整 exe 路径。
         m = re.match(r'\s*(?:"([^"]*)"|(\S+))', parent_args)
@@ -1553,8 +1515,8 @@ def build_state(cfg, console_port, config_health=None):
         "uiTheme": cfg.get("uiTheme") or DEFAULT_UI_THEME,
         "openBrowser": bool(cfg.get("openBrowser", True)),
         "themes": list_themes(),
-        # Windows 上 CPU 为「占全部核心百分比」（任务管理器口径），
-        # coreCount 供前端把迷你条还原为相对满核宽度；macOS 为 1 保持原语义。
+        # CPU 为「占全部核心百分比」（任务管理器口径），coreCount 供前端
+        # 把迷你条还原为相对满核宽度。
         "coreCount": sysops.core_count(),
     }
     # 仅在有可修复身份时附带内部字段；_refresh_state 在序列化前取走它。
@@ -1759,6 +1721,10 @@ def get_state_snapshot(cfg, console_port):
 
 def build_health(cfg):
     """不执行 ps/lsof 的轻量健康检查。"""
+    # snapshot() first refreshes the filesystem-backed Config. Returning
+    # health_info() from before that refresh can falsely report zero cards to
+    # the launcher and trigger replacement of a healthy instance.
+    snapshot = cfg.snapshot()
     health = cfg.health_info()
     issues = list(health.get("issues") or [])
     if VERSION_LOAD_ERROR:
@@ -1790,7 +1756,6 @@ def build_health(cfg):
         if not stat.S_ISREG(mode):
             issues.append("%s 不是普通文件" % label)
     degraded = bool(issues)
-    snapshot = cfg.snapshot()
     return {
         "ok": not degraded,
         "status": "degraded" if degraded else "ok",
@@ -2184,6 +2149,48 @@ def _simple_command_tokens(command):
     if not isinstance(command, str) or not command.strip():
         return []
     return _simple_windows_command_tokens(command)
+
+
+def normalize_attached_python_command(command, cwd):
+    """Prefer a project virtualenv over Windows' reported base Python.
+
+    A venv Python process can appear in the Windows process table as its base
+    interpreter. Saving that executable verbatim makes a reclaimed service
+    fail on restart because project modules such as uvicorn are not installed
+    in the base interpreter.
+    """
+    if not isinstance(cwd, str) or not cwd or not os.path.isdir(cwd):
+        return command
+    tokens = _simple_command_tokens(command)
+    if not tokens:
+        return command
+    executable_index = 0
+    while (executable_index < len(tokens)
+           and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*",
+                            tokens[executable_index])):
+        executable_index += 1
+    if executable_index >= len(tokens):
+        return command
+    executable = tokens[executable_index]
+    if not re.fullmatch(
+            r"(?:py|python|pythonw)(?:\d+(?:\.\d+)*)?(?:\.exe)?",
+            os.path.basename(executable), re.IGNORECASE):
+        return command
+    executable_base = os.path.basename(executable).lower()
+    executable_name = ("pythonw.exe" if executable_base.startswith("pythonw")
+                       else "python.exe")
+    for directory in (".venv", "venv", "env"):
+        candidate = os.path.join(cwd, directory, "Scripts", executable_name)
+        if not os.path.isfile(candidate):
+            continue
+        try:
+            if os.path.realpath(candidate) == os.path.realpath(executable):
+                return command
+        except OSError:
+            pass
+        tokens[executable_index] = candidate
+        return subprocess.list2cmdline(tokens)
+    return command
 
 
 def _resolve_command_path(value, cwd):
@@ -2786,6 +2793,8 @@ def attach_app_process(cfg, app_id, app, pid):
     if not ok:
         return False, error, identity
     actual_cwd = identity["cwd"]
+    normalized_command = normalize_attached_python_command(
+        app.get("command"), actual_cwd)
     cwd_updated = False
     pid_conflict = False
 
@@ -2815,6 +2824,7 @@ def attach_app_process(cfg, app_id, app, pid):
         if not same:
             target["cwd"] = actual_cwd
             cwd_updated = True
+        target["command"] = normalized_command
         return True
 
     if not cfg.update(op):
@@ -3871,6 +3881,8 @@ class Handler(BaseHTTPRequestHandler):
             except OSError:
                 cwd_updated = True
             app["cwd"] = actual_cwd
+            app["command"] = normalize_attached_python_command(
+                app.get("command"), actual_cwd)
             app["lastPid"] = attach_pid
             app["lastCreateTime"] = identity.get("ctime")
             app["attached"] = True
@@ -4255,17 +4267,40 @@ def open_browser_later(port, token, delay=0.8):
     threading.Thread(target=_open, daemon=True).start()
 
 
+_PYTHON_PROCESS_RE = re.compile(
+    r"python(?:w)?(?:\d+(?:\.\d+)*)?\.exe\Z", re.IGNORECASE)
+
+
+def _is_console_server_process(info):
+    """只识别解释器直接执行本项目 server.py 的进程。
+
+    args 是为展示拼接的字符串，参数边界已经丢失，不能用于决定是否杀进程。
+    argv 来自 psutil.cmdline()，因此 PowerShell 文本或 ``python -c`` 代码里
+    即使出现 server.py 也不会被误判。
+    """
+    executable = os.path.basename(info.get("comm") or "")
+    argv = info.get("argv")
+    if not _PYTHON_PROCESS_RE.fullmatch(executable):
+        return False
+    if not isinstance(argv, list) or len(argv) < 2:
+        return False
+    script = argv[1]
+    return (isinstance(script, str)
+            and os.path.basename(script).casefold() == "server.py")
+
+
 def find_console_instances():
     """查找从同一项目目录启动的总控台，用于双击启动器去重。"""
     snap = ps_snapshot(None, with_uid=True)
     candidates = []
     for pid, info in snap.items():
-        args = info.get("args") or ""
         if (pid == SELF_PID or not is_current_user(info.get("uid"))
-                or "server.py" not in args
-                or "--restart-helper" in args):
+                or not _is_console_server_process(info)
+                or "--restart-helper" in (info.get("argv") or [])):
             continue
         candidates.append(pid)
+    if not candidates:
+        return []
     cwds = lsof_cwds(candidates)
     listener_map = {}
     for pid, port in scan_listeners():
@@ -4291,13 +4326,43 @@ def find_console_instances():
 
 
 def _disk_configured_app_count(path=None):
-    """Count app cards in the on-disk config without mutating memory."""
+    """Count disk cards, or None for an established unreadable config."""
     path = path or CONFIG_PATH
     raw = _load_config_raw(path)
+    found_candidate = os.path.lexists(path)
+    if raw is None:
+        backup_path = path + ".bak"
+        raw = _load_config_raw(backup_path)
+        found_candidate = found_candidate or os.path.lexists(backup_path)
+    if raw is None:
+        control_token = os.path.join(
+            os.path.dirname(os.path.abspath(path)), "control.token")
+        return None if (found_candidate or os.path.lexists(control_token)) else 0
     if not isinstance(raw, dict) or not isinstance(raw.get("apps"), list):
         return 0
     return sum(1 for item in raw["apps"]
                if isinstance(item, dict) and item.get("id"))
+
+
+def require_expected_disk_apps(path, expected_count, timeout=3.0):
+    """Refuse startup until disk config is readable and meets expectations."""
+    try:
+        expected_count = max(0, int(expected_count))
+    except (TypeError, ValueError):
+        expected_count = 0
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    while True:
+        actual = _disk_configured_app_count(path)
+        if actual is not None and actual >= expected_count:
+            return actual
+        if time.monotonic() >= deadline:
+            if actual is None:
+                raise RuntimeError(
+                    "启动前配置校验失败：主配置与备份当前均不可读")
+            raise RuntimeError(
+                "启动前配置校验失败：启动器检测到 %d 张卡片，当前进程只读到 %d 张" %
+                (expected_count, actual))
+        time.sleep(0.1)
 
 
 def _http_json_localhost(port, path, timeout):
@@ -4317,15 +4382,25 @@ def console_instance_status(item, disk_app_count=0):
     Never classifies by port occupancy of unknown processes.
     """
     ports = [p for p in (item.get("ports") or []) if isinstance(p, int)]
+    if disk_app_count is None:
+        return "stale"
     if not ports:
         return "stale"
     port = min(ports)
     health = _http_json_localhost(port, "/api/health", 2.0)
     if not isinstance(health, dict) or not health.get("ok"):
         return "stale"
+    health_config = health.get("config")
+    if disk_app_count > 0 and isinstance(health_config, dict):
+        if (health_config.get("memoryAppCount") == 0
+                or health_config.get("diskAppCount") == 0):
+            return "stale"
     state = _http_json_localhost(port, "/api/state", 4.0)
     if not isinstance(state, dict):
-        return "stale"
+        # /api/state performs process scans and can time out transiently. The
+        # lightweight health endpoint already proved this is a live console;
+        # do not kill it solely because one expensive probe missed its window.
+        return "healthy"
     apps = state.get("apps")
     live_count = len(apps) if isinstance(apps, list) else 0
     if live_count == 0 and disk_app_count > 0:
@@ -4365,8 +4440,8 @@ def _reap_console_pids(pids, force=False):
 def reap_stale_console_processes():
     """Kill same-project leftover/unhealthy console processes.
 
-    Only current-user processes whose cwd is this project and whose command
-    contains server.py. Returns True if any stale process was reaped.
+    Only current-user Python processes directly executing this project's
+    server.py are eligible. Returns True if any stale process was reaped.
     """
     instances = find_console_instances()
     if not instances:
@@ -4469,18 +4544,27 @@ def schedule_console_stop(server):
 
 
 def restart_helper(old_pid, preferred_port):
-    """等旧进程释放端口后，原地重启新总控台（Windows 用独立进程接管）。"""
+    """等旧进程退出后，交给独立启动器重新读盘并启动总控台。"""
     deadline = time.monotonic() + 12.0
     while time.monotonic() < deadline and pid_alive(old_pid):
         time.sleep(0.1)
     if pid_alive(old_pid):
         return 1
-    args = [sys.executable, os.path.abspath(__file__),
-            "--preferred-port", str(int(preferred_port)), "--no-browser"]
-    # pythonw 无控制台：必须带 --log-to-file 重定向 stdout/stderr，
-    # 否则 print/logging 写入无效句柄，日志不可见且可能拖垮请求线程。
-    args.append("--log-to-file")
-    subprocess.Popen(args, cwd=BASE_DIR, close_fds=True)
+    launcher_python = sys.executable
+    if os.path.basename(launcher_python).lower() == "pythonw.exe":
+        console_python = os.path.join(os.path.dirname(launcher_python),
+                                      "python.exe")
+        if os.path.isfile(console_python):
+            launcher_python = console_python
+    args = [launcher_python, os.path.join(BASE_DIR, "launcher_check.py"),
+            "launch", str(int(preferred_port))]
+    # 让独立启动器重新读取磁盘配置，并由它计算 expected-app-count。
+    # 标准输出不继承 pythonw 的无效句柄；候选服务自己会写 console.log。
+    subprocess.Popen(
+        args, cwd=BASE_DIR, close_fds=True,
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     return 0
 
 
@@ -4517,7 +4601,8 @@ def _start_autostart_thread(cfg):
                      name="console-autostart", daemon=True).start()
 
 
-def _run_console(preferred_port=None, open_browser=True):
+def _run_console(preferred_port=None, open_browser=True,
+                 expected_app_count=0):
     configure_console_encoding()
     logging.basicConfig(
         level=logging.INFO,
@@ -4525,10 +4610,17 @@ def _run_console(preferred_port=None, open_browser=True):
     for private_dir in (DATA_DIR, ICONS_DIR, LOGS_DIR):
         _ensure_private_dir(private_dir)
     start_log_maintenance()
+    startup_disk_apps = require_expected_disk_apps(
+        CONFIG_PATH, expected_app_count)
     cfg = Config(CONFIG_PATH)
-    cfg.restore_apps_from_disk_if_empty()
     loaded = len(cfg.snapshot().get("apps") or [])
     disk_apps = _disk_configured_app_count(cfg.path)
+    required_apps = max(int(expected_app_count), startup_disk_apps)
+    if disk_apps is None or loaded < max(required_apps, disk_apps or 0):
+        raise RuntimeError(
+            "启动前配置校验失败：内存 %d 张，磁盘 %s 张，至少应加载 %d 张" %
+            (loaded, "不可读" if disk_apps is None else str(disk_apps),
+             required_apps))
     print("已加载 %d 个应用卡片（磁盘 %d，%s）" %
           (loaded, disk_apps, cfg.path), flush=True)
     if loaded == 0 and disk_apps > 0:
@@ -4626,7 +4718,8 @@ def redirect_console_output():
         os.close(fd)
 
 
-def main(preferred_port=None, open_browser=True, log_to_file=False):
+def main(preferred_port=None, open_browser=True, log_to_file=False,
+         expected_app_count=0):
     """Run exactly one console for this project/data directory."""
     configure_console_encoding()
     migration = prepare_runtime_storage()
@@ -4657,7 +4750,7 @@ def main(preferred_port=None, open_browser=True, log_to_file=False):
             print("发现残留总控台进程，正在清理: %s" %
                   ", ".join(str(pid) for pid in pids), flush=True)
             _reap_console_pids(pids, force=True)
-        _run_console(preferred_port, open_browser)
+        _run_console(preferred_port, open_browser, expected_app_count)
         return True
     finally:
         release_instance_lock(instance_lock)
@@ -4685,9 +4778,17 @@ if __name__ == "__main__":
                 preferred = int(sys.argv[index + 1])
             except (ValueError, IndexError):
                 sys.exit(2)
+        expected_app_count = 0
+        if "--expected-app-count" in sys.argv:
+            index = sys.argv.index("--expected-app-count")
+            try:
+                expected_app_count = max(0, int(sys.argv[index + 1]))
+            except (ValueError, IndexError):
+                sys.exit(2)
         # --log-to-file：无窗口后台运行（Windows pythonw / start.bat），
         # 输出写入 LOGS_DIR/console.log，避免无控制台时 print 崩溃。
         log_to_file = "--log-to-file" in sys.argv
         main(preferred_port=preferred,
              open_browser="--no-browser" not in sys.argv,
-             log_to_file=log_to_file)
+             log_to_file=log_to_file,
+             expected_app_count=expected_app_count)

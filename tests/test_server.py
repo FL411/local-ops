@@ -40,33 +40,25 @@ class OriginAttributionTests(unittest.TestCase):
             (100, 90, "node server.mjs --open"),
             (90, 80, "node npm exec"),
             (80, 70, "pnpm dev"),
-            (70, 60, "-zsh"),
-            (60, 1, "/usr/local/bin/codex"),
+            (70, 60, "node.exe wrapper.js"),
+            (60, 1, r"C:\Tools\codex.exe"),
         )
         origin = server.attribute_origin(100, table)
         self.assertEqual(origin, {"label": "Codex", "icon": "bot"})
 
-    def test_vscode_bundle_is_named_and_uses_code_icon(self):
+    def test_vscode_executable_is_named_and_uses_code_icon(self):
         table = self.table(
-            (100, 90, "python3 -m http.server 8000"),
-            (90, 80, "-zsh"),
-            (80, 1, "/Applications/Visual Studio Code.app/Contents/MacOS/Electron"),
+            (100, 90, "python.exe -m http.server 8000"),
+            (90, 80, "node.exe wrapper.js"),
+            (80, 1, r'"C:\Program Files\Microsoft VS Code\Code.exe"'),
         )
         origin = server.attribute_origin(100, table)
         self.assertEqual(origin, {"label": "VS Code", "icon": "code"})
 
-    def test_iterm_bundle_uses_terminal_icon(self):
-        table = self.table(
-            (100, 90, "-zsh"),
-            (90, 1, "/Applications/iTerm.app/Contents/MacOS/iTerm2"),
-        )
-        origin = server.attribute_origin(100, table)
-        self.assertEqual(origin, {"label": "iTerm", "icon": "terminal"})
-
     def test_console_run_token_marks_console_as_origin(self):
         table = self.table(
-            (100, 90, "python3 -m http.server 8377"),
-            (90, 1, "/bin/bash -c outer console-run:tok123 inner"),
+            (100, 90, "python.exe -m http.server 8377"),
+            (90, 1, "cmd.exe /d /s /c outer console-run:tok123 inner"),
         )
         origin = server.attribute_origin(100, table)
         self.assertEqual(origin, {"label": "总控台", "icon": "rocket"})
@@ -74,7 +66,7 @@ class OriginAttributionTests(unittest.TestCase):
     def test_unknown_middle_process_is_named_honestly(self):
         table = self.table(
             (100, 90, "node server.js"),
-            (90, 1, "/opt/homebrew/bin/mise run dev"),
+            (90, 1, r"C:\Tools\mise.exe run dev"),
         )
         origin = server.attribute_origin(100, table)
         self.assertEqual(origin, {"label": "mise", "icon": "package"})
@@ -102,8 +94,8 @@ class OriginAttributionTests(unittest.TestCase):
         # 未识别的中间层继续上爬，优先报告真正的 AI 助手
         table = self.table(
             (100, 90, "node server.js"),
-            (90, 80, "/opt/homebrew/bin/mise run dev"),
-            (80, 1, "/usr/local/bin/claude"),
+            (90, 80, r"C:\Tools\mise.exe run dev"),
+            (80, 1, r"C:\Tools\claude.exe"),
         )
         origin = server.attribute_origin(100, table)
         self.assertEqual(origin, {"label": "Claude Code", "icon": "bot"})
@@ -112,6 +104,36 @@ class OriginAttributionTests(unittest.TestCase):
 
 
 class WindowsScriptCommandTests(unittest.TestCase):
+    def test_reclaimed_python_service_prefers_project_virtualenv(self):
+        with tempfile.TemporaryDirectory() as td:
+            scripts = os.path.join(td, ".venv", "Scripts")
+            os.makedirs(scripts)
+            venv_python = os.path.join(scripts, "python.exe")
+            with open(venv_python, "wb") as handle:
+                handle.write(b"MZ")
+            command = (
+                r"C:\Tools\uv\python\python.exe "
+                r"-m uvicorn dashboard.app:app --port 8765"
+            )
+            normalized = server.normalize_attached_python_command(command, td)
+            tokens = server._simple_command_tokens(normalized)
+
+        self.assertEqual(os.path.normcase(tokens[0]),
+                         os.path.normcase(venv_python))
+        self.assertEqual(tokens[1:], [
+            "-m", "uvicorn", "dashboard.app:app", "--port", "8765"])
+
+    def test_reclaimed_non_python_command_is_unchanged(self):
+        with tempfile.TemporaryDirectory() as td:
+            scripts = os.path.join(td, ".venv", "Scripts")
+            os.makedirs(scripts)
+            with open(os.path.join(scripts, "python.exe"), "wb") as handle:
+                handle.write(b"MZ")
+            command = "npm run dev"
+            self.assertEqual(
+                server.normalize_attached_python_command(command, td),
+                command)
+
     def test_selected_python_script_with_spaces_is_checked(self):
         with tempfile.TemporaryDirectory() as td:
             folder = os.path.join(td, "script folder")
@@ -1146,14 +1168,18 @@ class IconTests(unittest.TestCase):
 class ConsoleRestartTests(unittest.TestCase):
     def test_instance_discovery_is_limited_to_same_project(self):
         snap = {
-            71001: {"uid": server.SELF_UID, "args": "python3 server.py",
-                    "etime": 10},
-            71002: {"uid": server.SELF_UID, "args": "python3 server.py",
-                    "etime": 20},
-            71003: {"uid": str(server.SELF_UID) + "-other", "args": "python3 server.py",
-                    "etime": 30},
-            71004: {"uid": server.SELF_UID, "args": "python3 server.py --launcher",
-                    "etime": 40},
+            71001: {"uid": server.SELF_UID, "comm": "pythonw.exe",
+                    "argv": ["pythonw.exe", "server.py"],
+                    "args": "pythonw.exe server.py", "etime": 10},
+            71002: {"uid": server.SELF_UID, "comm": "python.exe",
+                    "argv": ["python.exe", "server.py"],
+                    "args": "python.exe server.py", "etime": 20},
+            71003: {"uid": str(server.SELF_UID) + "-other",
+                    "comm": "python.exe", "argv": ["python.exe", "server.py"],
+                    "args": "python.exe server.py", "etime": 30},
+            71004: {"uid": server.SELF_UID, "comm": "python3.12.exe",
+                    "argv": ["python3.12.exe", "server.py", "--launcher"],
+                    "args": "python3.12.exe server.py --launcher", "etime": 40},
         }
         with mock.patch.object(server, "ps_snapshot", return_value=snap), \
                 mock.patch.object(server, "lsof_cwds", return_value={
@@ -1168,10 +1194,31 @@ class ConsoleRestartTests(unittest.TestCase):
         self.assertEqual(found[0]["ports"], [9600])
         self.assertEqual(found[1]["ports"], [9601])
 
+    def test_instance_discovery_rejects_commands_that_only_mention_server(self):
+        snap = {
+            71011: {"uid": server.SELF_UID, "comm": "pwsh.exe",
+                    "argv": ["pwsh.exe", "-Command", "inspect server.py"],
+                    "args": "pwsh.exe -Command inspect server.py", "etime": 1},
+            71012: {"uid": server.SELF_UID, "comm": "python.exe",
+                    "argv": ["python.exe", "-c", "print('server.py')"],
+                    "args": "python.exe -c print('server.py')", "etime": 1},
+            71013: {"uid": server.SELF_UID, "comm": "python.exe",
+                    "argv": ["python.exe", "server.py", "--restart-helper"],
+                    "args": "python.exe server.py --restart-helper", "etime": 1},
+        }
+        with mock.patch.object(server, "ps_snapshot", return_value=snap), \
+                mock.patch.object(server, "lsof_cwds") as cwds, \
+                mock.patch.object(server, "scan_listeners", return_value={}):
+            self.assertEqual(server.find_console_instances(), [])
+        cwds.assert_not_called()
+
     def test_panel_restart_spawns_helper_before_shutdown(self):
         class FakeServer:
             def __init__(self):
                 self.stopped = threading.Event()
+                self.cfg = mock.Mock()
+                self.cfg.snapshot.return_value = {
+                    "apps": [{"id": "saved-card"}]}
 
             def shutdown(self):
                 self.stopped.set()
@@ -1185,7 +1232,22 @@ class ConsoleRestartTests(unittest.TestCase):
         self.assertEqual(helper_pid, 72001)
         command = popen.call_args.args[0]
         self.assertIn("--restart-helper", command)
-        self.assertEqual(command[-1], "9603")
+        self.assertEqual(command[-2:], [str(server.SELF_PID), "9603"])
+        fake_server.cfg.snapshot.assert_not_called()
+
+    def test_restart_helper_delegates_to_disk_aware_launcher(self):
+        fake_proc = mock.Mock()
+        with mock.patch.object(server, "pid_alive", return_value=False), \
+                mock.patch.object(server.subprocess, "Popen",
+                                  return_value=fake_proc) as popen:
+            self.assertEqual(server.restart_helper(71001, 9603), 0)
+
+        command = popen.call_args.args[0]
+        self.assertEqual(
+            command[-3:],
+            [os.path.join(server.BASE_DIR, "launcher_check.py"),
+             "launch", "9603"])
+        self.assertNotIn("--expected-app-count", command)
 
     def test_panel_stop_shuts_down_after_response_window(self):
         class FakeServer:

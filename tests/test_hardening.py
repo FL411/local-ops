@@ -174,6 +174,127 @@ class LauncherCapabilityTokenTests(unittest.TestCase):
         open_browser.assert_not_called()
         urlopen.assert_not_called()
 
+    def test_status_marks_disk_memory_mismatch_stale(self):
+        health = {"ok": True, "config": {
+            "memoryAppCount": 0, "diskAppCount": 0}}
+        with mock.patch.object(launcher_check, "_read_json",
+                               return_value=health):
+            self.assertEqual(
+                launcher_check._console_status(9600, disk_app_count=1),
+                "STALE")
+
+    def test_status_leaves_matching_instance_running(self):
+        health = {"ok": True, "config": {
+            "memoryAppCount": 1, "diskAppCount": 1}}
+        with mock.patch.object(launcher_check, "_read_json",
+                               return_value=health):
+            self.assertEqual(
+                launcher_check._console_status(9600, disk_app_count=1),
+                "RUNNING")
+
+    def test_old_healthy_instance_is_not_replaced_on_state_timeout(self):
+        with mock.patch.object(launcher_check, "_read_json",
+                               side_effect=[{"ok": True}, None]):
+            self.assertEqual(
+                launcher_check._console_status(9600, disk_app_count=1),
+                "RUNNING")
+
+    def test_main_status_reports_probe_result(self):
+        with mock.patch.object(launcher_check, "find_console_status",
+                               return_value=("STALE", 9600)), \
+                mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            self.assertEqual(
+                launcher_check.main(["launcher_check.py", "status"]), 0)
+        self.assertEqual(stdout.getvalue().strip(), "STALE 9600")
+
+    def test_launch_retries_a_stale_candidate_and_requires_ready_state(self):
+        candidate = mock.Mock()
+        candidate.poll.return_value = 1
+        statuses = [
+            ("STOPPED", None), ("STALE", 9600),
+            ("STOPPED", None), ("RUNNING", 9600),
+        ]
+        with mock.patch.object(launcher_check, "_configured_app_count",
+                               return_value=1), \
+                mock.patch.object(launcher_check, "find_console_status",
+                                  side_effect=statuses), \
+                mock.patch.object(launcher_check, "_start_console_candidate",
+                                  return_value=candidate) as start:
+            port = launcher_check.launch_console(attempts=2, wait_sec=1)
+
+        self.assertEqual(port, 9600)
+        self.assertEqual(start.call_count, 2)
+        start.assert_has_calls([mock.call(1, None), mock.call(1, None)])
+
+    def test_unreadable_existing_config_fails_closed(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "config.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("{not-json")
+            with mock.patch.object(launcher_check, "_config_path",
+                                   return_value=path):
+                self.assertIsNone(launcher_check._configured_app_count())
+
+    def test_missing_config_with_existing_token_is_not_first_run(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "config.json")
+            token = os.path.join(td, "control.token")
+            with open(token, "w", encoding="ascii") as fh:
+                fh.write("x" * 43)
+            with mock.patch.object(launcher_check, "_config_path",
+                                   return_value=path), \
+                    mock.patch.object(launcher_check,
+                                      "_control_token_path",
+                                      return_value=token):
+                self.assertIsNone(launcher_check._configured_app_count())
+
+    def test_missing_config_without_token_is_valid_first_run(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "config.json")
+            token = os.path.join(td, "control.token")
+            with mock.patch.object(launcher_check, "_config_path",
+                                   return_value=path), \
+                    mock.patch.object(launcher_check,
+                                      "_control_token_path",
+                                      return_value=token):
+                self.assertEqual(launcher_check._configured_app_count(), 0)
+
+    def test_valid_backup_is_used_when_main_config_is_unreadable(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "config.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("{not-json")
+            with open(path + ".bak", "w", encoding="utf-8") as fh:
+                json.dump({"apps": [{"id": "saved-card"}]}, fh)
+            with mock.patch.object(launcher_check, "_config_path",
+                                   return_value=path):
+                self.assertEqual(launcher_check._configured_app_count(), 1)
+
+    def test_candidate_receives_expected_count_and_never_opens_browser(self):
+        process = mock.Mock()
+        with mock.patch.object(launcher_check, "_pythonw_executable",
+                               return_value="pythonw.exe"), \
+                mock.patch.object(launcher_check.subprocess, "Popen",
+                                  return_value=process) as popen:
+            self.assertIs(
+                launcher_check._start_console_candidate(2, 9601), process)
+
+        args = popen.call_args.args[0]
+        self.assertIn("--no-browser", args)
+        self.assertIn("--expected-app-count", args)
+        self.assertEqual(args[args.index("--expected-app-count") + 1], "2")
+        self.assertEqual(args[args.index("--preferred-port") + 1], "9601")
+
+    def test_main_launch_reports_only_a_ready_console(self):
+        with mock.patch.object(launcher_check, "find_console_port",
+                               return_value=None), \
+                mock.patch.object(launcher_check, "launch_console",
+                                  return_value=9600), \
+                mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            self.assertEqual(
+                launcher_check.main(["launcher_check.py", "launch"]), 0)
+        self.assertEqual(stdout.getvalue().strip(), "RUNNING 9600")
+
 
 
 class EnsureRuntimeTests(unittest.TestCase):
@@ -313,6 +434,12 @@ class EnsureRuntimeTests(unittest.TestCase):
         self.assertIn("ensure-runtime", bat)
         self.assertNotIn("import sys,psutil", bat)
         self.assertIn("ensure-runtime", cs)
+        self.assertIn("launcher_check.py\" status", bat)
+        self.assertIn('"status"', cs)
+        self.assertIn('StartsWith("RUNNING ")', cs)
+        self.assertIn("launcher_check.py\" launch", bat)
+        self.assertIn('"launch"', cs)
+        self.assertNotIn('"server.py --log-to-file"', cs)
 
 
 class ControlTokenStorageTests(unittest.TestCase):
@@ -408,6 +535,43 @@ class AtomicAttachCreateTests(unittest.TestCase):
         self.assertFalse(body["ok"])
         self.assertEqual(self.h.cfg.snapshot()["apps"], [])
 
+    def test_attached_python_process_persists_project_virtualenv(self):
+        with tempfile.TemporaryDirectory() as td:
+            scripts = os.path.join(td, ".venv", "Scripts")
+            os.makedirs(scripts)
+            venv_python = os.path.join(scripts, "python.exe")
+            with open(venv_python, "wb") as handle:
+                handle.write(b"MZ")
+            payload = {
+                "name": "API",
+                "command": (
+                    r"C:\Tools\uv\python\python.exe "
+                    r"-m uvicorn app:app --port 8765"),
+                "cwd": td,
+                "port": 8765,
+                "kind": "service",
+                "attachPid": 4242,
+            }
+            with mock.patch.object(server, "app_alive_sign",
+                                   return_value=False), \
+                    mock.patch.object(server, "scan_listeners",
+                                      return_value={(4242, 8765)}), \
+                    mock.patch.object(server, "ps_snapshot", return_value={
+                        4242: {"uid": server.SELF_UID, "ctime": 123456.0}}), \
+                    mock.patch.object(server, "listener_app_owners",
+                                      return_value={}), \
+                    mock.patch.object(server, "lsof_cwds",
+                                      return_value={4242: td}):
+                status, body, _ = self.h.request(
+                    "POST", "/api/apps", json.dumps(payload),
+                    {"Content-Type": "application/json"})
+
+            saved = self.h.cfg.snapshot()["apps"][0]
+            tokens = server._simple_command_tokens(saved["command"])
+            self.assertEqual(status, 200)
+            self.assertEqual(os.path.normcase(tokens[0]),
+                             os.path.normcase(venv_python))
+
 
 class DeliveryMetadataTests(unittest.TestCase):
     def setUp(self):
@@ -436,6 +600,10 @@ class DeliveryMetadataTests(unittest.TestCase):
     def test_health_is_lightweight_and_reports_runtime_metadata(self):
         icons = os.path.join(self.h.tmp.name, "icons")
         logs = os.path.join(self.h.tmp.name, "logs")
+        payload = self.h.cfg.snapshot()
+        payload["apps"] = [{"id": "disk-app", "name": "Disk app"}]
+        with open(self.h.config_path, "w", encoding="utf-8") as config_file:
+            json.dump(payload, config_file)
         os.chmod(self.h.tmp.name, 0o700)
         os.mkdir(icons, 0o700)
         os.mkdir(logs, 0o700)
@@ -454,6 +622,8 @@ class DeliveryMetadataTests(unittest.TestCase):
         self.assertEqual(body["version"], server.APP_VERSION)
         self.assertEqual(body["schemaVersion"],
                          server.CURRENT_SCHEMA_VERSION)
+        self.assertEqual(body["config"]["memoryAppCount"], 1)
+        self.assertEqual(body["config"]["diskAppCount"], 1)
         services.assert_not_called()
 
     def test_root_favicon_serves_the_unified_brand_asset(self):
@@ -1214,6 +1384,12 @@ class WindowsProcessSnapshotTests(unittest.TestCase):
             server.sysops.process_uid(os.getpid()), server.sysops.SELF_UID)
         self.assertFalse(server.is_current_user(None))
 
+    def test_snapshot_preserves_argv_boundaries(self):
+        snapshot = server.sysops._ps_snapshot_windows({os.getpid()})
+        self.assertIn(os.getpid(), snapshot)
+        self.assertIsInstance(snapshot[os.getpid()]["argv"], list)
+        self.assertGreaterEqual(len(snapshot[os.getpid()]["argv"]), 1)
+
     def test_targeted_snapshot_skips_pid_that_exits_before_lookup(self):
         fake_psutil = mock.Mock()
         fake_psutil.Process.side_effect = server.sysops.psutil.NoSuchProcess(
@@ -1278,6 +1454,47 @@ class WindowsProcessSnapshotTests(unittest.TestCase):
 @unittest.skipUnless(server.sysops.IS_WINDOWS,
                      "Windows 专属:msvcrt 单实例锁")
 class ConsoleSelfHealTests(unittest.TestCase):
+    def test_expected_disk_cards_are_read_before_startup_continues(self):
+        with mock.patch.object(server, "_disk_configured_app_count",
+                               side_effect=[0, 1]), \
+                mock.patch.object(server.time, "sleep") as sleep:
+            self.assertEqual(
+                server.require_expected_disk_apps("config.json", 1), 1)
+        sleep.assert_called_once_with(0.1)
+
+    def test_expected_disk_cards_fail_closed_instead_of_showing_empty(self):
+        with mock.patch.object(server, "_disk_configured_app_count",
+                               return_value=0):
+            with self.assertRaisesRegex(RuntimeError, "启动前配置校验失败"):
+                server.require_expected_disk_apps(
+                    "config.json", 1, timeout=0)
+
+    def test_unreadable_established_config_fails_even_when_expected_is_zero(self):
+        with mock.patch.object(server, "_disk_configured_app_count",
+                               return_value=None):
+            with self.assertRaisesRegex(RuntimeError, "均不可读"):
+                server.require_expected_disk_apps(
+                    "config.json", 0, timeout=0)
+
+    def test_disk_count_uses_backup_when_main_is_unreadable(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "config.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("{not-json")
+            with open(path + ".bak", "w", encoding="utf-8") as fh:
+                json.dump({"apps": [{"id": "saved-card"}]}, fh)
+            self.assertEqual(server._disk_configured_app_count(path), 1)
+
+    def test_established_missing_config_is_read_only_and_not_recreated(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "config.json")
+            with open(os.path.join(td, "control.token"),
+                      "w", encoding="ascii") as fh:
+                fh.write("x" * 43)
+            cfg = server.Config(path)
+            self.assertFalse(cfg.health_info()["writable"])
+            self.assertFalse(os.path.exists(path))
+
     def test_orphan_without_port_is_stale(self):
         self.assertEqual(
             server.console_instance_status({"pid": 9, "ports": []}, 1),
@@ -1320,6 +1537,27 @@ class ConsoleSelfHealTests(unittest.TestCase):
                     {"pid": 11, "ports": [9600]}, 0),
                 "healthy")
 
+    def test_state_timeout_after_healthy_probe_is_not_reaped(self):
+        health = {"ok": True, "config": {
+            "memoryAppCount": 1, "diskAppCount": 1}}
+        with mock.patch.object(server, "_http_json_localhost",
+                               side_effect=[health, None]):
+            self.assertEqual(
+                server.console_instance_status(
+                    {"pid": 11, "ports": [9600]}, 1),
+                "healthy")
+
+    def test_health_config_mismatch_is_stale_without_state_scan(self):
+        health = {"ok": True, "config": {
+            "memoryAppCount": 0, "diskAppCount": 0}}
+        with mock.patch.object(server, "_http_json_localhost",
+                               return_value=health) as request:
+            self.assertEqual(
+                server.console_instance_status(
+                    {"pid": 11, "ports": [9600]}, 1),
+                "stale")
+        request.assert_called_once_with(9600, "/api/health", 2.0)
+
     def test_health_timeout_is_stale(self):
         with mock.patch.object(server, "_http_json_localhost",
                                return_value=None):
@@ -1347,36 +1585,6 @@ class ConsoleSelfHealTests(unittest.TestCase):
                                            return_value=[]) as reap:
                         self.assertTrue(server.reap_stale_console_processes())
                         reap.assert_called_once_with([22], force=True)
-
-    def test_restore_apps_from_disk_when_memory_empty(self):
-        with tempfile.TemporaryDirectory() as td:
-            path = os.path.join(td, "config.json")
-            payload = {
-                "schemaVersion": 1,
-                "apps": [{
-                    "id": "abcd1234", "name": "demo",
-                    "command": "python app.py",
-                    "cwd": td, "port": 8000, "kind": "service",
-                }],
-                "hidden": [], "pinned": [], "promoted": [],
-                "watchedKeywords": [], "uiTheme": "ops",
-                "openBrowser": True,
-            }
-            with open(path, "w", encoding="utf-8") as fh:
-                json.dump(payload, fh)
-            cfg = server.Config(path)
-            cfg._data["apps"] = []
-            self.assertTrue(cfg.restore_apps_from_disk_if_empty())
-            self.assertEqual(cfg.snapshot()["apps"][0]["id"], "abcd1234")
-            self.assertFalse(cfg.restore_apps_from_disk_if_empty())
-
-    def test_restore_does_not_invent_apps_when_disk_empty(self):
-        with tempfile.TemporaryDirectory() as td:
-            path = os.path.join(td, "config.json")
-            cfg = server.Config(path)
-            cfg._data["apps"] = []
-            self.assertFalse(cfg.restore_apps_from_disk_if_empty())
-            self.assertEqual(cfg.snapshot()["apps"], [])
 
     def test_snapshot_rereads_apps_from_disk_without_restore(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1423,7 +1631,7 @@ class ConsoleSelfHealTests(unittest.TestCase):
             cfg = server.Config(path)
             self.assertEqual(cfg.snapshot()["apps"], [])
 
-    def test_restore_uses_backup_only_if_main_unreadable(self):
+    def test_snapshot_uses_backup_only_if_main_unreadable(self):
         with tempfile.TemporaryDirectory() as td:
             path = os.path.join(td, "config.json")
             payload = {
@@ -1446,7 +1654,6 @@ class ConsoleSelfHealTests(unittest.TestCase):
             with open(path, "w", encoding="utf-8") as fh:
                 fh.write("{")
             cfg._data["apps"] = []
-            self.assertTrue(cfg.restore_apps_from_disk_if_empty())
             self.assertEqual(cfg.snapshot()["apps"][0]["id"], "abcd1234")
 
     def test_update_does_not_clobber_disk_apps_when_memory_empty(self):

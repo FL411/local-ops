@@ -5,8 +5,9 @@
 供 start.bat 调用，输出保持纯 ASCII（Windows cmd 按代码页解析，
 非 ASCII 输出会乱码并破坏分支判断）：
 
-    python launcher_check.py status          -> RUNNING <port> | STOPPED
+    python launcher_check.py status          -> RUNNING <port> | STALE <port> | STOPPED
     python launcher_check.py ensure-runtime  -> OK | ERROR ...
+    python launcher_check.py launch [port]   -> RUNNING <port> | ERROR ...
     python launcher_check.py open <port>     -> 打开浏览器
     python launcher_check.py restart <port>  -> POST /api/console/restart
 
@@ -21,12 +22,18 @@ import subprocess
 import sys
 import re
 import sysconfig
+import time
 import urllib.parse
 import urllib.request
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PORT_START = 9600
 PORT_TRIES = 10
 HEALTH_TIMEOUT = 1.0
+STATE_TIMEOUT = 5.0
+LAUNCH_ATTEMPTS = 2
+LAUNCH_WAIT_SEC = 15.0
+CONFIG_WAIT_SEC = 5.0
 CONTROL_TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{32,128}\Z")
 
 
@@ -37,6 +44,10 @@ def _control_token_path():
                             "control.token")
     base = os.environ.get("APPDATA") or os.path.expanduser("~/AppData/Roaming")
     return os.path.join(base, "总控台", "control.token")
+
+
+def _config_path():
+    return os.path.join(os.path.dirname(_control_token_path()), "config.json")
 
 
 def _read_control_token():
@@ -57,19 +68,105 @@ def _console_url(port, token):
         port, urllib.parse.quote(token, safe="-_"))
 
 
-def _is_console(port):
-    """端口开放且 /api/health 返回 ok 才算总控台实例。"""
+def _read_json(port, path, timeout):
     try:
         with urllib.request.urlopen(
-                "http://127.0.0.1:%d/api/health" % port,
-                timeout=HEALTH_TIMEOUT) as r:
-            data = json.loads(r.read().decode("utf-8"))
-        return bool(data.get("ok"))
+                "http://127.0.0.1:%d%s" % (port, path),
+                timeout=timeout) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        return data if isinstance(data, dict) else None
     except Exception:
-        return False
+        return None
 
 
-def find_console_port():
+def _configured_app_count():
+    """Return disk card count, or None when an existing config is unreadable.
+
+    A missing config is a valid first-run empty state. If the main file is
+    unreadable, a valid backup is still accepted; only when every existing
+    candidate is unreadable do we return None so startup fails closed instead
+    of silently presenting an empty console.
+    """
+    paths = (_config_path(), _config_path() + ".bak")
+    found_candidate = False
+    for path in paths:
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                raw = json.load(fh)
+        except FileNotFoundError:
+            continue
+        except (OSError, UnicodeError, json.JSONDecodeError, TypeError,
+                ValueError):
+            found_candidate = True
+            continue
+        found_candidate = True
+        if not isinstance(raw, dict):
+            continue
+        apps = raw.get("apps")
+        if not isinstance(apps, list):
+            # Config.normalize treats a missing/non-list apps field as the
+            # default empty list, so this is still a valid empty config.
+            return 0
+        return sum(1 for app in apps
+                   if isinstance(app, dict) and app.get("id"))
+    if found_candidate:
+        return None
+    # A missing config is only a valid empty state before the installation
+    # has created its persistent control token. During Windows sign-in the
+    # roaming profile can be temporarily unavailable; treating that window
+    # as a first run would launch an empty console.
+    return None if os.path.lexists(_control_token_path()) else 0
+
+
+def _wait_for_configured_app_count(timeout=CONFIG_WAIT_SEC):
+    """Wait briefly for an established roaming profile to become readable."""
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    while True:
+        count = _configured_app_count()
+        if count is not None:
+            return count
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(0.1)
+
+
+def _console_status(port, disk_app_count=None):
+    """Return RUNNING/STALE for a console, or None for a foreign port."""
+    health = _read_json(port, "/api/health", HEALTH_TIMEOUT)
+    if not isinstance(health, dict) or not health.get("ok"):
+        return None
+    if disk_app_count is None:
+        disk_app_count = _configured_app_count()
+    if disk_app_count is None:
+        return "STALE"
+    if disk_app_count <= 0:
+        return "RUNNING"
+
+    config = health.get("config")
+    if isinstance(config, dict):
+        memory_count = config.get("memoryAppCount")
+        reported_disk_count = config.get("diskAppCount")
+        if memory_count == 0 or reported_disk_count == 0:
+            return "STALE"
+        if isinstance(memory_count, int) and memory_count > 0:
+            return "RUNNING"
+
+    # Older backends do not expose config counts in /api/health. Confirm an
+    # actual mismatch when possible, but never replace an otherwise healthy
+    # instance merely because the expensive state request timed out.
+    state = _read_json(port, "/api/state", STATE_TIMEOUT)
+    if isinstance(state, dict) and isinstance(state.get("apps"), list):
+        return "RUNNING" if state["apps"] else "STALE"
+    return "RUNNING"
+
+
+def _is_console(port):
+    """端口开放且 /api/health 返回 ok 才算总控台实例。"""
+    return _console_status(port) is not None
+
+
+def find_console_status():
+    disk_app_count = _configured_app_count()
     for port in range(PORT_START, PORT_START + PORT_TRIES):
         s = socket.socket()
         s.settimeout(0.3)
@@ -79,9 +176,63 @@ def find_console_port():
             continue
         finally:
             s.close()
-        if _is_console(port):
+        status = _console_status(port, disk_app_count)
+        if status:
+            return status, port
+    return "STOPPED", None
+
+
+def find_console_port():
+    _, port = find_console_status()
+    return port
+
+
+def _pythonw_executable():
+    candidate = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+    return candidate if os.path.isfile(candidate) else sys.executable
+
+
+def _start_console_candidate(expected_app_count, preferred_port=None):
+    args = [
+        _pythonw_executable(), os.path.join(BASE_DIR, "server.py"),
+        "--no-browser", "--log-to-file",
+        "--expected-app-count", str(max(0, int(expected_app_count))),
+    ]
+    if isinstance(preferred_port, int):
+        args.extend(["--preferred-port", str(preferred_port)])
+    return subprocess.Popen(
+        args, cwd=BASE_DIR, close_fds=True,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+
+
+def launch_console(preferred_port=None, attempts=LAUNCH_ATTEMPTS,
+                   wait_sec=LAUNCH_WAIT_SEC):
+    """Start and verify a non-empty console, retrying one stale candidate."""
+    for _ in range(max(1, int(attempts))):
+        status, port = find_console_status()
+        if status == "RUNNING":
             return port
-    return None
+        # Read immediately before each candidate. This is intentionally not
+        # inherited from the old server process: a restart can be triggered
+        # precisely while that process has a stale in-memory snapshot.
+        expected_app_count = _wait_for_configured_app_count()
+        if expected_app_count is None:
+            return None
+        try:
+            candidate = _start_console_candidate(
+                expected_app_count, preferred_port)
+        except OSError:
+            continue
+        deadline = time.monotonic() + max(0.1, float(wait_sec))
+        while time.monotonic() < deadline:
+            status, port = find_console_status()
+            if status == "RUNNING":
+                return port
+            if candidate.poll() is not None:
+                break
+            time.sleep(0.25)
+    status, port = find_console_status()
+    return port if status == "RUNNING" else None
 
 
 PSUTIL_SPEC = "psutil>=7.2"
@@ -145,6 +296,10 @@ def main(argv):
     action = argv[1] if len(argv) > 1 else "status"
     if action == "ensure-runtime":
         return ensure_runtime()
+    if action == "status":
+        status, port = find_console_status()
+        print(status if port is None else "%s %d" % (status, port))
+        return 0
     port = None
     if len(argv) > 2:
         try:
@@ -153,6 +308,14 @@ def main(argv):
             port = None
     if port is None:
         port = find_console_port()
+
+    if action == "launch":
+        port = launch_console(port)
+        if port is None:
+            print("ERROR console failed readiness check")
+            return 1
+        print("RUNNING %d" % port)
+        return 0
 
     if action == "open":
         if port is None:
@@ -185,12 +348,8 @@ def main(argv):
         print("RESTARTING %d" % port)
         return 0
 
-    # 默认 status
-    if port is None:
-        print("STOPPED")
-    else:
-        print("RUNNING %d" % port)
-    return 0
+    print("ERROR unknown action")
+    return 2
 
 
 if __name__ == "__main__":
