@@ -599,6 +599,15 @@ class Config:
             self._health_issues.append(
                 "主配置与备份均不可读，已进入只读保护状态")
             return data
+        control_token = os.path.join(
+            os.path.dirname(os.path.abspath(self._path)), "control.token")
+        if os.path.lexists(control_token):
+            # An established installation must not be reset merely because
+            # the roaming profile was temporarily unavailable at sign-in.
+            self._writable = False
+            self._health_issues.append(
+                "已有控制凭据但配置暂时不可见，已进入只读保护状态")
+            return data
         try:
             self._write_atomic(self._path, self._payload(data))
         except OSError as e:
@@ -707,14 +716,18 @@ class Config:
 
     def health_info(self):
         with self._lock:
+            disk_app_count = _disk_configured_app_count(self._path)
+            issues = list(self._health_issues)
+            if disk_app_count is None:
+                issues.append("磁盘配置与备份当前均不可读")
             return {
                 "writable": self._writable,
                 "recoveredFromBackup": self._recovered_from_backup,
                 "migratedFromSchema": self._migration_from,
-                "issues": list(self._health_issues),
+                "issues": issues,
                 "configPath": self._path,
                 "memoryAppCount": len(self._data.get("apps") or []),
-                "diskAppCount": _disk_configured_app_count(self._path),
+                "diskAppCount": disk_app_count,
             }
 
     def update(self, fn):
@@ -4297,9 +4310,18 @@ def find_console_instances():
 
 
 def _disk_configured_app_count(path=None):
-    """Count app cards in the on-disk config without mutating memory."""
+    """Count disk cards, or None for an established unreadable config."""
     path = path or CONFIG_PATH
     raw = _load_config_raw(path)
+    found_candidate = os.path.lexists(path)
+    if raw is None:
+        backup_path = path + ".bak"
+        raw = _load_config_raw(backup_path)
+        found_candidate = found_candidate or os.path.lexists(backup_path)
+    if raw is None:
+        control_token = os.path.join(
+            os.path.dirname(os.path.abspath(path)), "control.token")
+        return None if (found_candidate or os.path.lexists(control_token)) else 0
     if not isinstance(raw, dict) or not isinstance(raw.get("apps"), list):
         return 0
     return sum(1 for item in raw["apps"]
@@ -4307,19 +4329,20 @@ def _disk_configured_app_count(path=None):
 
 
 def require_expected_disk_apps(path, expected_count, timeout=3.0):
-    """Refuse to expose an empty console when the launcher saw disk cards."""
+    """Refuse startup until disk config is readable and meets expectations."""
     try:
         expected_count = max(0, int(expected_count))
     except (TypeError, ValueError):
         expected_count = 0
-    if expected_count == 0:
-        return 0
     deadline = time.monotonic() + max(0.0, float(timeout))
     while True:
         actual = _disk_configured_app_count(path)
-        if actual >= expected_count:
+        if actual is not None and actual >= expected_count:
             return actual
         if time.monotonic() >= deadline:
+            if actual is None:
+                raise RuntimeError(
+                    "启动前配置校验失败：主配置与备份当前均不可读")
             raise RuntimeError(
                 "启动前配置校验失败：启动器检测到 %d 张卡片，当前进程只读到 %d 张" %
                 (expected_count, actual))
@@ -4343,6 +4366,8 @@ def console_instance_status(item, disk_app_count=0):
     Never classifies by port occupancy of unknown processes.
     """
     ports = [p for p in (item.get("ports") or []) if isinstance(p, int)]
+    if disk_app_count is None:
+        return "stale"
     if not ports:
         return "stale"
     port = min(ports)
@@ -4569,11 +4594,18 @@ def _run_console(preferred_port=None, open_browser=True,
     for private_dir in (DATA_DIR, ICONS_DIR, LOGS_DIR):
         _ensure_private_dir(private_dir)
     start_log_maintenance()
-    require_expected_disk_apps(CONFIG_PATH, expected_app_count)
+    startup_disk_apps = require_expected_disk_apps(
+        CONFIG_PATH, expected_app_count)
     cfg = Config(CONFIG_PATH)
     cfg.restore_apps_from_disk_if_empty()
     loaded = len(cfg.snapshot().get("apps") or [])
     disk_apps = _disk_configured_app_count(cfg.path)
+    required_apps = max(int(expected_app_count), startup_disk_apps)
+    if disk_apps is None or loaded < max(required_apps, disk_apps or 0):
+        raise RuntimeError(
+            "启动前配置校验失败：内存 %d 张，磁盘 %s 张，至少应加载 %d 张" %
+            (loaded, "不可读" if disk_apps is None else str(disk_apps),
+             required_apps))
     print("已加载 %d 个应用卡片（磁盘 %d，%s）" %
           (loaded, disk_apps, cfg.path), flush=True)
     if loaded == 0 and disk_apps > 0:

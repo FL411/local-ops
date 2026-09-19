@@ -235,6 +235,30 @@ class LauncherCapabilityTokenTests(unittest.TestCase):
                                    return_value=path):
                 self.assertIsNone(launcher_check._configured_app_count())
 
+    def test_missing_config_with_existing_token_is_not_first_run(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "config.json")
+            token = os.path.join(td, "control.token")
+            with open(token, "w", encoding="ascii") as fh:
+                fh.write("x" * 43)
+            with mock.patch.object(launcher_check, "_config_path",
+                                   return_value=path), \
+                    mock.patch.object(launcher_check,
+                                      "_control_token_path",
+                                      return_value=token):
+                self.assertIsNone(launcher_check._configured_app_count())
+
+    def test_missing_config_without_token_is_valid_first_run(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "config.json")
+            token = os.path.join(td, "control.token")
+            with mock.patch.object(launcher_check, "_config_path",
+                                   return_value=path), \
+                    mock.patch.object(launcher_check,
+                                      "_control_token_path",
+                                      return_value=token):
+                self.assertEqual(launcher_check._configured_app_count(), 0)
+
     def test_valid_backup_is_used_when_main_config_is_unreadable(self):
         with tempfile.TemporaryDirectory() as td:
             path = os.path.join(td, "config.json")
@@ -1401,6 +1425,32 @@ class ConsoleSelfHealTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "启动前配置校验失败"):
                 server.require_expected_disk_apps(
                     "config.json", 1, timeout=0)
+
+    def test_unreadable_established_config_fails_even_when_expected_is_zero(self):
+        with mock.patch.object(server, "_disk_configured_app_count",
+                               return_value=None):
+            with self.assertRaisesRegex(RuntimeError, "均不可读"):
+                server.require_expected_disk_apps(
+                    "config.json", 0, timeout=0)
+
+    def test_disk_count_uses_backup_when_main_is_unreadable(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "config.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("{not-json")
+            with open(path + ".bak", "w", encoding="utf-8") as fh:
+                json.dump({"apps": [{"id": "saved-card"}]}, fh)
+            self.assertEqual(server._disk_configured_app_count(path), 1)
+
+    def test_established_missing_config_is_read_only_and_not_recreated(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "config.json")
+            with open(os.path.join(td, "control.token"),
+                      "w", encoding="ascii") as fh:
+                fh.write("x" * 43)
+            cfg = server.Config(path)
+            self.assertFalse(cfg.health_info()["writable"])
+            self.assertFalse(os.path.exists(path))
 
     def test_orphan_without_port_is_stale(self):
         self.assertEqual(

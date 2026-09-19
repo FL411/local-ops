@@ -33,6 +33,7 @@ HEALTH_TIMEOUT = 1.0
 STATE_TIMEOUT = 5.0
 LAUNCH_ATTEMPTS = 2
 LAUNCH_WAIT_SEC = 15.0
+CONFIG_WAIT_SEC = 5.0
 CONTROL_TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{32,128}\Z")
 
 
@@ -108,7 +109,25 @@ def _configured_app_count():
             return 0
         return sum(1 for app in apps
                    if isinstance(app, dict) and app.get("id"))
-    return None if found_candidate else 0
+    if found_candidate:
+        return None
+    # A missing config is only a valid empty state before the installation
+    # has created its persistent control token. During Windows sign-in the
+    # roaming profile can be temporarily unavailable; treating that window
+    # as a first run would launch an empty console.
+    return None if os.path.lexists(_control_token_path()) else 0
+
+
+def _wait_for_configured_app_count(timeout=CONFIG_WAIT_SEC):
+    """Wait briefly for an established roaming profile to become readable."""
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    while True:
+        count = _configured_app_count()
+        if count is not None:
+            return count
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(0.1)
 
 
 def _console_status(port, disk_app_count=None):
@@ -196,7 +215,7 @@ def launch_console(preferred_port=None, attempts=LAUNCH_ATTEMPTS,
         # Read immediately before each candidate. This is intentionally not
         # inherited from the old server process: a restart can be triggered
         # precisely while that process has a stale in-memory snapshot.
-        expected_app_count = _configured_app_count()
+        expected_app_count = _wait_for_configured_app_count()
         if expected_app_count is None:
             return None
         try:
