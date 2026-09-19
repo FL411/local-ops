@@ -1759,6 +1759,10 @@ def get_state_snapshot(cfg, console_port):
 
 def build_health(cfg):
     """不执行 ps/lsof 的轻量健康检查。"""
+    # snapshot() first refreshes the filesystem-backed Config. Returning
+    # health_info() from before that refresh can falsely report zero cards to
+    # the launcher and trigger replacement of a healthy instance.
+    snapshot = cfg.snapshot()
     health = cfg.health_info()
     issues = list(health.get("issues") or [])
     if VERSION_LOAD_ERROR:
@@ -1790,7 +1794,6 @@ def build_health(cfg):
         if not stat.S_ISREG(mode):
             issues.append("%s 不是普通文件" % label)
     degraded = bool(issues)
-    snapshot = cfg.snapshot()
     return {
         "ok": not degraded,
         "status": "degraded" if degraded else "ok",
@@ -4323,9 +4326,17 @@ def console_instance_status(item, disk_app_count=0):
     health = _http_json_localhost(port, "/api/health", 2.0)
     if not isinstance(health, dict) or not health.get("ok"):
         return "stale"
+    health_config = health.get("config")
+    if disk_app_count > 0 and isinstance(health_config, dict):
+        if (health_config.get("memoryAppCount") == 0
+                or health_config.get("diskAppCount") == 0):
+            return "stale"
     state = _http_json_localhost(port, "/api/state", 4.0)
     if not isinstance(state, dict):
-        return "stale"
+        # /api/state performs process scans and can time out transiently. The
+        # lightweight health endpoint already proved this is a live console;
+        # do not kill it solely because one expensive probe missed its window.
+        return "healthy"
     apps = state.get("apps")
     live_count = len(apps) if isinstance(apps, list) else 0
     if live_count == 0 and disk_app_count > 0:

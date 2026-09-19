@@ -5,7 +5,7 @@
 供 start.bat 调用，输出保持纯 ASCII（Windows cmd 按代码页解析，
 非 ASCII 输出会乱码并破坏分支判断）：
 
-    python launcher_check.py status          -> RUNNING <port> | STOPPED
+    python launcher_check.py status          -> RUNNING <port> | STALE <port> | STOPPED
     python launcher_check.py ensure-runtime  -> OK | ERROR ...
     python launcher_check.py open <port>     -> 打开浏览器
     python launcher_check.py restart <port>  -> POST /api/console/restart
@@ -27,6 +27,7 @@ import urllib.request
 PORT_START = 9600
 PORT_TRIES = 10
 HEALTH_TIMEOUT = 1.0
+STATE_TIMEOUT = 5.0
 CONTROL_TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{32,128}\Z")
 
 
@@ -37,6 +38,10 @@ def _control_token_path():
                             "control.token")
     base = os.environ.get("APPDATA") or os.path.expanduser("~/AppData/Roaming")
     return os.path.join(base, "总控台", "control.token")
+
+
+def _config_path():
+    return os.path.join(os.path.dirname(_control_token_path()), "config.json")
 
 
 def _read_control_token():
@@ -57,19 +62,65 @@ def _console_url(port, token):
         port, urllib.parse.quote(token, safe="-_"))
 
 
-def _is_console(port):
-    """端口开放且 /api/health 返回 ok 才算总控台实例。"""
+def _read_json(port, path, timeout):
     try:
         with urllib.request.urlopen(
-                "http://127.0.0.1:%d/api/health" % port,
-                timeout=HEALTH_TIMEOUT) as r:
-            data = json.loads(r.read().decode("utf-8"))
-        return bool(data.get("ok"))
+                "http://127.0.0.1:%d%s" % (port, path),
+                timeout=timeout) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        return data if isinstance(data, dict) else None
     except Exception:
-        return False
+        return None
 
 
-def find_console_port():
+def _configured_app_count():
+    try:
+        with open(_config_path(), "r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+        return 0
+    apps = raw.get("apps") if isinstance(raw, dict) else None
+    if not isinstance(apps, list):
+        return 0
+    return sum(1 for app in apps
+               if isinstance(app, dict) and app.get("id"))
+
+
+def _console_status(port, disk_app_count=None):
+    """Return RUNNING/STALE for a console, or None for a foreign port."""
+    health = _read_json(port, "/api/health", HEALTH_TIMEOUT)
+    if not isinstance(health, dict) or not health.get("ok"):
+        return None
+    if disk_app_count is None:
+        disk_app_count = _configured_app_count()
+    if disk_app_count <= 0:
+        return "RUNNING"
+
+    config = health.get("config")
+    if isinstance(config, dict):
+        memory_count = config.get("memoryAppCount")
+        reported_disk_count = config.get("diskAppCount")
+        if memory_count == 0 or reported_disk_count == 0:
+            return "STALE"
+        if isinstance(memory_count, int) and memory_count > 0:
+            return "RUNNING"
+
+    # Older backends do not expose config counts in /api/health. Confirm an
+    # actual mismatch when possible, but never replace an otherwise healthy
+    # instance merely because the expensive state request timed out.
+    state = _read_json(port, "/api/state", STATE_TIMEOUT)
+    if isinstance(state, dict) and isinstance(state.get("apps"), list):
+        return "RUNNING" if state["apps"] else "STALE"
+    return "RUNNING"
+
+
+def _is_console(port):
+    """端口开放且 /api/health 返回 ok 才算总控台实例。"""
+    return _console_status(port) is not None
+
+
+def find_console_status():
+    disk_app_count = _configured_app_count()
     for port in range(PORT_START, PORT_START + PORT_TRIES):
         s = socket.socket()
         s.settimeout(0.3)
@@ -79,9 +130,15 @@ def find_console_port():
             continue
         finally:
             s.close()
-        if _is_console(port):
-            return port
-    return None
+        status = _console_status(port, disk_app_count)
+        if status:
+            return status, port
+    return "STOPPED", None
+
+
+def find_console_port():
+    _, port = find_console_status()
+    return port
 
 
 PSUTIL_SPEC = "psutil>=7.2"
@@ -145,6 +202,10 @@ def main(argv):
     action = argv[1] if len(argv) > 1 else "status"
     if action == "ensure-runtime":
         return ensure_runtime()
+    if action == "status":
+        status, port = find_console_status()
+        print(status if port is None else "%s %d" % (status, port))
+        return 0
     port = None
     if len(argv) > 2:
         try:
@@ -185,12 +246,8 @@ def main(argv):
         print("RESTARTING %d" % port)
         return 0
 
-    # 默认 status
-    if port is None:
-        print("STOPPED")
-    else:
-        print("RUNNING %d" % port)
-    return 0
+    print("ERROR unknown action")
+    return 2
 
 
 if __name__ == "__main__":

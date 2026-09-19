@@ -64,12 +64,19 @@ if not exist "%PYW%" set "PYW=%PYEXE%"
 if errorlevel 1 goto :install_failed
 
 :probe
+set "LSTATE="
+set "LPORT="
 "%PYEXE%" "%~dp0launcher_check.py" status > "%TEMP%\localops_status.txt" 2>nul
 set /p LSTATUS=<"%TEMP%\localops_status.txt"
 del "%TEMP%\localops_status.txt" >nul 2>nul
 if not defined LSTATUS set "LSTATUS=STOPPED"
 if "%LSTATUS%"=="STOPPED" goto :launch
-for /f "tokens=2" %%p in ("%LSTATUS%") do set "LPORT=%%p"
+for /f "tokens=1,2" %%s in ("%LSTATUS%") do (
+  set "LSTATE=%%s"
+  set "LPORT=%%t"
+)
+if "%LSTATE%"=="STALE" goto :launch
+if not "%LSTATE%"=="RUNNING" goto :launch
 if not defined LPORT goto :launch
 REM Already running: open browser directly (tray owns open/restart/stop)
 "%PYEXE%" "%~dp0launcher_check.py" open %LPORT%

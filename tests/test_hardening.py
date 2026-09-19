@@ -174,6 +174,39 @@ class LauncherCapabilityTokenTests(unittest.TestCase):
         open_browser.assert_not_called()
         urlopen.assert_not_called()
 
+    def test_status_marks_disk_memory_mismatch_stale(self):
+        health = {"ok": True, "config": {
+            "memoryAppCount": 0, "diskAppCount": 0}}
+        with mock.patch.object(launcher_check, "_read_json",
+                               return_value=health):
+            self.assertEqual(
+                launcher_check._console_status(9600, disk_app_count=1),
+                "STALE")
+
+    def test_status_leaves_matching_instance_running(self):
+        health = {"ok": True, "config": {
+            "memoryAppCount": 1, "diskAppCount": 1}}
+        with mock.patch.object(launcher_check, "_read_json",
+                               return_value=health):
+            self.assertEqual(
+                launcher_check._console_status(9600, disk_app_count=1),
+                "RUNNING")
+
+    def test_old_healthy_instance_is_not_replaced_on_state_timeout(self):
+        with mock.patch.object(launcher_check, "_read_json",
+                               side_effect=[{"ok": True}, None]):
+            self.assertEqual(
+                launcher_check._console_status(9600, disk_app_count=1),
+                "RUNNING")
+
+    def test_main_status_reports_probe_result(self):
+        with mock.patch.object(launcher_check, "find_console_status",
+                               return_value=("STALE", 9600)), \
+                mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            self.assertEqual(
+                launcher_check.main(["launcher_check.py", "status"]), 0)
+        self.assertEqual(stdout.getvalue().strip(), "STALE 9600")
+
 
 
 class EnsureRuntimeTests(unittest.TestCase):
@@ -313,6 +346,9 @@ class EnsureRuntimeTests(unittest.TestCase):
         self.assertIn("ensure-runtime", bat)
         self.assertNotIn("import sys,psutil", bat)
         self.assertIn("ensure-runtime", cs)
+        self.assertIn("launcher_check.py\" status", bat)
+        self.assertIn('"status"', cs)
+        self.assertIn('StartsWith("RUNNING ")', cs)
 
 
 class ControlTokenStorageTests(unittest.TestCase):
@@ -436,6 +472,10 @@ class DeliveryMetadataTests(unittest.TestCase):
     def test_health_is_lightweight_and_reports_runtime_metadata(self):
         icons = os.path.join(self.h.tmp.name, "icons")
         logs = os.path.join(self.h.tmp.name, "logs")
+        payload = self.h.cfg.snapshot()
+        payload["apps"] = [{"id": "disk-app", "name": "Disk app"}]
+        with open(self.h.config_path, "w", encoding="utf-8") as config_file:
+            json.dump(payload, config_file)
         os.chmod(self.h.tmp.name, 0o700)
         os.mkdir(icons, 0o700)
         os.mkdir(logs, 0o700)
@@ -454,6 +494,8 @@ class DeliveryMetadataTests(unittest.TestCase):
         self.assertEqual(body["version"], server.APP_VERSION)
         self.assertEqual(body["schemaVersion"],
                          server.CURRENT_SCHEMA_VERSION)
+        self.assertEqual(body["config"]["memoryAppCount"], 1)
+        self.assertEqual(body["config"]["diskAppCount"], 1)
         services.assert_not_called()
 
     def test_root_favicon_serves_the_unified_brand_asset(self):
@@ -1319,6 +1361,27 @@ class ConsoleSelfHealTests(unittest.TestCase):
                 server.console_instance_status(
                     {"pid": 11, "ports": [9600]}, 0),
                 "healthy")
+
+    def test_state_timeout_after_healthy_probe_is_not_reaped(self):
+        health = {"ok": True, "config": {
+            "memoryAppCount": 1, "diskAppCount": 1}}
+        with mock.patch.object(server, "_http_json_localhost",
+                               side_effect=[health, None]):
+            self.assertEqual(
+                server.console_instance_status(
+                    {"pid": 11, "ports": [9600]}, 1),
+                "healthy")
+
+    def test_health_config_mismatch_is_stale_without_state_scan(self):
+        health = {"ok": True, "config": {
+            "memoryAppCount": 0, "diskAppCount": 0}}
+        with mock.patch.object(server, "_http_json_localhost",
+                               return_value=health) as request:
+            self.assertEqual(
+                server.console_instance_status(
+                    {"pid": 11, "ports": [9600]}, 1),
+                "stale")
+        request.assert_called_once_with(9600, "/api/health", 2.0)
 
     def test_health_timeout_is_stale(self):
         with mock.patch.object(server, "_http_json_localhost",

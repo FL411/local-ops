@@ -37,8 +37,22 @@ public static class Launcher
                             "LocalOps Console", MessageBoxButtons.OK, MessageBoxIcon.Error);
             return 1;
         }
-        if (!EnsureRuntime(pyexe, root))
+        string status = RunLauncherCheck(pyexe, root, "status", 10000);
+        if (status.StartsWith("RUNNING "))
+        {
+            bool noBrowser = Array.IndexOf(args, "--no-browser") >= 0;
+            if (noBrowser) return 0;
+            string port = status.Substring("RUNNING ".Length).Trim();
+            string opened = RunLauncherCheck(pyexe, root, "open " + port, 10000);
+            if (opened.StartsWith("OPENED ")) return 0;
+            MessageBox.Show("The console is running, but its control token is unavailable. " +
+                            "Use the tray menu to restart it, or stop it before launching again.",
+                            "LocalOps Console", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             return 1;
+        }
+        // STOPPED starts normally. STALE deliberately starts a candidate;
+        // server.py will validate and replace only the unhealthy same-project instance.
+        if (!EnsureRuntime(pyexe, root)) return 1;
         string pythonw = pyexe.Replace("python.exe", "pythonw.exe");
         if (!File.Exists(pythonw)) pythonw = pyexe;
         Process p = new Process();
@@ -48,6 +62,38 @@ public static class Launcher
         p.StartInfo.UseShellExecute = false;
         p.Start();
         return 0;
+    }
+
+    private static string RunLauncherCheck(string pyexe, string root,
+                                           string arguments, int timeoutMs)
+    {
+        try
+        {
+            ProcessStartInfo psi = new ProcessStartInfo();
+            psi.FileName = pyexe;
+            psi.Arguments = "launcher_check.py " + arguments;
+            psi.WorkingDirectory = root;
+            psi.UseShellExecute = false;
+            psi.RedirectStandardOutput = true;
+            psi.RedirectStandardError = true;
+            psi.CreateNoWindow = true;
+            using (Process p = Process.Start(psi))
+            {
+                if (p == null) return "";
+                string output = p.StandardOutput.ReadToEnd().Trim();
+                p.StandardError.ReadToEnd();
+                if (!p.WaitForExit(timeoutMs))
+                {
+                    try { p.Kill(); } catch { }
+                    return "";
+                }
+                return p.ExitCode == 0 ? output : "";
+            }
+        }
+        catch (Exception)
+        {
+            return "";
+        }
     }
 
     // python.exe may see user-site psutil that pythonw ignores.
