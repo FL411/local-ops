@@ -535,6 +535,43 @@ class AtomicAttachCreateTests(unittest.TestCase):
         self.assertFalse(body["ok"])
         self.assertEqual(self.h.cfg.snapshot()["apps"], [])
 
+    def test_attached_python_process_persists_project_virtualenv(self):
+        with tempfile.TemporaryDirectory() as td:
+            scripts = os.path.join(td, ".venv", "Scripts")
+            os.makedirs(scripts)
+            venv_python = os.path.join(scripts, "python.exe")
+            with open(venv_python, "wb") as handle:
+                handle.write(b"MZ")
+            payload = {
+                "name": "API",
+                "command": (
+                    r"C:\Tools\uv\python\python.exe "
+                    r"-m uvicorn app:app --port 8765"),
+                "cwd": td,
+                "port": 8765,
+                "kind": "service",
+                "attachPid": 4242,
+            }
+            with mock.patch.object(server, "app_alive_sign",
+                                   return_value=False), \
+                    mock.patch.object(server, "scan_listeners",
+                                      return_value={(4242, 8765)}), \
+                    mock.patch.object(server, "ps_snapshot", return_value={
+                        4242: {"uid": server.SELF_UID, "ctime": 123456.0}}), \
+                    mock.patch.object(server, "listener_app_owners",
+                                      return_value={}), \
+                    mock.patch.object(server, "lsof_cwds",
+                                      return_value={4242: td}):
+                status, body, _ = self.h.request(
+                    "POST", "/api/apps", json.dumps(payload),
+                    {"Content-Type": "application/json"})
+
+            saved = self.h.cfg.snapshot()["apps"][0]
+            tokens = server._simple_command_tokens(saved["command"])
+            self.assertEqual(status, 200)
+            self.assertEqual(os.path.normcase(tokens[0]),
+                             os.path.normcase(venv_python))
+
 
 class DeliveryMetadataTests(unittest.TestCase):
     def setUp(self):

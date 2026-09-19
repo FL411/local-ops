@@ -112,6 +112,36 @@ class OriginAttributionTests(unittest.TestCase):
 
 
 class WindowsScriptCommandTests(unittest.TestCase):
+    def test_reclaimed_python_service_prefers_project_virtualenv(self):
+        with tempfile.TemporaryDirectory() as td:
+            scripts = os.path.join(td, ".venv", "Scripts")
+            os.makedirs(scripts)
+            venv_python = os.path.join(scripts, "python.exe")
+            with open(venv_python, "wb") as handle:
+                handle.write(b"MZ")
+            command = (
+                r"C:\Tools\uv\python\python.exe "
+                r"-m uvicorn dashboard.app:app --port 8765"
+            )
+            normalized = server.normalize_attached_python_command(command, td)
+            tokens = server._simple_command_tokens(normalized)
+
+        self.assertEqual(os.path.normcase(tokens[0]),
+                         os.path.normcase(venv_python))
+        self.assertEqual(tokens[1:], [
+            "-m", "uvicorn", "dashboard.app:app", "--port", "8765"])
+
+    def test_reclaimed_non_python_command_is_unchanged(self):
+        with tempfile.TemporaryDirectory() as td:
+            scripts = os.path.join(td, ".venv", "Scripts")
+            os.makedirs(scripts)
+            with open(os.path.join(scripts, "python.exe"), "wb") as handle:
+                handle.write(b"MZ")
+            command = "npm run dev"
+            self.assertEqual(
+                server.normalize_attached_python_command(command, td),
+                command)
+
     def test_selected_python_script_with_spaces_is_checked(self):
         with tempfile.TemporaryDirectory() as td:
             folder = os.path.join(td, "script folder")

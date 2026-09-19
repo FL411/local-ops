@@ -2205,6 +2205,48 @@ def _simple_command_tokens(command):
     return _simple_windows_command_tokens(command)
 
 
+def normalize_attached_python_command(command, cwd):
+    """Prefer a project virtualenv over Windows' reported base Python.
+
+    A venv Python process can appear in the Windows process table as its base
+    interpreter. Saving that executable verbatim makes a reclaimed service
+    fail on restart because project modules such as uvicorn are not installed
+    in the base interpreter.
+    """
+    if not isinstance(cwd, str) or not cwd or not os.path.isdir(cwd):
+        return command
+    tokens = _simple_command_tokens(command)
+    if not tokens:
+        return command
+    executable_index = 0
+    while (executable_index < len(tokens)
+           and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*",
+                            tokens[executable_index])):
+        executable_index += 1
+    if executable_index >= len(tokens):
+        return command
+    executable = tokens[executable_index]
+    if not re.fullmatch(
+            r"(?:py|python|pythonw)(?:\d+(?:\.\d+)*)?(?:\.exe)?",
+            os.path.basename(executable), re.IGNORECASE):
+        return command
+    executable_base = os.path.basename(executable).lower()
+    executable_name = ("pythonw.exe" if executable_base.startswith("pythonw")
+                       else "python.exe")
+    for directory in (".venv", "venv", "env"):
+        candidate = os.path.join(cwd, directory, "Scripts", executable_name)
+        if not os.path.isfile(candidate):
+            continue
+        try:
+            if os.path.realpath(candidate) == os.path.realpath(executable):
+                return command
+        except OSError:
+            pass
+        tokens[executable_index] = candidate
+        return subprocess.list2cmdline(tokens)
+    return command
+
+
 def _resolve_command_path(value, cwd):
     value = os.path.expanduser(value)
     if os.path.isabs(value):
@@ -2805,6 +2847,8 @@ def attach_app_process(cfg, app_id, app, pid):
     if not ok:
         return False, error, identity
     actual_cwd = identity["cwd"]
+    normalized_command = normalize_attached_python_command(
+        app.get("command"), actual_cwd)
     cwd_updated = False
     pid_conflict = False
 
@@ -2834,6 +2878,7 @@ def attach_app_process(cfg, app_id, app, pid):
         if not same:
             target["cwd"] = actual_cwd
             cwd_updated = True
+        target["command"] = normalized_command
         return True
 
     if not cfg.update(op):
@@ -3890,6 +3935,8 @@ class Handler(BaseHTTPRequestHandler):
             except OSError:
                 cwd_updated = True
             app["cwd"] = actual_cwd
+            app["command"] = normalize_attached_python_command(
+                app.get("command"), actual_cwd)
             app["lastPid"] = attach_pid
             app["lastCreateTime"] = identity.get("ctime")
             app["attached"] = True
