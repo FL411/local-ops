@@ -2,6 +2,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import uuid
@@ -11,6 +12,52 @@ import windows_runtime
 
 
 class WindowsRuntimePureTests(unittest.TestCase):
+    def test_close_waits_for_in_progress_job_members_probe(self):
+        api = mock.Mock()
+        entered = threading.Event()
+        release = threading.Event()
+
+        def query_members(_job):
+            entered.set()
+            if not release.wait(2):
+                raise TimeoutError("test probe was not released")
+            return [123]
+
+        api.query_job_members.side_effect = query_members
+        instance = windows_runtime.ManagedProcess(
+            api, 10, "run-01", "Local\\job", 123)
+        probe_errors = []
+
+        def probe():
+            try:
+                instance.members()
+            except Exception as exc:  # surfaced in the assertion thread
+                probe_errors.append(exc)
+
+        probe_thread = threading.Thread(target=probe)
+        probe_thread.start()
+        self.assertTrue(entered.wait(1))
+
+        close_started = threading.Event()
+
+        def close():
+            close_started.set()
+            instance.close()
+
+        close_thread = threading.Thread(target=close)
+        close_thread.start()
+        self.assertTrue(close_started.wait(1))
+        time.sleep(0.05)
+        api.close_handle.assert_not_called()
+
+        release.set()
+        probe_thread.join(1)
+        close_thread.join(1)
+        self.assertFalse(probe_thread.is_alive())
+        self.assertFalse(close_thread.is_alive())
+        self.assertEqual(probe_errors, [])
+        self.assertEqual(api.close_handle.call_args_list, [mock.call(10)])
+
     def test_job_name_is_sid_scoped_and_validated(self):
         left = windows_runtime.job_name_for("run-01", "S-1-5-21-10")
         right = windows_runtime.job_name_for("run-01", "S-1-5-21-11")
@@ -25,6 +72,61 @@ class WindowsRuntimePureTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "creation time is required"):
             manager.reopen("run-01", sid="S-1-5-21-10", anchor_pid=123)
         manager._api.open_job.assert_not_called()
+
+    def test_members_reports_and_retains_failed_anchor_cleanup(self):
+        api = mock.Mock()
+        api.query_job_members.return_value = []
+        api.poll_process.side_effect = [None, None]
+        api.wait_process.side_effect = subprocess.TimeoutExpired("keeper", 2)
+        instance = windows_runtime.ManagedProcess(
+            api, 10, "run-01", "Local\\job", 123,
+            anchor_pid=456, anchor_handle=20)
+
+        with self.assertRaisesRegex(OSError, "保活进程"):
+            instance.members()
+
+        self.assertEqual(instance._anchor_handle, 20)
+        self.assertEqual(instance._job_handle, 10)
+        api.close_handle.assert_not_called()
+
+        # The same retained process handle can be used to finish cleanup once
+        # Windows signals the keeper.
+        api.poll_process.side_effect = None
+        api.poll_process.return_value = 0
+        self.assertEqual(instance.members(), [])
+        instance.close()
+        self.assertEqual(api.close_handle.call_args_list,
+                         [mock.call(20), mock.call(10)])
+
+    def test_reopen_empty_job_timeout_raises_with_retryable_handles(self):
+        manager = object.__new__(windows_runtime.WindowsRuntimeManager)
+        api = mock.Mock()
+        manager._api = api
+        api.open_job.return_value = 10
+        api.query_job_members.return_value = []
+        api.open_process.return_value = 20
+        api.process_creation_time.return_value = 123.0
+        api.process_sid.return_value = "S-1-5-21-10"
+        api.poll_process.side_effect = [None, None]
+        api.wait_process.side_effect = subprocess.TimeoutExpired("keeper", 2)
+
+        with self.assertRaises(windows_runtime.JobAnchorCleanupError) as caught:
+            manager.reopen(
+                "run-01", sid="S-1-5-21-10", anchor_pid=456,
+                anchor_create_time=123.0)
+
+        cleanup = caught.exception.managed_process
+        self.assertEqual(cleanup._anchor_handle, 20)
+        self.assertEqual(cleanup._job_handle, 10)
+        api.close_handle.assert_not_called()
+
+        # Cleanup remains retryable with the exact handles opened during reopen.
+        api.poll_process.side_effect = None
+        api.poll_process.return_value = 0
+        self.assertEqual(cleanup.members(), [])
+        cleanup.close()
+        self.assertEqual(api.close_handle.call_args_list,
+                         [mock.call(20), mock.call(10)])
 
     def test_environment_overlay_is_case_insensitive_and_unicode_safe(self):
         block = windows_runtime._environment_block({

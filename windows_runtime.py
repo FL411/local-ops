@@ -18,6 +18,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from ctypes import wintypes
@@ -628,6 +629,19 @@ class _NativeApi:
             self.kernel32.CloseHandle(handle)
 
 
+class JobAnchorCleanupError(OSError):
+    """An empty Job Object could not release its keeper process.
+
+    ``managed_process`` retains the Job Object and exact keeper process
+    handles so a caller can retry cleanup instead of losing the only safe
+    references after a timeout.
+    """
+
+    def __init__(self, message, managed_process):
+        super().__init__(message)
+        self.managed_process = managed_process
+
+
 class ManagedProcess:
     """A subprocess-like handle plus its Job Object process boundary."""
 
@@ -648,6 +662,7 @@ class ManagedProcess:
         self._anchor_handle = anchor_handle
         self._root_exit_code = root_exit_code
         self._closed = False
+        self._lock = threading.RLock()
 
     def poll(self):
         if self._process_handle:
@@ -678,12 +693,13 @@ class ManagedProcess:
         return self._root_exit_code
 
     def members(self):
-        if not self._job_handle:
-            return []
-        members = self._api.query_job_members(self._job_handle)
-        if not members:
-            self._stop_anchor()
-        return members
+        with self._lock:
+            if not self._job_handle:
+                return []
+            members = self._api.query_job_members(self._job_handle)
+            if not members and not self._stop_anchor():
+                raise OSError("无法清理 Job Object 保活进程")
+            return members
 
     def wait_for_empty(self, timeout=None):
         """Wait until every application process in the Job Object has exited."""
@@ -695,25 +711,31 @@ class ManagedProcess:
         return None
 
     def _stop_anchor(self):
-        if not self._anchor_handle:
-            return True
-        try:
-            # The handle is bound to the exact process opened at launch/reopen;
-            # never re-resolve its PID here, so PID reuse cannot redirect cleanup.
-            if self._api.poll_process(self._anchor_handle) is not None:
+        with self._lock:
+            if not self._anchor_handle:
                 return True
             try:
-                self._api.terminate_process(self._anchor_handle, 0)
-            except OSError:
-                # Process exit can race the poll.  Treat it as success only if
-                # the original process handle is now signaled.
+                # The handle is bound to the exact process opened at launch or
+                # reopen; never re-resolve its PID, so PID reuse cannot redirect.
                 if self._api.poll_process(self._anchor_handle) is not None:
                     return True
-                raise
-            self._api.wait_process(self._anchor_handle, 2.0)
-            return True
-        except (OSError, subprocess.TimeoutExpired):
-            return False
+                try:
+                    self._api.terminate_process(self._anchor_handle, 0)
+                except OSError:
+                    # Process exit can race the poll. Treat it as success only
+                    # if the original process handle is now signaled.
+                    if self._api.poll_process(self._anchor_handle) is not None:
+                        return True
+                    raise
+                try:
+                    self._api.wait_process(self._anchor_handle, 2.0)
+                except subprocess.TimeoutExpired:
+                    # A timeout is only a failed cleanup if the exact process
+                    # remains alive; it may have exited as the wait expired.
+                    pass
+                return self._api.poll_process(self._anchor_handle) is not None
+            except OSError:
+                return False
 
     def terminate(self, force=False, timeout=5.0):
         """Stop the job as a unit; graceful stop falls back to job termination.
@@ -722,6 +744,10 @@ class ManagedProcess:
         graceful request uses taskkill's window-close path for each job member,
         then terminates only this Job Object if processes remain after timeout.
         """
+        with self._lock:
+            return self._terminate_locked(force=force, timeout=timeout)
+
+    def _terminate_locked(self, force=False, timeout=5.0):
         if self._closed or not self._job_handle:
             return False, "Job Object handle is closed"
         try:
@@ -757,21 +783,22 @@ class ManagedProcess:
 
     def close(self):
         """Release handles without terminating the job or its processes."""
-        if self._closed:
-            return
-        self._closed = True
-        if self._thread_handle:
-            self._api.close_handle(self._thread_handle)
-            self._thread_handle = None
-        if self._process_handle:
-            self._api.close_handle(self._process_handle)
-            self._process_handle = None
-        if self._anchor_handle:
-            self._api.close_handle(self._anchor_handle)
-            self._anchor_handle = None
-        if self._job_handle:
-            self._api.close_handle(self._job_handle)
-            self._job_handle = None
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            if self._thread_handle:
+                self._api.close_handle(self._thread_handle)
+                self._thread_handle = None
+            if self._process_handle:
+                self._api.close_handle(self._process_handle)
+                self._process_handle = None
+            if self._anchor_handle:
+                self._api.close_handle(self._anchor_handle)
+                self._anchor_handle = None
+            if self._job_handle:
+                self._api.close_handle(self._job_handle)
+                self._job_handle = None
 
     def __enter__(self):
         return self
@@ -948,14 +975,23 @@ class WindowsRuntimeManager:
                         anchor_handle = None
             if not members:
                 if anchor_handle:
-                    self._api.terminate_process(anchor_handle, 0)
-                    try:
-                        self._api.wait_process(anchor_handle, 2)
-                    except subprocess.TimeoutExpired:
-                        pass
-                    self._api.close_handle(anchor_handle)
+                    # Transfer ownership before cleanup so a failed wait can
+                    # carry the exact handles back to the caller for retry.
+                    cleanup = ManagedProcess(
+                        self._api, job, run_id, job_name,
+                        int(root_pid or anchor_pid or 1),
+                        anchor_pid=anchor_pid,
+                        anchor_create_time=anchor_create_time,
+                        anchor_handle=anchor_handle)
+                    job = None
                     anchor_handle = None
-                self._api.close_handle(job)
+                    if not cleanup._stop_anchor():
+                        raise JobAnchorCleanupError(
+                            "无法清理空 Job Object 的保活进程", cleanup)
+                    cleanup.close()
+                else:
+                    self._api.close_handle(job)
+                    job = None
                 return None
             if not anchor_handle:
                 anchor_handle, anchor_pid, anchor_create_time = \
@@ -984,7 +1020,8 @@ class WindowsRuntimeManager:
                 self._api.close_handle(process)
             if anchor_handle:
                 self._api.close_handle(anchor_handle)
-            self._api.close_handle(job)
+            if job:
+                self._api.close_handle(job)
             raise
 
 

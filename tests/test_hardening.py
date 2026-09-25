@@ -605,11 +605,13 @@ class AtomicAttachCreateTests(unittest.TestCase):
         self.assertTrue(body["attached"])
         self.assertTrue(body["running"])
         self.assertEqual(body["pid"], 4242)
+        self.assertEqual(body["cwd"], "/actual")
+        self.assertTrue(body["cwdUpdated"])
         apps = self.h.cfg.snapshot()["apps"]
         self.assertEqual(len(apps), 1)
         self.assertEqual(apps[0]["lastPid"], 4242)
         self.assertEqual(apps[0]["lastCreateTime"], 123456.0)
-        self.assertEqual(apps[0]["cwd"], "/expected")
+        self.assertEqual(apps[0]["cwd"], "/actual")
         self.assertEqual(apps[0]["observation"]["cwd"], "/actual")
         self.assertTrue(apps[0]["attached"])
 
@@ -769,6 +771,194 @@ class AppConfigurationTests(unittest.TestCase):
         self.assertEqual(status, 409)
         self.assertIn("已被 PID 999 占用", body["error"])
         start.assert_not_called()
+
+    def _structured_spec(self, cwd, port, *, readiness=None, args=None):
+        return {
+            "mode": "exec",
+            "executable": sys.executable,
+            "args": args or ["-m", "http.server"],
+            "cwd": cwd,
+            "env": {},
+            "readiness": readiness or server.default_readiness(port),
+        }
+
+    def test_create_rejects_explicit_legacy_shell_without_saving_card(self):
+        status, body, _ = self.h.request(
+            "POST", "/api/apps", json.dumps({
+                "name": "unsafe", "command": "evil & whoami",
+                "cwd": self.h.tmp.name, "port": 8765,
+                "launchSpec": {
+                    "mode": "legacy-shell",
+                    "legacyCommand": "evil & whoami",
+                },
+            }), {"Content-Type": "application/json"})
+
+        self.assertEqual(status, 400)
+        self.assertFalse(body["ok"])
+        self.assertIn("结构化 LaunchSpec", body["error"])
+        self.assertEqual(self.h.cfg.snapshot()["apps"], [])
+
+    def test_create_without_launch_spec_resolves_structured_and_canonical_values(self):
+        port = 18765
+        command = '"%s" -m http.server' % sys.executable
+        status, body, _ = self.h.request(
+            "POST", "/api/apps", json.dumps({
+                "name": "resolved", "command": command,
+                "cwd": self.h.tmp.name, "port": port,
+            }), {"Content-Type": "application/json"})
+
+        self.assertEqual(status, 200, body)
+        saved = self.h.cfg.snapshot()["apps"][0]
+        self.assertIn(saved["launchSpec"]["mode"],
+                      ("exec", "cmd", "powershell"))
+        self.assertEqual(saved["cwd"], saved["launchSpec"]["cwd"])
+        self.assertEqual(saved["port"], saved["launchSpec"]["readiness"]["port"])
+        self.assertEqual(saved["command"],
+                         server.command_from_launch_spec(saved["launchSpec"]))
+
+    def test_create_canonicalizes_http_port_and_task_readiness(self):
+        port = 18766
+        stale_http = {"type": "http", "host": "127.0.0.1", "port": 4567,
+                      "url": "/health", "timeoutSec": 20}
+        base = {
+            "command": "display only", "cwd": self.h.tmp.name,
+            "launchSpec": self._structured_spec(
+                r"C:\\stale-cwd", 4567, readiness=stale_http),
+        }
+        status, service, _ = self.h.request(
+            "POST", "/api/apps", json.dumps({
+                **base, "name": "http", "port": port,
+            }), {"Content-Type": "application/json"})
+        self.assertEqual(status, 200, service)
+        saved_service = self.h.cfg.snapshot()["apps"][0]
+        self.assertEqual(saved_service["cwd"], self.h.tmp.name)
+        self.assertEqual(saved_service["launchSpec"]["cwd"], self.h.tmp.name)
+        self.assertEqual(saved_service["launchSpec"]["readiness"]["port"], port)
+
+        status, task, _ = self.h.request(
+            "POST", "/api/apps", json.dumps({
+                "name": "task", "command": "display only",
+                "cwd": self.h.tmp.name, "port": 18767, "kind": "task",
+                "launchSpec": self._structured_spec(
+                    self.h.tmp.name, 18767,
+                    readiness={"type": "tcp", "host": "localhost",
+                               "port": 18767, "timeoutSec": 20}),
+            }), {"Content-Type": "application/json"})
+        self.assertEqual(status, 200, task)
+        saved_task = self.h.cfg.snapshot()["apps"][1]
+        self.assertIsNone(saved_task["port"])
+        self.assertEqual(saved_task["launchSpec"]["readiness"],
+                         server.default_readiness(None))
+
+    def test_create_uses_launch_spec_cwd_and_probe_port_when_card_fields_omitted(self):
+        port = 18772
+        status, body, _ = self.h.request(
+            "POST", "/api/apps", json.dumps({
+                "name": "nested values", "command": "display only",
+                "launchSpec": self._structured_spec(
+                    self.h.tmp.name, port,
+                    readiness={"type": "tcp", "host": "localhost",
+                               "port": port, "timeoutSec": 20}),
+            }), {"Content-Type": "application/json"})
+
+        self.assertEqual(status, 200, body)
+        saved = self.h.cfg.snapshot()["apps"][0]
+        self.assertEqual(saved["cwd"], self.h.tmp.name)
+        self.assertEqual(saved["port"], port)
+        self.assertEqual(saved["launchSpec"]["cwd"], saved["cwd"])
+        self.assertEqual(saved["launchSpec"]["readiness"]["port"], port)
+
+    def test_put_command_edit_does_not_downgrade_structured_launch(self):
+        port = 18768
+        initial_spec = self._structured_spec(self.h.tmp.name, port)
+        status, created, _ = self.h.request(
+            "POST", "/api/apps", json.dumps({
+                "name": "structured", "command": "display only",
+                "cwd": self.h.tmp.name, "port": port,
+                "launchSpec": initial_spec,
+            }), {"Content-Type": "application/json"})
+        self.assertEqual(status, 200, created)
+
+        command = '"%s" -m http.server --bind 127.0.0.1' % sys.executable
+        status, updated, _ = self.h.request(
+            "PUT", "/api/apps/%s" % created["id"],
+            json.dumps({"command": command}),
+            {"Content-Type": "application/json"})
+
+        self.assertEqual(status, 200, updated)
+        saved = self.h.cfg.snapshot()["apps"][0]
+        self.assertEqual(saved["launchSpec"]["mode"], "exec")
+        self.assertEqual(saved["launchSpec"]["args"],
+                         ["-m", "http.server", "--bind", "127.0.0.1"])
+        self.assertEqual(saved["command"],
+                         server.command_from_launch_spec(saved["launchSpec"]))
+
+    def test_put_and_validate_cannot_introduce_legacy_shell(self):
+        port = 18771
+        status, created, _ = self.h.request(
+            "POST", "/api/apps", json.dumps({
+                "name": "structured", "command": "display only",
+                "cwd": self.h.tmp.name, "port": port,
+                "launchSpec": self._structured_spec(self.h.tmp.name, port),
+            }), {"Content-Type": "application/json"})
+        self.assertEqual(status, 200, created)
+        request = {
+            "command": "evil & whoami",
+            "launchSpec": {"mode": "legacy-shell",
+                           "legacyCommand": "evil & whoami"},
+        }
+
+        status, body, _ = self.h.request(
+            "PUT", "/api/apps/%s" % created["id"], json.dumps(request),
+            {"Content-Type": "application/json"})
+        self.assertEqual(status, 400)
+        self.assertIn("结构化 LaunchSpec", body["error"])
+        self.assertEqual(self.h.cfg.snapshot()["apps"][0]["launchSpec"]["mode"],
+                         "exec")
+
+        status, body, _ = self.h.request(
+            "POST", "/api/apps/%s/validate-launch" % created["id"],
+            json.dumps(request), {"Content-Type": "application/json"})
+        self.assertEqual(status, 422)
+        self.assertIn("结构化 LaunchSpec", body["error"])
+
+    def test_put_lifecycle_edits_sync_cwd_http_port_and_task_mode(self):
+        port = 18769
+        readiness = {"type": "http", "host": "127.0.0.1", "port": port,
+                     "url": "/health", "timeoutSec": 20}
+        status, created, _ = self.h.request(
+            "POST", "/api/apps", json.dumps({
+                "name": "http", "command": "display only",
+                "cwd": self.h.tmp.name, "port": port,
+                "launchSpec": self._structured_spec(
+                    self.h.tmp.name, port, readiness=readiness),
+            }), {"Content-Type": "application/json"})
+        self.assertEqual(status, 200, created)
+
+        new_cwd = os.path.join(self.h.tmp.name, "new-project")
+        os.mkdir(new_cwd)
+        new_port = 18770
+        status, updated, _ = self.h.request(
+            "PUT", "/api/apps/%s" % created["id"],
+            json.dumps({"cwd": new_cwd, "port": new_port}),
+            {"Content-Type": "application/json"})
+        self.assertEqual(status, 200, updated)
+        saved = self.h.cfg.snapshot()["apps"][0]
+        self.assertEqual(saved["cwd"], new_cwd)
+        self.assertEqual(saved["launchSpec"]["cwd"], new_cwd)
+        self.assertEqual(saved["port"], new_port)
+        self.assertEqual(saved["launchSpec"]["readiness"]["port"], new_port)
+
+        status, converted, _ = self.h.request(
+            "PUT", "/api/apps/%s" % created["id"],
+            json.dumps({"kind": "task"}),
+            {"Content-Type": "application/json"})
+        self.assertEqual(status, 200, converted)
+        saved = self.h.cfg.snapshot()["apps"][0]
+        self.assertEqual(saved["kind"], "task")
+        self.assertIsNone(saved["port"])
+        self.assertEqual(saved["launchSpec"]["readiness"],
+                         server.default_readiness(None))
 
 
 class OperationLockTests(unittest.TestCase):

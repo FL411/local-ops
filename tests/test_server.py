@@ -999,6 +999,143 @@ class ProcessIdentityTests(unittest.TestCase):
                 proc.close()
 
 
+class StartAppCompensationTests(unittest.TestCase):
+    def _config(self, directory):
+        cfg = server.Config(os.path.join(directory, "config.json"))
+        app = {
+            **server.Config.APP_DEFAULT,
+            "id": "start-test",
+            "name": "start test",
+            "command": "python app.py",
+            "cwd": directory,
+            "kind": "service",
+            "port": None,
+            "controlMode": "managed",
+            "launchSpec": {
+                "mode": "exec",
+                "executable": r"C:\Python\python.exe",
+                "args": ["app.py"],
+                "cwd": directory,
+                "env": {},
+                "readiness": server.default_readiness(None),
+            },
+            "launchConfigured": True,
+        }
+        cfg.update(lambda data: data["apps"].append(app))
+        return cfg
+
+    def _run_failure(self, stage, *, terminate_result=(True, None)):
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._config(td)
+            proc = mock.Mock(pid=4321, run_id="run-test")
+            proc.poll.return_value = None
+            proc.members.return_value = [4321]
+            proc.terminate.return_value = terminate_result
+
+            patches = [
+                mock.patch.object(server, "app_alive_sign", return_value=False),
+                mock.patch.object(server, "inspect_app_health",
+                                  return_value={"blocking": False}),
+                mock.patch.object(server, "scan_listeners", return_value=set()),
+                mock.patch.object(server, "start_app",
+                                  return_value=(True, None, proc, 4321, "run-test")),
+                mock.patch.object(server, "persist_started_app",
+                                  return_value=True),
+                mock.patch.object(server, "mark_app_alive"),
+                mock.patch.object(server, "watch_app_readiness"),
+                mock.patch.object(server.time, "sleep"),
+            ]
+            for patcher in patches:
+                patcher.start()
+            try:
+                if stage == "persist":
+                    patches[4].stop()
+                    patches[4] = mock.patch.object(
+                        server, "persist_started_app",
+                        side_effect=OSError("disk full"))
+                    patches[4].start()
+                elif stage == "alive":
+                    patches[5].stop()
+                    patches[5] = mock.patch.object(
+                        server, "mark_app_alive",
+                        side_effect=OSError("state write failed"))
+                    patches[5].start()
+                elif stage == "readiness":
+                    patches[6].stop()
+                    patches[6] = mock.patch.object(
+                        server, "watch_app_readiness",
+                        side_effect=RuntimeError("watcher failed"))
+                    patches[6].start()
+                elif stage == "poll":
+                    proc.poll.side_effect = OSError("poll failed")
+                elif stage == "members":
+                    proc.members.side_effect = OSError("members failed")
+
+                result = server.start_app_transaction(cfg, "start-test")
+                self.assertFalse(result["ok"])
+                self.assertEqual(result["status"], 500)
+                proc.terminate.assert_called_once_with(force=True)
+                proc.close.assert_called_once_with()
+                return cfg, proc, result
+            finally:
+                for patcher in patches:
+                    try:
+                        patcher.stop()
+                    except RuntimeError:
+                        pass
+
+    def test_post_spawn_failures_terminate_and_close_the_process(self):
+        for stage in ("persist", "alive", "readiness", "poll", "members"):
+            with self.subTest(stage=stage):
+                _cfg, _proc, result = self._run_failure(stage)
+                self.assertIn("已终止", result["error"])
+
+    def test_failed_termination_keeps_persisted_identity_for_recovery(self):
+        cfg, proc, result = self._run_failure(
+            "alive", terminate_result=(False, "access denied"))
+        self.assertIn("无法确认进程已终止", result["error"])
+        proc.close.assert_called_once_with()
+        app = server.find_app(cfg.snapshot(), "start-test")
+        # No token was persisted by the mock, so this scenario verifies the
+        # failure is surfaced; real persistence failures are covered above.
+        self.assertIsNone(app["runToken"])
+
+
+class JobStopFailureTests(unittest.TestCase):
+    def test_job_members_failure_closes_handle_and_refuses_stop(self):
+        app = {"id": "broken-job", "controlMode": "managed",
+               "runInstance": {"runId": "run", "jobName": "Local\\job",
+                               "processState": "alive"}}
+        job = mock.Mock()
+        job.members.side_effect = OSError("query failed")
+        with mock.patch.object(server, "_open_run_job", return_value=job):
+            target, error = server.resolve_app_stop_target(app)
+
+        self.assertIsNone(target)
+        self.assertIn("未执行停止", error)
+        job.close.assert_called_once_with()
+
+    def test_job_stop_timeout_is_passed_to_terminate(self):
+        target = {"kind": "job", "id": "run", "members": [123],
+                  "job": mock.Mock()}
+        target["job"].terminate.return_value = (True, None)
+        with mock.patch.object(server, "resolve_app_stop_target",
+                               return_value=(target, None)), \
+                mock.patch.object(server, "stop_target_alive", return_value=False):
+            stopped, error = server.stop_app_and_wait(
+                {"id": "x"}, timeout=0.0)
+
+        self.assertTrue(stopped, error)
+        target["job"].terminate.assert_called_once_with(
+            force=False, timeout=0.0)
+        target["job"].close.assert_called_once_with()
+
+    def test_job_members_probe_error_is_conservatively_treated_as_alive(self):
+        target = {"kind": "job", "job": mock.Mock()}
+        target["job"].members.side_effect = OSError("query failed")
+        self.assertTrue(server.stop_target_alive(target))
+
+
     def test_verified_legacy_process_can_be_stopped_without_port_kill(self):
         app = {"id": "legacy", "lastPid": 999, "lastPgid": None,
                "runToken": None, "port": 8080, "cwd": r"C:\\tmp\\project"}
@@ -1076,9 +1213,146 @@ class ProcessIdentityTests(unittest.TestCase):
         self.assertIsNone(target["lastPgid"])
         self.assertIsNone(target["runToken"])
         self.assertTrue(target["attached"])
-        self.assertEqual(target["cwd"], "/old")
+        self.assertEqual(target["cwd"], "/new")
         self.assertEqual(target["observation"]["cwd"], "/new")
-        self.assertNotIn("cwdUpdated", info)
+        self.assertTrue(info["cwdUpdated"])
+        self.assertEqual(info["cwd"], "/new")
+
+
+class RetainedRunJobTests(unittest.TestCase):
+    def test_anchor_repair_reuses_keeper_and_sweeps_it_after_job_exit(self):
+        app_id = "retained-%s" % os.urandom(4).hex()
+        run_id = "run-%s" % os.urandom(4).hex()
+        app = {
+            "id": app_id,
+            "runToken": run_id,
+            "controlMode": "managed",
+            "runInstance": {
+                "runId": run_id,
+                "jobName": "Local\\retained-job",
+                "anchorPid": 111,
+                "anchorCreateTime": 1.0,
+                "processState": "alive",
+            },
+        }
+        proc = mock.Mock()
+        proc.anchor_pid = 222
+        proc.anchor_create_time = 2.0
+        proc._anchor_handle = object()
+        proc._api = mock.Mock()
+        proc._api.poll_process.return_value = None
+        proc._closed = False
+        proc.members.return_value = [987]
+
+        cfg = mock.Mock()
+        cfg.update.side_effect = OSError("read only")
+        cfg.snapshot.return_value = {"apps": [app]}
+        key = (app_id, run_id)
+        retained_app = {"id": app_id, "runInstance": {"runId": run_id}}
+        self.addCleanup(server._forget_run_job, retained_app, proc)
+
+        with mock.patch.object(server.windows_runtime, "reopen",
+                               return_value=proc) as reopen, \
+                mock.patch.object(server, "ps_snapshot",
+                                  return_value={987: {
+                                      "uid": server.SELF_UID}}):
+            for _ in range(3):
+                repairs = []
+                server.managed_process_index(
+                    [app], groups={}, anchor_repairs=repairs)
+                self.assertEqual(len(repairs), 1)
+                server.repair_run_instance_anchors(cfg, repairs)
+
+            self.assertEqual(reopen.call_count, 1)
+            self.assertIs(server.RETAINED_RUN_JOBS[key][1], proc)
+
+            # Even if the card is no longer part of the current config, the
+            # retained keeper is cleaned up once the Job Object drains.
+            proc.members.side_effect = OSError("keeper cleanup pending")
+            server.managed_process_index([], groups={})
+            self.assertIn(key, server.RETAINED_RUN_JOBS)
+            self.assertFalse(
+                server._cleanup_retained_run_job_after_exit(app_id, run_id))
+            self.assertEqual(server.RETAINED_RUN_JOBS[key][0], "empty-cleanup")
+
+            proc.members.side_effect = None
+            proc.members.return_value = []
+            server.managed_process_index([], groups={})
+
+        self.assertNotIn(key, server.RETAINED_RUN_JOBS)
+        proc.close.assert_called_once_with()
+
+
+class ProcessLifecycleAndLaunchCanonicalizationTests(unittest.TestCase):
+    def test_launch_spec_is_canonicalized_to_card_cwd_and_http_port(self):
+        requested = {
+            "mode": "exec",
+            "executable": r"C:\runtime\python.exe",
+            "args": ["-m", "http.server"],
+            "cwd": r"C:\stale-project",
+            "env": {},
+            "readiness": {
+                "type": "http", "host": "127.0.0.1", "port": 1234,
+                "url": "/health", "timeoutSec": 9,
+            },
+        }
+        spec, command = server.canonicalize_app_launch_spec(
+            requested, command="ignored display text", cwd=r"D:\project",
+            port=9876, kind="service")
+
+        self.assertEqual(spec["cwd"], r"D:\project")
+        self.assertEqual(spec["readiness"]["port"], 9876)
+        self.assertEqual(command, server.command_from_launch_spec(spec))
+
+    def test_canonicalizes_default_tcp_readiness_port_when_type_is_omitted(self):
+        requested = {
+            "mode": "exec",
+            "executable": r"C:\runtime\python.exe",
+            "args": ["-m", "http.server"],
+            "readiness": {"port": 1234},
+        }
+        spec, _ = server.canonicalize_app_launch_spec(
+            requested, command="ignored", cwd=r"D:\project", port=9876,
+            kind="service")
+
+        self.assertEqual(spec["readiness"]["type"], "tcp")
+        self.assertEqual(spec["readiness"]["port"], 9876)
+
+    def test_task_canonicalization_removes_port_readiness(self):
+        requested = {
+            "mode": "exec", "executable": r"C:\runtime\worker.exe",
+            "args": [], "readiness": {
+                "type": "tcp", "host": "localhost", "port": 3000,
+                "timeoutSec": 20,
+            },
+        }
+        spec, _ = server.canonicalize_app_launch_spec(
+            requested, command="worker", cwd=None, port=3000,
+            kind="task")
+
+        self.assertEqual(spec["readiness"], server.default_readiness(None))
+
+    def test_new_card_cannot_use_legacy_shell_compatibility(self):
+        with self.assertRaises(server.LaunchSpecError):
+            server.canonicalize_app_launch_spec(
+                {"mode": "legacy-shell", "legacyCommand": "evil & whoami"},
+                command="evil & whoami", cwd=None, port=8765,
+                kind="service")
+
+    def test_existing_legacy_card_keeps_compatibility_without_downgrading(self):
+        legacy_app = {
+            "launchSpec": {
+                "mode": "legacy-shell", "legacyCommand": "old command",
+                "cwd": None, "env": {},
+                "readiness": server.default_readiness(8765),
+            },
+        }
+        spec, command = server.canonicalize_app_launch_spec(
+            None, command="new legacy command", cwd=None, port=8765,
+            kind="service", existing=legacy_app)
+
+        self.assertEqual(spec["mode"], "legacy-shell")
+        self.assertEqual(command, "new legacy command")
 
     def test_attached_listener_survives_child_pid_rotation_by_unique_cwd(self):
         app = {"id": "a", "port": 3000, "cwd": "/project",

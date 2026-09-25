@@ -28,11 +28,18 @@ def _string(value, field, *, allow_empty=False):
         raise LaunchSpecError("%s 不能包含 NUL 字符" % field)
     if not allow_empty and not value.strip():
         raise LaunchSpecError("%s 不能为空" % field)
+    try:
+        value.encode("utf-16-le")
+    except UnicodeEncodeError as exc:
+        raise LaunchSpecError("%s 包含无法编码的 Unicode 字符" % field) from exc
     return value
 
 
 def _utf16_units(value):
-    return len(value.encode("utf-16-le")) // 2
+    try:
+        return len(value.encode("utf-16-le")) // 2
+    except UnicodeEncodeError as exc:
+        raise LaunchSpecError("字符串包含无法编码的 Unicode 字符") from exc
 
 
 def _is_loopback_host(host):
@@ -123,6 +130,8 @@ def _normalize_readiness(value, port):
     host = host.strip()
     if host.startswith("[") and host.endswith("]"):
         host = host[1:-1]
+    if probe_type == "tcp" and not _is_loopback_host(host):
+        raise LaunchSpecError("TCP readiness 仅允许 loopback 地址")
     probe_port = value.get("port", port)
     if probe_type in ("tcp", "http"):
         if type(probe_port) is not int or not 1 <= probe_port <= 65535:

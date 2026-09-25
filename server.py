@@ -144,6 +144,9 @@ WATCHER_LOCK = threading.RLock()
 ACTIVE_EXIT_WATCHERS = set()
 ACTIVE_READINESS_WATCHERS = set()
 RUN_JOB_REOPEN_FAILED = object()
+RETAINED_RUN_JOBS_LOCK = threading.RLock()
+RETAINED_RUN_JOBS = {}
+RUN_JOB_ACCESS_LOCK = threading.RLock()
 
 
 def configure_console_encoding():
@@ -1400,8 +1403,137 @@ def _managed_candidates(app, groups):
     return set(sysops.group_members(pgid))
 
 
-def _open_run_job(app):
+def _run_job_key(app):
+    instance = app.get("runInstance")
+    if not isinstance(instance, dict):
+        return None
+    run_id = instance.get("runId")
+    return (app.get("id"), run_id) if run_id else None
+
+
+def _remember_run_job(app, proc, mode="repair"):
+    key = _run_job_key(app)
+    if key is None or proc is None:
+        return
+    with RETAINED_RUN_JOBS_LOCK:
+        previous = RETAINED_RUN_JOBS.get(key)
+        if previous and previous[1] is not proc:
+            try:
+                previous[1].close()
+            except Exception:
+                LOG.exception("关闭重复保留的 Job Object 句柄失败（应用 %s）",
+                              app.get("id"))
+        RETAINED_RUN_JOBS[key] = (mode, proc)
+
+
+def _forget_run_job(app, proc=None, *, close=True):
+    key = _run_job_key(app)
+    if key is None:
+        return
+    retained = None
+    with RETAINED_RUN_JOBS_LOCK:
+        current = RETAINED_RUN_JOBS.get(key)
+        if current and (proc is None or current[1] is proc):
+            retained = RETAINED_RUN_JOBS.pop(key)[1]
+    if close and retained is not None:
+        try:
+            retained.close()
+        except Exception:
+            LOG.exception("关闭已保留的 Job Object 句柄失败（应用 %s）",
+                          app.get("id"))
+
+
+def _release_run_job_handle(app, proc):
+    with RUN_JOB_ACCESS_LOCK:
+        key = _run_job_key(app)
+        with RETAINED_RUN_JOBS_LOCK:
+            current = RETAINED_RUN_JOBS.get(key) if key is not None else None
+        if current and current[1] is proc:
+            _forget_run_job(app, proc)
+            return
+        try:
+            proc.close()
+        except Exception:
+            LOG.exception("关闭 Job Object 句柄失败（应用 %s）", app.get("id"))
+
+
+def _run_job_is_retained(app, proc):
+    key = _run_job_key(app)
+    with RETAINED_RUN_JOBS_LOCK:
+        current = RETAINED_RUN_JOBS.get(key) if key is not None else None
+    return bool(current and current[1] is proc)
+
+
+def _sweep_retained_run_jobs():
+    """Release retained Job handles and keepers once their process trees drain.
+
+    A retained handle is used only when anchor repair or cleanup cannot yet be
+    persisted/completed. The associated service may exit later, including
+    after its card has been removed from config, so sweep the small in-memory
+    set independently of the current app list.
+    """
+    with RUN_JOB_ACCESS_LOCK:
+        with RETAINED_RUN_JOBS_LOCK:
+            retained = list(RETAINED_RUN_JOBS.items())
+        for (app_id, run_id), (_, proc) in retained:
+            try:
+                if proc.members():
+                    continue
+            except Exception as exc:
+                LOG.debug("应用 %s 的保留 Job 仍待清理: %s", app_id, exc)
+                continue
+            _forget_run_job(
+                {"id": app_id, "runInstance": {"runId": run_id}}, proc)
+
+
+def _cleanup_retained_run_job_after_exit(app_id, run_id):
+    """Stop a replacement keeper before persisting this run as exited."""
+    app = {"id": app_id, "runInstance": {"runId": run_id}}
+    key = (app_id, run_id)
+    with RUN_JOB_ACCESS_LOCK:
+        with RETAINED_RUN_JOBS_LOCK:
+            retained = RETAINED_RUN_JOBS.get(key)
+        if not retained:
+            return True
+        proc = retained[1]
+        try:
+            if proc.members():
+                return False
+        except Exception as exc:
+            _remember_run_job(app, proc, "empty-cleanup")
+            LOG.warning("应用 %s 已退出，但 Job keeper 清理待重试: %s",
+                        app_id, exc)
+            return False
+        _forget_run_job(app, proc)
+        return True
+
+
+def _is_anchor_cleanup_failure(exc):
+    return isinstance(exc, OSError) and "Job Object 保活进程" in str(exc)
+
+
+def _open_run_job_unlocked(app):
     """Reopen this user's named Job Object for a structured run instance."""
+    key = _run_job_key(app)
+    # A retained cleanup handle must be retried even after the watcher has
+    # marked the run exited. Otherwise the exit-state guard would strand the
+    # keeper forever.
+    if key is not None:
+        with RETAINED_RUN_JOBS_LOCK:
+            retained = RETAINED_RUN_JOBS.get(key)
+        if retained and retained[0] == "empty-cleanup":
+            proc = retained[1]
+            try:
+                if proc.members():
+                    _remember_run_job(app, proc, "repair")
+                    return proc
+                _forget_run_job(app, proc)
+                return None
+            except Exception as exc:
+                LOG.warning("应用 %s 的空 Job keeper 清理待重试: %s",
+                            app.get("id"), exc)
+                return RUN_JOB_REOPEN_FAILED
+
     instance = app.get("runInstance")
     if (not isinstance(instance, dict)
             or instance.get("processState") == "exited"
@@ -1409,16 +1541,49 @@ def _open_run_job(app):
         return None
     if not isinstance(SELF_UID, str) or not SELF_UID.startswith("S-"):
         return RUN_JOB_REOPEN_FAILED
+    if key is not None:
+        with RETAINED_RUN_JOBS_LOCK:
+            retained = RETAINED_RUN_JOBS.get(key)
+        if retained:
+            mode, proc = retained
+            anchor_handle = getattr(proc, "_anchor_handle", None)
+            try:
+                anchor_live = bool(
+                    anchor_handle and
+                    proc._api.poll_process(anchor_handle) is None)
+            except Exception:
+                anchor_live = True
+            if anchor_live and not getattr(proc, "_closed", False):
+                return proc
+            # 原 keeper 已退出时尝试换一个。若此操作失败，继续用仍然有效的
+            # Job handle 管理当前服务，避免丢掉唯一可控身份。
     try:
-        return windows_runtime.reopen(
+        proc = windows_runtime.reopen(
             instance["runId"], job_name=instance.get("jobName"),
             root_pid=instance.get("rootPid"),
             root_create_time=instance.get("rootCreateTime"), sid=SELF_UID,
             anchor_pid=instance.get("anchorPid"),
             anchor_create_time=instance.get("anchorCreateTime"))
+        if key is not None and 'retained' in locals() and retained:
+            _forget_run_job(app, retained[1])
+        return proc
+    except windows_runtime.JobAnchorCleanupError as exc:
+        cleanup = getattr(exc, "managed_process", None)
+        if cleanup is not None:
+            _remember_run_job(app, cleanup, "empty-cleanup")
+        LOG.debug("无法清理应用 %s 的空 Job keeper: %s",
+                  app.get("id"), exc)
+        return RUN_JOB_REOPEN_FAILED
     except (OSError, ValueError, TypeError) as exc:
+        if key is not None and 'retained' in locals() and retained:
+            return retained[1]
         LOG.debug("无法重连应用 %s 的 Job Object: %s", app.get("id"), exc)
         return RUN_JOB_REOPEN_FAILED
+
+
+def _open_run_job(app):
+    with RUN_JOB_ACCESS_LOCK:
+        return _open_run_job_unlocked(app)
 
 
 def observed_process_pid(app, listeners=None, snap=None, cwds=None):
@@ -1466,13 +1631,14 @@ def observed_process_pid(app, listeners=None, snap=None, cwds=None):
     return matches[0] if len(matches) == 1 else None
 
 
-def managed_process_index(apps, groups=None, anchor_repairs=None,
-                          unavailable_jobs=None):
+def _managed_process_index_unlocked(apps, groups=None, anchor_repairs=None,
+                                    unavailable_jobs=None):
     """批量校验应用的受控进程，返回 (appId -> [pid], ps, groups)。
 
     必须同时满足：属于记录的进程组、属于当前用户、argv 中带本次启动的
     随机 token。即使 PID/PGID 被系统复用，也不会把无关进程当成应用或停止它。
     """
+    _sweep_retained_run_jobs()
     if groups is None:
         needs_groups = any(
             app.get("runToken")
@@ -1489,23 +1655,45 @@ def managed_process_index(apps, groups=None, anchor_repairs=None,
                 unavailable_jobs.add(app.get("id"))
             pids = set()
         elif job is not None:
+            instance = app.get("runInstance") or {}
+            anchor_pid = getattr(job, "anchor_pid", None)
+            anchor_ctime = getattr(job, "anchor_create_time", None)
+            anchor_changed = (
+                instance.get("anchorPid") != anchor_pid
+                or instance.get("anchorCreateTime") != anchor_ctime)
             try:
-                instance = app.get("runInstance") or {}
-                anchor_pid = getattr(job, "anchor_pid", None)
-                anchor_ctime = getattr(job, "anchor_create_time", None)
-                if (anchor_repairs is not None
-                        and (instance.get("anchorPid") != anchor_pid
-                             or instance.get("anchorCreateTime") != anchor_ctime)):
-                    anchor_repairs.append({
+                pids = set(job.members())
+            except Exception as exc:
+                LOG.warning("读取应用 %s 的 Job Object 成员失败，保留身份待重试: %s",
+                            app.get("id"), exc)
+                if unavailable_jobs is not None:
+                    unavailable_jobs.add(app.get("id"))
+                if _is_anchor_cleanup_failure(exc):
+                    _remember_run_job(app, job, "empty-cleanup")
+                else:
+                    _release_run_job_handle(app, job)
+                pids = set()
+            else:
+                if not pids:
+                    _release_run_job_handle(app, job)
+                elif anchor_changed and instance.get("processState") == "stopping":
+                    # Let the stop transaction own this exact handle; writing a
+                    # replacement identity mid-stop could race its Job calls.
+                    _remember_run_job(app, job, "repair")
+                elif anchor_changed:
+                    repair = {
                         "id": app.get("id"),
                         "runId": instance.get("runId"),
                         "jobName": instance.get("jobName"),
                         "anchorPid": anchor_pid,
                         "anchorCreateTime": anchor_ctime,
-                    })
-                pids = set(job.members())
-            finally:
-                job.close()
+                        "managedProcess": job,
+                    }
+                    if anchor_repairs is not None:
+                        anchor_repairs.append(repair)
+                    _remember_run_job(app, job, "repair")
+                else:
+                    _release_run_job_handle(app, job)
         elif app.get("controlMode") == "monitor":
             pids = set()
         elif ((app.get("runInstance") or {}).get("jobName")):
@@ -1536,6 +1724,13 @@ def managed_process_index(apps, groups=None, anchor_repairs=None,
         # 随机标记在进程组的常驻外层 shell 上；校验后整组均为受控后代。
         result[app.get("id")] = current_user if controller_found else []
     return result, snap, groups
+
+
+def managed_process_index(apps, groups=None, anchor_repairs=None,
+                          unavailable_jobs=None):
+    with RUN_JOB_ACCESS_LOCK:
+        return _managed_process_index_unlocked(
+            apps, groups, anchor_repairs, unavailable_jobs)
 
 
 def managed_pids(app, groups=None):
@@ -1864,6 +2059,11 @@ def repair_attached_app_identities(cfg, repairs):
 
 
 def repair_run_instance_anchors(cfg, repairs):
+    with RUN_JOB_ACCESS_LOCK:
+        return _repair_run_instance_anchors_unlocked(cfg, repairs)
+
+
+def _repair_run_instance_anchors_unlocked(cfg, repairs):
     """Persist a replacement Job Object keeper after PID reuse or keeper loss."""
     if not repairs:
         return False
@@ -1876,7 +2076,7 @@ def repair_run_instance_anchors(cfg, repairs):
             if (not isinstance(instance, dict)
                     or instance.get("runId") != repair.get("runId")
                     or instance.get("jobName") != repair.get("jobName")
-                    or instance.get("processState") == "exited"):
+                    or instance.get("processState") in ("exited", "stopping")):
                 continue
             if (instance.get("anchorPid") != repair.get("anchorPid")
                     or instance.get("anchorCreateTime") !=
@@ -1887,10 +2087,77 @@ def repair_run_instance_anchors(cfg, repairs):
         return changed
 
     try:
-        return bool(cfg.update(op))
-    except OSError as exc:
+        updated = bool(cfg.update(op))
+    except Exception as exc:
         LOG.warning("无法持久化 Job Object 保活进程身份: %s", exc)
-        return False
+        updated = False
+
+    # A newly created keeper must have exactly one in-process owner until the
+    # Job drains. If its identity could not be written, reuse this handle on
+    # the next poll rather than opening another keeper per /api/state. When
+    # persisted successfully, keep the handle until exit cleanup so a watcher
+    # holding the old anchor cannot strand the replacement keeper.
+    snapshot = None
+    try:
+        snapshot = cfg.snapshot()
+    except Exception:
+        if updated:
+            LOG.exception("确认 Job Object keeper 身份落盘失败")
+    for repair in repairs:
+        proc = repair.get("managedProcess")
+        if proc is None:
+            continue
+        app = {
+            "id": repair.get("id"),
+            "runInstance": {
+                "runId": repair.get("runId"),
+                "jobName": repair.get("jobName"),
+            },
+        }
+        if snapshot is None:
+            _remember_run_job(app, proc, "repair")
+            continue
+        target = find_app(snapshot, repair.get("id")) if snapshot else None
+        instance = target.get("runInstance") if target else None
+        persisted = (
+            isinstance(instance, dict)
+            and instance.get("runId") == repair.get("runId")
+            and instance.get("jobName") == repair.get("jobName")
+            and instance.get("anchorPid") == repair.get("anchorPid")
+            and instance.get("anchorCreateTime") ==
+            repair.get("anchorCreateTime")
+            and instance.get("processState") not in ("exited", "stopping"))
+        if persisted:
+            # Keep the repaired keeper handle in-process while this run is
+            # alive. The original exit watcher owns the pre-repair handle, so
+            # without this reference the replacement keeper could outlive the
+            # application after the watcher marks the run exited.
+            _remember_run_job(app, proc, "repair")
+        elif (target and isinstance(instance, dict)
+              and instance.get("runId") == repair.get("runId")
+              and instance.get("processState") == "stopping"):
+            # stop_app_and_wait will consume this same handle under the
+            # RUN_JOB_ACCESS_LOCK; leave it open for that transaction.
+            _remember_run_job(app, proc, "repair")
+        elif target and isinstance(instance, dict) and (
+                instance.get("runId") == repair.get("runId")
+                and instance.get("processState") not in ("exited", "stopping")):
+            _remember_run_job(app, proc, "repair")
+        else:
+            # This identity was replaced or removed while the repair was being
+            # committed. It no longer owns the saved application lifecycle.
+            try:
+                stop_anchor = getattr(proc, "_stop_anchor", None)
+                if callable(stop_anchor) and not stop_anchor():
+                    _remember_run_job(app, proc, "empty-cleanup")
+                    continue
+            except Exception:
+                LOG.exception("清理过期 Job Object keeper 失败（应用 %s）",
+                              repair.get("id"))
+                _remember_run_job(app, proc, "empty-cleanup")
+                continue
+            _forget_run_job(app, proc)
+    return updated
 
 
 def repair_observation_identities(cfg, repairs):
@@ -2468,6 +2735,7 @@ def watch_app_exit(cfg, app_id, proc, token, started_at=None):
                     if not isinstance(members, (list, tuple, set, frozenset)) or not members:
                         break
                     time.sleep(0.05)
+            _cleanup_retained_run_job_after_exit(app_id, token)
             ended_at = time.time()
             duration = round(max(0.0, ended_at - started_at), 3)
 
@@ -2567,6 +2835,84 @@ def persist_started_app(cfg, app_id, proc, pgid, token):
     if saved:
         watch_app_exit(cfg, app_id, proc, token, started_at)
     return saved
+
+
+def abort_started_app(cfg, app_id, proc, token, reason):
+    """Compensate a failed post-spawn start before returning an API error.
+
+    A failed config or watcher step must not leave an untracked Job Object.
+    Keep persisted identity when termination cannot be verified so a later
+    request can still reconnect and control the process.
+    """
+    stopped = False
+    cleanup_error = None
+    try:
+        poll = getattr(proc, "poll", None)
+        members = getattr(proc, "members", None)
+        try:
+            already_exited = (callable(poll) and poll() is not None
+                              and (not callable(members) or not members()))
+        except Exception:
+            already_exited = False
+        if already_exited:
+            stopped = True
+        else:
+            result = proc.terminate(force=True)
+            if isinstance(result, tuple):
+                stopped = bool(result and result[0])
+                if not stopped:
+                    cleanup_error = (result[1] if len(result) > 1 else
+                                     "强制停止返回失败")
+            else:
+                stopped = result is not False
+            wait_empty = getattr(proc, "wait_for_empty", None)
+            if stopped and callable(wait_empty):
+                try:
+                    wait_empty(timeout=5.0)
+                except TypeError:
+                    wait_empty()
+            elif stopped and callable(members) and members():
+                stopped = False
+                cleanup_error = "Job Object 中仍有进程"
+    except Exception as exc:
+        stopped = False
+        cleanup_error = str(exc) or type(exc).__name__
+        LOG.exception("启动失败后的 Job Object 清理异常（应用 %s）", app_id)
+
+    if stopped:
+        try:
+            clear_app_runtime(cfg, app_id, expected_token=token)
+        except Exception:
+            LOG.exception("已停止的应用运行身份无法回滚（应用 %s）", app_id)
+    else:
+        LOG.critical(
+            "启动失败后无法确认应用进程已停止；保留可用身份（应用 %s, PID %s, runId %s）：%s",
+            app_id, getattr(proc, "pid", None),
+            getattr(proc, "run_id", token), cleanup_error or "未知清理错误")
+
+    # When persist_started_app registered its exit watcher, let that watcher
+    # finish its wait and release handles before the compensation closes them.
+    watcher_key = (app_id, token)
+    watcher_deadline = time.monotonic() + 5.0
+    while time.monotonic() < watcher_deadline:
+        with WATCHER_LOCK:
+            watcher_active = watcher_key in ACTIVE_EXIT_WATCHERS
+        if not watcher_active:
+            break
+        time.sleep(0.02)
+
+    close = getattr(proc, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:
+            LOG.exception("启动失败后的进程句柄关闭失败（应用 %s）", app_id)
+
+    if stopped:
+        return {"ok": False, "status": 500,
+                "error": "%s；本次进程已终止" % reason}
+    return {"ok": False, "status": 500,
+            "error": "%s；无法确认进程已终止，请查看日志并重试停止操作" % reason}
 
 
 def mark_app_alive(cfg, app_id, run_id):
@@ -2777,21 +3123,32 @@ def start_app_transaction(cfg, app_id, require_autostart=False):
             return {"ok": False, "status": 409,
                     "error": "请先确认启动配置，再由总控台托管此服务",
                     "launchSpecRequired": True}
-        current_instance = current.get("runInstance")
-        if (isinstance(current_instance, dict)
-                and current_instance.get("jobName")
-                and current_instance.get("processState") != "exited"):
-            job = _open_run_job(current)
-            if job is RUN_JOB_REOPEN_FAILED:
-                return {"ok": False, "status": 409,
-                        "error": "无法验证当前 Job Object 状态，请检查总控台日志后重试"}
-            if job is not None:
-                try:
-                    if job.members():
-                        return {"ok": False, "status": 409,
-                                "error": "应用已在运行"}
-                finally:
-                    job.close()
+        with RUN_JOB_ACCESS_LOCK:
+            current_instance = current.get("runInstance")
+            if (isinstance(current_instance, dict)
+                    and current_instance.get("jobName")
+                    and current_instance.get("processState") != "exited"):
+                job = _open_run_job(current)
+                if job is RUN_JOB_REOPEN_FAILED:
+                    return {"ok": False, "status": 409,
+                            "error": "无法验证当前 Job Object 状态，请检查总控台日志后重试"}
+                if job is not None:
+                    try:
+                        try:
+                            members = job.members()
+                        except Exception as exc:
+                            LOG.warning("读取应用 %s 的 Job Object 状态失败: %s",
+                                        app_id, exc)
+                            if _is_anchor_cleanup_failure(exc):
+                                _remember_run_job(current, job, "empty-cleanup")
+                            return {"ok": False, "status": 409,
+                                    "error": "无法验证当前 Job Object 状态，请稍后重试"}
+                        if members:
+                            return {"ok": False, "status": 409,
+                                    "error": "应用已在运行"}
+                    finally:
+                        if not _run_job_is_retained(current, job):
+                            _release_run_job_handle(current, job)
         if require_autostart and (
                 (current.get("kind") or "service") != "service"
                 or not current.get("autostart")):
@@ -2824,36 +3181,38 @@ def start_app_transaction(cfg, app_id, require_autostart=False):
         ok, error, proc, pgid, token = start_app(current)
         if not ok:
             return {"ok": False, "status": 500, "error": error}
-        if not persist_started_app(cfg, app_id, proc, pgid, token):
-            try:
-                proc.terminate(force=True)
-            except Exception:
-                pass
-            close = getattr(proc, "close", None)
-            if close:
-                close()
-            return {"ok": False, "status": 409,
-                    "error": "应用已被删除，已取消启动"}
-        mark_app_alive(cfg, app_id, token)
-        watch_app_readiness(cfg, app_id, token, current)
-        # 一次性任务的正常形态就是快速退出，不能把成功任务误判成启动失败。
-        if (current.get("kind") or "service") == "task":
-            return {"ok": True, "status": 200, "pid": proc.pid}
-        deadline = time.monotonic() + STARTUP_PROBE_SEC
-        code = proc.poll()
-        while code is None and time.monotonic() < deadline:
-            time.sleep(0.025)
+        persisted = False
+        try:
+            persisted = persist_started_app(cfg, app_id, proc, pgid, token)
+            if not persisted:
+                return abort_started_app(
+                    cfg, app_id, proc, token,
+                    "应用已被删除，已取消启动") | {"status": 409}
+            mark_app_alive(cfg, app_id, token)
+            watch_app_readiness(cfg, app_id, token, current)
+            # 一次性任务的正常形态就是快速退出，不能把成功任务误判成启动失败。
+            if (current.get("kind") or "service") == "task":
+                return {"ok": True, "status": 200, "pid": proc.pid}
+            deadline = time.monotonic() + STARTUP_PROBE_SEC
             code = proc.poll()
-        members = getattr(proc, "members", None)
-        live_members = members() if callable(members) else []
-        if (code is not None
-                and isinstance(live_members, (list, tuple, set, frozenset))
-                and not live_members):
-            return {"ok": False, "status": 422,
-                    "error": startup_failure_message(app_id, code)}
-        return {"ok": True, "status": 200, "pid": proc.pid,
-                "readiness": "checking" if (current.get("launchSpec") or {}).get(
-                    "readiness", {}).get("type") in ("tcp", "http") else "unknown"}
+            while code is None and time.monotonic() < deadline:
+                time.sleep(0.025)
+                code = proc.poll()
+            members = getattr(proc, "members", None)
+            live_members = members() if callable(members) else []
+            if (code is not None
+                    and isinstance(live_members, (list, tuple, set, frozenset))
+                    and not live_members):
+                return {"ok": False, "status": 422,
+                        "error": startup_failure_message(app_id, code)}
+            return {"ok": True, "status": 200, "pid": proc.pid,
+                    "readiness": "checking" if (current.get("launchSpec") or {}).get(
+                        "readiness", {}).get("type") in ("tcp", "http") else "unknown"}
+        except Exception as exc:
+            LOG.exception("启动后的状态保存或初始化失败（应用 %s）", app_id)
+            reason = "启动后的应用状态保存或初始化失败（%s）" % (
+                str(exc) or type(exc).__name__)
+            return abort_started_app(cfg, app_id, proc, token, reason)
     finally:
         lock.release()
 
@@ -4079,11 +4438,27 @@ def resolve_app_stop_target(app, listeners=None):
         if job is RUN_JOB_REOPEN_FAILED:
             return None, "无法重连应用的 Job Object，未执行停止"
         if job is not None:
-            members = job.members()
+            try:
+                members = job.members()
+            except Exception as exc:
+                LOG.exception("读取应用 %s 的 Job Object 成员失败",
+                              app.get("id"))
+                if _is_anchor_cleanup_failure(exc):
+                    _remember_run_job(app, job, "empty-cleanup")
+                else:
+                    _release_run_job_handle(app, job)
+                return None, "无法读取 Job Object 状态，未执行停止：%s" % (
+                    str(exc) or type(exc).__name__)
             if members:
                 return {"kind": "job", "id": instance.get("runId"),
                         "members": list(members), "job": job}, None
-            job.close()
+            try:
+                _release_run_job_handle(app, job)
+            except Exception as exc:
+                LOG.exception("关闭应用 %s 的 Job Object 句柄失败",
+                              app.get("id"))
+                return None, "无法关闭 Job Object 句柄，未执行停止：%s" % (
+                    str(exc) or type(exc).__name__)
     current = managed_pids(app)
     if current:
         pgid = app.get("lastPgid") or app.get("lastPid")
@@ -4096,11 +4471,12 @@ def resolve_app_stop_target(app, listeners=None):
     return None, "无法确认受控进程，未执行停止"
 
 
-def signal_app_stop(target, sig=signal.SIGTERM):
+def signal_app_stop(target, sig=signal.SIGTERM,
+                    timeout=APP_STOP_TIMEOUT_SEC):
     """Signal a target returned by resolve_app_stop_target."""
     if target["kind"] == "job":
-        return target["job"].terminate(force=False,
-                                       timeout=APP_STOP_TIMEOUT_SEC)
+        return target["job"].terminate(
+            force=False, timeout=max(0.0, float(timeout)))
     ident = target["id"]
     if target["kind"] == "group":
         members = target.get("members")
@@ -4113,7 +4489,9 @@ def stop_target_alive(target, expected_uid=None):
         try:
             return bool(target["job"].members())
         except OSError:
-            return False
+            # Unknown Job state is not proof of exit. Keep the app managed and
+            # let the caller return a timeout instead of clearing live state.
+            return True
     if target["kind"] == "group":
         return any(pid_alive(pid) for pid in target.get("members") or [])
     if not sysops.pid_alive(target["id"]):
@@ -4124,6 +4502,12 @@ def stop_target_alive(target, expected_uid=None):
 
 
 def stop_app_and_wait(app, timeout=APP_STOP_TIMEOUT_SEC, listeners=None):
+    with RUN_JOB_ACCESS_LOCK:
+        return _stop_app_and_wait_unlocked(app, timeout, listeners)
+
+
+def _stop_app_and_wait_unlocked(app, timeout=APP_STOP_TIMEOUT_SEC,
+                                listeners=None):
     """Signal a verified app and wait until the exact target is gone.
 
     Returns (ok, error).  A timeout is deliberately not escalated to SIGKILL;
@@ -4134,7 +4518,7 @@ def stop_app_and_wait(app, timeout=APP_STOP_TIMEOUT_SEC, listeners=None):
     if target is None:
         return False, error
     try:
-        ok, error = signal_app_stop(target)
+        ok, error = signal_app_stop(target, timeout=timeout)
         if not ok:
             return False, error
         deadline = time.monotonic() + max(0.0, timeout)
@@ -4156,7 +4540,7 @@ def stop_app_and_wait(app, timeout=APP_STOP_TIMEOUT_SEC, listeners=None):
         return True, None
     finally:
         if target.get("kind") == "job":
-            target["job"].close()
+            _release_run_job_handle(app, target["job"])
 
 
 def stop_app_and_clear(cfg, app, timeout=APP_STOP_TIMEOUT_SEC, listeners=None):
@@ -4272,6 +4656,7 @@ def attach_app_process(cfg, app_id, app, pid):
     if not ok:
         return False, error, identity
     pid_conflict = False
+    attach_result = {}
 
     def op(c):
         nonlocal pid_conflict
@@ -4300,17 +4685,32 @@ def attach_app_process(cfg, app_id, app, pid):
         target["lastCreateTime"] = identity.get("ctime")
         target["runInstance"] = None
         target["readinessState"] = "unknown"
+        previous_cwd = target.get("cwd")
+        actual_cwd = identity.get("cwd")
+        if actual_cwd:
+            try:
+                cwd_updated = (
+                    os.path.normcase(os.path.realpath(actual_cwd))
+                    != os.path.normcase(os.path.realpath(previous_cwd or "")))
+            except (OSError, TypeError, ValueError):
+                cwd_updated = actual_cwd != previous_cwd
+            target["cwd"] = actual_cwd
+        else:
+            cwd_updated = False
         target["observation"] = observation_from_identity(
             pid, target.get("port"), identity)
+        attach_result.update({
+            "cwd": target.get("cwd"),
+            "cwdUpdated": cwd_updated,
+            "observation": target["observation"],
+        })
         return True
 
     if not cfg.update(op):
         if pid_conflict:
             return False, "该进程已由其他卡片管理", {"status": 409}
         return False, "应用已被删除", {"status": 404}
-    return True, None, {"controlMode": "monitor",
-                        "observation": observation_from_identity(
-                            pid, app.get("port"), identity)}
+    return True, None, {"controlMode": "monitor", **attach_result}
 
 
 # ---------------------------------------------------------------- 日志
@@ -4691,6 +5091,96 @@ def validate_app_fields(data, partial):
         fields["port"] = None  # 批处理任务无端口语义
         fields["autostart"] = False  # 批处理任务无开机自启意义
     return fields, None
+
+
+def canonicalize_app_launch_spec(requested, *, command, cwd, port, kind,
+                                existing=None):
+    """Resolve a card's launch definition and keep compatibility fields aligned.
+
+    New cards always resolve to a shell-free LaunchSpec. ``legacy-shell`` is
+    accepted only when updating a card which already has that migrated legacy
+    mode. Callers pass the card's top-level cwd/port/kind as canonical values;
+    the LaunchSpec's display command is derived from the normalized result.
+    """
+    if kind not in ("service", "task"):
+        raise LaunchSpecError("kind 必须是 service/task")
+    if kind == "task":
+        port = None
+
+    old_spec = existing.get("launchSpec") if isinstance(existing, dict) else None
+    legacy_compat = (isinstance(old_spec, dict)
+                     and old_spec.get("mode") == "legacy-shell")
+
+    if requested is None:
+        if legacy_compat:
+            # Preserve old shell semantics only for a card already migrated
+            # with that explicit mode. A command-only edit cannot downgrade a
+            # structured card into a shell command.
+            requested = dict(old_spec)
+            requested["legacyCommand"] = command
+        else:
+            requested = resolve_launch_spec(command, cwd, port, kind)
+
+    if not isinstance(requested, dict):
+        raise LaunchSpecError("launchSpec 必须是对象")
+    if (requested.get("mode") == "legacy-shell"
+            and not legacy_compat):
+        raise LaunchSpecError(
+            "新应用必须使用结构化 LaunchSpec；请确认可执行程序、批处理或 PowerShell 配置")
+
+    value = dict(requested)
+    # Top-level fields are the API's canonical compatibility representation.
+    # Do not let an inconsistent nested cwd or probe port change actual runtime
+    # behavior behind what the card displays.
+    value["cwd"] = cwd
+    readiness = value.get("readiness")
+    if kind == "task":
+        value["readiness"] = default_readiness(None)
+    elif isinstance(readiness, dict) and readiness.get(
+            "type", "tcp" if port is not None else "none") in ("tcp", "http"):
+        readiness = dict(readiness)
+        readiness["port"] = port
+        value["readiness"] = readiness
+
+    spec = normalize_launch_spec(
+        value, command=command, cwd=cwd, port=port)
+    if spec.get("mode") == "legacy-shell" and not legacy_compat:
+        raise LaunchSpecError(
+            "新应用必须使用结构化 LaunchSpec；请确认可执行程序、批处理或 PowerShell 配置")
+    return spec, command_from_launch_spec(spec)
+
+
+def app_launch_field_values(data, fields, existing=None):
+    """Choose canonical cwd/port values for a launch API request.
+
+    Explicit top-level fields win. If omitted, an explicit LaunchSpec can
+    provide cwd and a TCP/HTTP port; otherwise partial updates retain the
+    existing card values.
+    """
+    old = existing if isinstance(existing, dict) else {}
+    requested = data.get("launchSpec") if isinstance(data, dict) else None
+    if "cwd" in data:
+        cwd = fields.get("cwd")
+    elif isinstance(requested, dict) and "cwd" in requested:
+        cwd = requested.get("cwd")
+    else:
+        cwd = fields.get("cwd", old.get("cwd"))
+
+    kind = fields.get("kind", old.get("kind") or "service")
+    if kind == "task":
+        port = None
+    elif "port" in data:
+        port = fields.get("port")
+    else:
+        readiness = (requested.get("readiness")
+                     if isinstance(requested, dict) else None)
+        if (isinstance(readiness, dict)
+                and readiness.get("type") in ("tcp", "http")
+                and "port" in readiness):
+            port = readiness.get("port")
+        else:
+            port = fields.get("port", old.get("port"))
+    return cwd, port, kind
 
 
 # ---------------------------------------------------------------- HTTP 处理
@@ -5219,36 +5709,19 @@ class Handler(BaseHTTPRequestHandler):
             self.send_err(400, err)
             return
         kind = fields.get("kind", existing.get("kind") or "service")
-        port = fields.get("port", existing.get("port"))
-        if kind == "task":
-            port = None
-        cwd = fields.get("cwd", existing.get("cwd"))
+        cwd, port, kind = app_launch_field_values(
+            data, fields, existing)
         command = fields.get("command", existing.get("command", ""))
         try:
-            requested = data.get("launchSpec")
-            if requested is None:
-                spec = resolve_launch_spec(command, cwd, port, kind)
-            else:
-                spec_value = dict(requested) if isinstance(requested, dict) else requested
-                if isinstance(spec_value, dict):
-                    spec_value["cwd"] = cwd
-                    if kind == "task":
-                        spec_value["readiness"] = default_readiness(None)
-                    elif (isinstance(spec_value.get("readiness"), dict)
-                          and spec_value["readiness"].get("type") == "tcp"):
-                        spec_value["readiness"]["port"] = port
-                spec = normalize_launch_spec(
-                    spec_value, command=command, cwd=cwd, port=port)
-                if (spec.get("mode") == "legacy-shell"
-                        and not (isinstance(existing.get("launchSpec"), dict)
-                                 and existing["launchSpec"].get("mode") == "legacy-shell")):
-                    raise LaunchSpecError(
-                        "新启动配置不能使用 legacy-shell；请选择 Windows 可执行程序、批处理或 PowerShell 脚本")
+            requested = (data.get("launchSpec")
+                         if "launchSpec" in data else None)
+            spec, canonical_command = canonicalize_app_launch_spec(
+                requested, command=command, cwd=cwd, port=port, kind=kind,
+                existing=existing)
         except (LaunchSpecError, TypeError) as exc:
             self.send_err(422, str(exc))
             return
 
-        canonical_command = command_from_launch_spec(spec)
         health_app = dict(existing)
         health_app.update(fields)
         health_app.update({"kind": kind, "port": port, "cwd": cwd,
@@ -5436,12 +5909,16 @@ class Handler(BaseHTTPRequestHandler):
                "readinessState": "unknown", "lastExit": None,
                "lastCreateTime": None, "createdAt": int(time.time())}
         try:
-            requested_spec = data.get("launchSpec")
             if attach_pid is None:
-                app["launchSpec"] = normalize_launch_spec(
-                    requested_spec, command=fields["command"],
-                    cwd=fields["cwd"], port=fields["port"])
-                app["command"] = command_from_launch_spec(app["launchSpec"])
+                launch_cwd, launch_port, launch_kind = app_launch_field_values(
+                    data, fields)
+                app["launchSpec"], app["command"] = (
+                    canonicalize_app_launch_spec(
+                        data.get("launchSpec"), command=fields["command"],
+                        cwd=launch_cwd, port=launch_port,
+                        kind=launch_kind))
+                app["cwd"] = app["launchSpec"].get("cwd")
+                app["port"] = launch_port
                 app["controlMode"] = "managed"
                 app["launchConfigured"] = is_launch_configured(
                     app["launchSpec"])
@@ -5468,6 +5945,7 @@ class Handler(BaseHTTPRequestHandler):
             app["attached"] = True
             app["launchSpec"] = None
             app["launchConfigured"] = False
+            app["cwd"] = identity.get("cwd") or app.get("cwd")
             app["observation"] = observation_from_identity(
                 attach_pid, app.get("port"), identity)
             app["lastPid"] = attach_pid
@@ -5739,79 +6217,60 @@ class Handler(BaseHTTPRequestHandler):
             if err:
                 self.send_err(400, err)
                 return
-            if "launchSpec" in data:
-                try:
-                    spec_value = data.get("launchSpec")
-                    if (spec_value is None
-                            and app.get("controlMode") == "monitor"):
-                        self.send_json({
-                            "ok": False,
-                            "error": "监控卡片必须保存已确认的结构化启动配置",
-                            "launchSpecRequired": True,
-                        }, 422)
-                        return
-                    if isinstance(spec_value, dict):
-                        spec_value = dict(spec_value)
-                        spec_value["cwd"] = fields.get(
-                            "cwd", spec_value.get("cwd", app.get("cwd")))
-                        selected_kind = fields.get(
-                            "kind", app.get("kind") or "service")
-                        selected_port = (None if selected_kind == "task" else
-                                         fields.get("port", app.get("port")))
-                        if selected_kind == "task":
-                            spec_value["readiness"] = default_readiness(None)
-                        elif (isinstance(spec_value.get("readiness"), dict)
-                              and spec_value["readiness"].get("type") == "tcp"):
-                            spec_value["readiness"]["port"] = selected_port
-                    else:
-                        selected_kind = fields.get(
-                            "kind", app.get("kind") or "service")
-                        selected_port = (None if selected_kind == "task" else
-                                         fields.get("port", app.get("port")))
-                    fields["launchSpec"] = normalize_launch_spec(
-                        spec_value,
-                        command=data.get("command", app.get("command", "")),
-                        cwd=fields.get("cwd", app.get("cwd")),
-                        port=selected_port)
-                except LaunchSpecError as exc:
-                    self.send_err(400, str(exc))
-                    return
-                fields["command"] = command_from_launch_spec(
-                    fields["launchSpec"])
-                fields["controlMode"] = "managed"
-                fields["attached"] = False
-                fields["observation"] = None
-                if (app.get("controlMode") == "monitor"
-                        or fields["launchSpec"] != app.get("launchSpec")):
-                    fields["lastPid"] = None
-                    fields["lastPgid"] = None
-                    fields["runToken"] = None
-                    fields["lastCreateTime"] = None
-                    fields["runInstance"] = None
-                fields["launchConfigured"] = is_launch_configured(
-                    fields["launchSpec"])
-                fields["readinessState"] = "unknown"
-            elif ("command" in fields
-                  and fields["command"] != app.get("command")
-                  and app.get("controlMode") != "monitor"):
-                # Older API clients still send a free-form command. Keep them
-                # working through the explicit legacy compatibility mode.
-                fields["launchSpec"] = normalize_launch_spec(
-                    None, command=fields["command"],
-                    cwd=fields.get("cwd", app.get("cwd")),
-                    port=fields.get("port", app.get("port")))
-                fields["launchConfigured"] = is_launch_configured(
-                    fields["launchSpec"])
+            launch_fields = ("command", "cwd", "port", "kind")
+            has_launch_field_change = any(
+                key in fields and fields[key] != app.get(key)
+                for key in launch_fields)
             if (app.get("controlMode") == "monitor"
-                    and any(key in fields and fields[key] != app.get(key)
-                            for key in ("command", "cwd", "port", "kind"))
-                    and "launchSpec" not in data):
+                    and has_launch_field_change and "launchSpec" not in data):
                 self.send_json({
                     "ok": False,
                     "error": "监控卡片修改启动字段时必须同时确认 launchSpec",
                     "launchSpecRequired": True,
                 }, 409)
                 return
+            if (app.get("controlMode") == "monitor"
+                    and "launchSpec" in data
+                    and data.get("launchSpec") is None):
+                self.send_json({
+                    "ok": False,
+                    "error": "监控卡片必须保存已确认的结构化启动配置",
+                    "launchSpecRequired": True,
+                }, 422)
+                return
+
+            should_canonicalize_launch = (
+                "launchSpec" in data or has_launch_field_change)
+            if should_canonicalize_launch:
+                try:
+                    selected_cwd, selected_port, selected_kind = (
+                        app_launch_field_values(data, fields, app))
+                    requested = (data.get("launchSpec")
+                                 if "launchSpec" in data else None)
+                    spec, canonical_command = canonicalize_app_launch_spec(
+                        requested,
+                        command=fields.get("command", app.get("command", "")),
+                        cwd=selected_cwd, port=selected_port,
+                        kind=selected_kind, existing=app)
+                except (LaunchSpecError, TypeError) as exc:
+                    self.send_err(400, str(exc))
+                    return
+                fields["launchSpec"] = spec
+                fields["command"] = canonical_command
+                fields["cwd"] = selected_cwd
+                fields["port"] = selected_port
+                fields["controlMode"] = "managed"
+                fields["attached"] = False
+                fields["observation"] = None
+                if (app.get("controlMode") == "monitor"
+                        or spec != app.get("launchSpec")):
+                    fields["lastPid"] = None
+                    fields["lastPgid"] = None
+                    fields["runToken"] = None
+                    fields["lastCreateTime"] = None
+                    fields["runInstance"] = None
+                fields["launchConfigured"] = is_launch_configured(spec)
+                fields["readinessState"] = "unknown"
             if not fields:
                 self.send_err(400, "没有可更新的字段")
                 return

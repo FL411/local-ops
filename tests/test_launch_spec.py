@@ -47,6 +47,21 @@ class LaunchSpecTests(unittest.TestCase):
             normalize_launch_spec({**base, "readiness": {"type": "tcp",
                                    "port": 8080, "timeoutSec": 0}})
 
+    def test_tcp_readiness_only_accepts_loopback_hosts(self):
+        base = {"mode": "exec", "executable": r"C:\Python\python.exe",
+                "args": []}
+        for host in ("localhost", "LOCALHOST", "127.0.0.1", "::1", "[::1]"):
+            with self.subTest(host=host):
+                spec = normalize_launch_spec({**base, "readiness": {
+                    "type": "tcp", "host": host, "port": 8080}})
+                self.assertEqual(spec["readiness"]["type"], "tcp")
+        for host in ("example.com", "192.168.1.10", "0.0.0.0", "::",
+                     "2001:db8::1"):
+            with self.subTest(host=host), self.assertRaisesRegex(
+                    LaunchSpecError, "TCP readiness 仅允许 loopback"):
+                normalize_launch_spec({**base, "readiness": {
+                    "type": "tcp", "host": host, "port": 8080}})
+
     def test_http_readiness_is_loopback_and_uses_the_configured_port(self):
         base = {"mode": "exec", "executable": r"C:\Python\python.exe",
                 "args": []}
@@ -77,6 +92,20 @@ class LaunchSpecTests(unittest.TestCase):
         with self.assertRaisesRegex(LaunchSpecError, "环境变量总长度"):
             normalize_launch_spec({**base, "args": [],
                                    "env": {"LARGE": "x" * 32760}})
+
+    def test_unpaired_surrogates_raise_launch_spec_error(self):
+        invalid_unicode = "\ud800"
+        base = {"mode": "exec", "executable": r"C:\Python\python.exe",
+                "args": []}
+        invalid_specs = (
+            {**base, "args": [invalid_unicode]},
+            {**base, "env": {"APP_VALUE": invalid_unicode}},
+            {"mode": "legacy-shell", "legacyCommand": invalid_unicode},
+        )
+        for spec in invalid_specs:
+            with self.subTest(spec=spec), self.assertRaisesRegex(
+                    LaunchSpecError, "无法编码的 Unicode"):
+                normalize_launch_spec(spec)
 
 
 if __name__ == "__main__":
