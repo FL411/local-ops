@@ -119,7 +119,8 @@ class WindowsRuntimeIntegrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             code = (
                 "import subprocess,sys,time; "
-                "subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)']); "
+                "subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)'], "
+                "creationflags=subprocess.CREATE_NO_WINDOW); "
                 "time.sleep(60)"
             )
             instance = self._launch(code, td)
@@ -218,7 +219,8 @@ class WindowsRuntimeIntegrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             code = (
                 "import subprocess,sys,time; "
-                "subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)'],close_fds=True); "
+                "subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)'], "
+                "close_fds=True,creationflags=subprocess.CREATE_NO_WINDOW); "
                 "time.sleep(.2)"
             )
             instance = self._launch(code, td)
