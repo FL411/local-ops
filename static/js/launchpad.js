@@ -289,6 +289,7 @@ function updateAppCard(card, app) {
   const kind = app.kind || 'service';
   const isTask = kind === 'task';
   const monitor = isMonitorApp(app);
+  const identityUnavailable = !monitor && !!app.identityUnavailable;
   const configureOnly = needsLaunchConfiguration(app);
   const monitorState = app.processState || (app.running ? 'alive' : 'absent');
   const monitorAlive = monitor && monitorState === 'alive';
@@ -313,7 +314,10 @@ function updateAppCard(card, app) {
       : app.running ? '运行中' : (app.port ? '已停止' : '未运行'));
   let stFail = false;
   let taskHistoryText = '';
-  if (monitor) {
+  if (identityUnavailable) {
+    stTxt = '无法验证运行状态';
+    stFail = true;
+  } else if (monitor) {
     stFail = false;
   } else if (app.portConflict) {
     stTxt = '配置冲突';
@@ -337,6 +341,14 @@ function updateAppCard(card, app) {
   } else if (!app.running && healthIssue) {
     stTxt = healthIssue.title || '配置不可用';
     stFail = true;
+  } else if (taskFinished && taskStatus === 'unknown') {
+    stTxt = '重启期间结束 · 退出码未知';
+    const endedAt = Number(app.lastExit.at);
+    const ago = Number.isFinite(endedAt) && endedAt > 0
+      ? fmtUptime(Date.now() / 1000 - endedAt) : '';
+    const duration = fmtDuration(app.lastExit.durationSec);
+    taskHistoryText = [ago, duration ? '用时 ' + duration : '']
+      .filter(Boolean).join(' · ');
   } else if (taskFinished && (taskStatus === 'canceled' || taskStatus === 'stopped')) {
     stTxt = taskStatus === 'canceled' ? '已取消' : '已中止';
     const endedAt = Number(app.lastExit.at);
@@ -455,10 +467,12 @@ function updateAppCard(card, app) {
   card.setAttribute('aria-label', appName + '，' + stTxt);
   r.restart.hidden = configureOnly || !app.running || kind !== 'service';
   const blocked = !configureOnly && !app.running &&
-    (!!app.portConflict || !!healthIssue);
+    (identityUnavailable || !!app.portConflict || !!healthIssue);
   // 注意：portOccupied 不在此禁用——按钮保持可点，点击时走「释放端口并启动」确认流。
   r.primary.disabled = blocked;
-  r.primary.title = monitor
+  r.primary.title = identityUnavailable
+    ? 'Job Object 暂时无法验证；为避免重复启动，验证恢复前不能启动'
+    : monitor
     ? '此卡片仅监控外部进程；点击后确认启动配置，保存后才可托管启停'
     : configureOnly ? '启动配置未确认；点击编辑并保存后才可托管启停'
     : app.portConflict
@@ -469,7 +483,7 @@ function updateAppCard(card, app) {
     && (isTask ? taskStatus === 'failed' : app.lastExit.code !== 0);
   card.classList.toggle('running', !!app.running);
   card.classList.toggle('monitor-only', monitor);
-  card.classList.toggle('has-error', !!app.portConflict || !!app.portOccupied
+  card.classList.toggle('has-error', identityUnavailable || !!app.portConflict || !!app.portOccupied
     || portMismatch || launchFailed || !!healthIssue);
   r.diag.hidden = !launchFailed && !healthIssue;
   updateCardGlow(card, app);
@@ -1181,7 +1195,8 @@ function loadLevel(pct) {
 const SVC_FILTERS = [['all', '全部'], ['running', '运行中'],
   ['stopped', '已停止'], ['error', '异常']];
 const TASK_FILTERS = [['all', '全部'], ['running', '运行中'],
-  ['succeeded', '成功'], ['failed', '失败'], ['canceled', '已取消']];
+  ['succeeded', '成功'], ['failed', '失败'], ['canceled', '已取消'],
+  ['unknown', '结果未知']];
 let svcFilter = 'all', taskFilter = 'all';
 /* 芯片按钮只创建一次，点击时必须读取当轮数据而不是首次渲染的闭包快照 */
 let latestSvcs = [], latestTasks = [];

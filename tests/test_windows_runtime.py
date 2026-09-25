@@ -38,6 +38,15 @@ class WindowsRuntimePureTests(unittest.TestCase):
                         if entry and entry.split("=", 1)[0].casefold() == "path"]
         self.assertEqual(len(path_entries), 1)
 
+    def test_oversized_merged_environment_is_rejected_before_create_process(self):
+        with mock.patch.dict(os.environ, {"PATH": "C:\\Windows"}, clear=True):
+            with self.assertRaisesRegex(ValueError, "environment block"):
+                windows_runtime._environment_block({"LARGE": "x" * 32760})
+
+    def test_oversized_final_command_line_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "command line"):
+            windows_runtime._checked_command_line("x" * 32767)
+
     def test_exec_command_uses_windows_argv_quoting_without_shell(self):
         executable = os.path.abspath(sys.executable)
         args = ["-c", 'print("a&b %TEMP% ^ | 雪")', r"C:\space dir\x.py"]

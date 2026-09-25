@@ -179,6 +179,8 @@ function diffSnapshot(prev, next) {
           pushEvent('error', app.name + ' 任务执行失败',
             app.exit.code != null ? '退出码 ' + app.exit.code : '');
         } else if (status === 'canceled') pushEvent('warn', app.name + ' 任务已取消', '');
+        else if (status === 'unknown') pushEvent('warn', app.name + ' 任务结束状态未知',
+          '控制台重启时任务已结束，无法恢复退出码');
         else pushEvent('warn', app.name + ' 任务已中止', '');
       } else if (app.exit.code) {
         pushEvent('error', app.name + ' 异常退出', '退出码 ' + app.exit.code);

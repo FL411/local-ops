@@ -266,9 +266,13 @@ class FrontendAccessibilityContractTests(unittest.TestCase):
 
         self.assertIn("export function taskExitStatus", core)
         self.assertIn("lastExit.code === 130", core)
-        for status in ("succeeded", "canceled", "failed", "stopped"):
+        for status in ("succeeded", "canceled", "failed", "stopped", "unknown"):
             self.assertIn(f"'{status}'", core)
         self.assertIn("taskStatus === 'canceled' ? '已取消' : '已中止'", launchpad)
+        self.assertIn("taskStatus === 'unknown'", launchpad)
+        self.assertIn("['unknown', '结果未知']", launchpad)
+        self.assertIn("identityUnavailable", launchpad)
+        self.assertIn("无法验证运行状态", launchpad)
         self.assertIn("app.health && app.health.blocking", launchpad)
         self.assertIn("r.primary.disabled = blocked", launchpad)
         self.assertIn("配置与运行诊断", launchpad)

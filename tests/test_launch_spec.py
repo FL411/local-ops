@@ -1,6 +1,7 @@
 import unittest
 
 from launch_spec import (LaunchSpecError, command_from_launch_spec,
+                        default_readiness, http_readiness_url,
                         is_launch_configured, normalize_launch_spec)
 
 
@@ -45,6 +46,37 @@ class LaunchSpecTests(unittest.TestCase):
         with self.assertRaises(LaunchSpecError):
             normalize_launch_spec({**base, "readiness": {"type": "tcp",
                                    "port": 8080, "timeoutSec": 0}})
+
+    def test_http_readiness_is_loopback_and_uses_the_configured_port(self):
+        base = {"mode": "exec", "executable": r"C:\Python\python.exe",
+                "args": []}
+        for url in ("http://example.com:8080/health",
+                    "http://127.0.0.1:8081/health",
+                    "https://127.0.0.1:8080/health"):
+            with self.subTest(url=url), self.assertRaises(LaunchSpecError):
+                normalize_launch_spec({**base, "readiness": {
+                    "type": "http", "port": 8080, "url": url}})
+
+    def test_ipv6_readiness_uses_bracketed_http_authority(self):
+        readiness = {"type": "http", "host": "::1", "port": 8080,
+                     "url": "/health", "timeoutSec": 5}
+        spec = normalize_launch_spec({
+            "mode": "exec", "executable": r"C:\Python\python.exe",
+            "args": [], "readiness": readiness})
+
+        self.assertEqual(default_readiness(8080)["host"], "localhost")
+        self.assertEqual(http_readiness_url("::1", 8080, "/health")[0],
+                         "http://[::1]:8080/health")
+        self.assertEqual(spec["readiness"]["host"], "::1")
+
+    def test_command_and_environment_overlays_obey_windows_size_limits(self):
+        base = {"mode": "exec", "executable": r"C:\Python\python.exe",
+                "args": ["x" * 32760]}
+        with self.assertRaisesRegex(LaunchSpecError, "命令行长度"):
+            normalize_launch_spec(base)
+        with self.assertRaisesRegex(LaunchSpecError, "环境变量总长度"):
+            normalize_launch_spec({**base, "args": [],
+                                   "env": {"LARGE": "x" * 32760}})
 
 
 if __name__ == "__main__":

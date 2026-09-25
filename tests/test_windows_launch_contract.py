@@ -136,6 +136,26 @@ class WindowsLaunchContractTests(unittest.TestCase):
         self.assertIn(special, spec["args"])
         self.assertEqual(spec["cwd"], cwd)
 
+    def test_launch_resolve_rejects_unquoted_shell_operators(self):
+        status, body = self.h.request("POST", "/api/launch/resolve", {
+            "command": 'python -m http.server 8765 && echo "done"',
+            "cwd": os.getcwd(), "port": 8765, "kind": "service",
+        })
+
+        self.assertEqual(status, 422)
+        self.assertIn("Shell 运算符", body["error"])
+        self.assertIn(".bat/.cmd", body["error"])
+
+    def test_quoted_shell_operator_remains_plain_argument_data(self):
+        command = '"%s" -c "print(\'a & b\')"' % sys.executable
+        status, body = self.h.request("POST", "/api/launch/resolve", {
+            "command": command, "cwd": os.getcwd(),
+            "port": 8765, "kind": "service",
+        })
+
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["launchSpec"]["args"][1], "print('a & b')")
+
     def test_validate_launch_route_checks_without_spawning(self):
         self._store(monitor_app())
         candidate = structured_spec(port=8765)
@@ -165,6 +185,28 @@ class WindowsLaunchContractTests(unittest.TestCase):
                 self.assertEqual(status, 409)
                 self.assertTrue(body.get("launchSpecRequired"))
                 launch.assert_not_called()
+
+    def test_monitor_card_can_fetch_favicon_from_its_verified_listener(self):
+        self._store(monitor_app())
+        png = b"\x89PNG\r\n\x1a\nfixture"
+        with tempfile.TemporaryDirectory() as icons, \
+                mock.patch.object(server, "ICONS_DIR", icons), \
+                mock.patch.object(server, "scan_listeners", return_value={
+                    (4242, 8765): {"127.0.0.1"}}), \
+                mock.patch.object(server, "observed_process_pid",
+                                  return_value=4242) as observed, \
+                mock.patch.object(server, "fetch_favicon",
+                                  return_value=(png, "png")) as fetch:
+            status, body = self.h.request(
+                "POST", "/api/apps/a1b2c3d4/favicon", {})
+            icon_exists = os.path.isfile(
+                os.path.join(icons, "fav-a1b2c3d4.png"))
+
+        self.assertEqual(status, 200, body)
+        self.assertTrue(body["ok"])
+        observed.assert_called_once()
+        fetch.assert_called_once_with(8765, "127.0.0.1")
+        self.assertTrue(icon_exists)
 
     def test_monitor_put_rejects_an_unconfirmed_null_launch_spec(self):
         self._store(monitor_app())
@@ -255,6 +297,17 @@ class WindowsLaunchContractTests(unittest.TestCase):
         )
 
         self.assertIsNone(observed)
+
+    def test_monitor_observation_can_follow_listener_pid_rotation(self):
+        app = monitor_app()
+        observed = server.observed_process_pid(
+            app,
+            listeners={(4243, 8765)},
+            snap={4243: {"uid": server.SELF_UID, "ctime": 200.0}},
+            cwds={4243: app["observation"]["cwd"]},
+        )
+
+        self.assertEqual(observed, 4243)
 
     def test_pid_reuse_does_not_leave_stale_card_blocking_new_observation(self):
         with tempfile.TemporaryDirectory() as cwd:

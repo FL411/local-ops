@@ -1,12 +1,14 @@
 import json
 import os
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest import mock
 
 import server
@@ -1240,6 +1242,25 @@ class ProcessIdentityTests(unittest.TestCase):
         self.assertEqual(server.classify_task_exit(1), "failed")
         self.assertEqual(server.classify_task_exit(-15), "failed")
 
+    def test_task_exit_with_unavailable_root_code_is_unknown(self):
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.object(server, "LOGS_DIR", td):
+            path = os.path.join(td, "config.json")
+            app = {**server.Config.APP_DEFAULT, "id": "deadbeef",
+                   "name": "任务", "kind": "task", "lastPid": 4321,
+                   "lastPgid": 4321, "runToken": "token"}
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({**server.Config.DEFAULT, "apps": [app]}, f)
+            cfg = server.Config(path)
+            proc = mock.Mock(pid=4321)
+            proc.wait.return_value = None
+            thread = server.watch_app_exit(cfg, "deadbeef", proc, "token")
+            thread.join(timeout=2)
+            result = cfg.snapshot()["apps"][0]["lastExit"]
+
+        self.assertEqual(result["status"], "unknown")
+        self.assertIsNone(result["code"])
+
     def test_old_task_exit_status_is_normalized_only_for_api_output(self):
         legacy = {"code": 0, "at": 123}
         app = {"kind": "task", "lastExit": legacy}
@@ -1251,6 +1272,11 @@ class ProcessIdentityTests(unittest.TestCase):
             "lastExit": {"status": "canceled", "code": None, "at": 456},
         })
         self.assertEqual(stopped["status"], "stopped")
+        unknown = server.public_last_exit({
+            "kind": "task",
+            "lastExit": {"status": "unknown", "code": None, "at": 456},
+        })
+        self.assertEqual(unknown["status"], "unknown")
 
     def test_task_start_preserves_previous_completed_result(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1275,6 +1301,154 @@ class ProcessIdentityTests(unittest.TestCase):
 
         self.assertEqual(apps["deadbeef"]["lastExit"], previous)
         self.assertIsNone(apps["feedface"]["lastExit"])
+
+
+class RunWatcherRecoveryTests(unittest.TestCase):
+    class ReopenedProcess:
+        def __init__(self, pid, result=0, gate=None):
+            self.pid = pid
+            self.result = result
+            self.gate = gate
+            self.wait_calls = 0
+            self.closed = False
+
+        def wait(self):
+            self.wait_calls += 1
+            if self.gate is not None:
+                self.gate.wait(3)
+            return self.result
+
+        def wait_for_empty(self):
+            return None
+
+        def close(self):
+            self.closed = True
+
+    @staticmethod
+    def _config(kind="service", readiness_state="checking"):
+        td = tempfile.TemporaryDirectory()
+        path = os.path.join(td.name, "config.json")
+        started_ms = int(time.time() * 1000) - 700
+        app = {
+            **server.Config.APP_DEFAULT,
+            "id": "recovery",
+            "name": "recovery test",
+            "command": "python -m http.server 8765",
+            "cwd": td.name,
+            "port": 8765 if kind == "service" else None,
+            "kind": kind,
+            "controlMode": "managed",
+            "launchSpec": None,
+            "lastPid": 4321,
+            "lastPgid": 4321,
+            "runToken": "restore-run",
+            "runInstance": {
+                "runId": "restore-run",
+                "jobName": "Local\\LocalOps-test",
+                "rootPid": 4321,
+                "rootCreateTime": 10.0,
+                "anchorPid": None,
+                "anchorCreateTime": None,
+                "startedAt": started_ms,
+                "processState": "alive",
+                "exitResult": None,
+            },
+            "readinessState": readiness_state,
+        }
+        cfg = server.Config(path)
+        cfg.update(lambda data: data["apps"].append(app))
+        return td, cfg, started_ms
+
+    def _wait_for(self, predicate, timeout=2):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return True
+            time.sleep(0.01)
+        return bool(predicate())
+
+    def test_restart_reconnects_exit_and_readiness_watchers_once(self):
+        td, cfg, started_ms = self._config()
+        gate = threading.Event()
+        first = self.ReopenedProcess(4321, gate=gate)
+        duplicate = self.ReopenedProcess(4321, gate=gate)
+        try:
+            with mock.patch.object(server, "_open_run_job",
+                                  side_effect=[first, duplicate]), \
+                    mock.patch.object(server, "_probe_readiness",
+                                      return_value=True):
+                server.restore_run_watchers(cfg)
+                server.restore_run_watchers(cfg)
+                self.assertTrue(self._wait_for(lambda:
+                    cfg.snapshot()["apps"][0]["readinessState"] == "ready"))
+                self.assertTrue(self._wait_for(lambda:
+                    ("recovery", "restore-run")
+                    not in server.ACTIVE_READINESS_WATCHERS))
+                self.assertEqual(first.wait_calls, 1)
+                self.assertEqual(duplicate.wait_calls, 0)
+                self.assertTrue(duplicate.closed)
+                gate.set()
+                self.assertTrue(self._wait_for(lambda:
+                    cfg.snapshot()["apps"][0]["runInstance"]["processState"] == "exited"))
+            result = cfg.snapshot()["apps"][0]["lastExit"]
+            self.assertEqual(result["startedAt"], started_ms)
+            self.assertEqual(cfg.snapshot()["apps"][0]["readinessState"], "ready")
+        finally:
+            gate.set()
+            td.cleanup()
+
+    def test_restarted_task_exit_is_recorded_with_persisted_start_time(self):
+        td, cfg, started_ms = self._config("task", "unknown")
+        proc = self.ReopenedProcess(4321, result=0)
+        try:
+            with mock.patch.object(server, "_open_run_job", return_value=proc):
+                server.restore_run_watchers(cfg)
+                self.assertTrue(self._wait_for(lambda:
+                    cfg.snapshot()["apps"][0]["lastExit"] is not None
+                    and proc.closed))
+            result = cfg.snapshot()["apps"][0]["lastExit"]
+            self.assertEqual(result["status"], "succeeded")
+            self.assertEqual(result["code"], 0)
+            self.assertEqual(result["startedAt"], started_ms)
+            self.assertTrue(proc.closed)
+        finally:
+            td.cleanup()
+
+    def test_empty_job_records_unknown_task_result_instead_of_stale_history(self):
+        td, cfg, _ = self._config("task", "unknown")
+        try:
+            with mock.patch.object(server, "_open_run_job", return_value=None):
+                server.restore_run_watchers(cfg)
+            app = cfg.snapshot()["apps"][0]
+            self.assertEqual(app["runInstance"]["processState"], "exited")
+            self.assertEqual(app["lastExit"]["status"], "unknown")
+            self.assertIsNone(app["lastExit"]["code"])
+        finally:
+            td.cleanup()
+
+    def test_reopen_failure_preserves_identity_and_blocks_duplicate_start(self):
+        td, cfg, _ = self._config("service", "checking")
+        try:
+            with mock.patch.object(server, "_open_run_job",
+                                   return_value=server.RUN_JOB_REOPEN_FAILED), \
+                    mock.patch.object(server, "_probe_readiness",
+                                      return_value=True):
+                server.restore_run_watchers(cfg)
+                self.assertTrue(self._wait_for(lambda:
+                    cfg.snapshot()["apps"][0]["readinessState"] == "ready"))
+            app = cfg.snapshot()["apps"][0]
+            self.assertNotEqual(app["runInstance"]["processState"], "exited")
+            self.assertEqual(app["readinessState"], "ready")
+            app["kind"] = "task"
+            app["port"] = None
+            cfg.update(lambda data: data["apps"].__setitem__(0, app))
+            with mock.patch.object(server, "_open_run_job",
+                                   return_value=server.RUN_JOB_REOPEN_FAILED):
+                result = server.start_app_transaction(cfg, "recovery")
+            self.assertEqual(result["status"], 409)
+            self.assertIn("无法验证", result["error"])
+        finally:
+            td.cleanup()
 
 
 class LaunchEnvironmentTests(unittest.TestCase):
@@ -1330,6 +1504,31 @@ class StateTests(unittest.TestCase):
 
         self.assertEqual(service["openHost"], "localhost")
         self.assertEqual(built_app["openHosts"], {"5173": "localhost"})
+
+    def test_unavailable_job_is_not_reported_exited_or_startable(self):
+        app = {**server.Config.APP_DEFAULT, "id": "a", "name": "受管服务",
+               "command": "python app.py", "port": 8765,
+               "lastPid": 4242, "runToken": "run-1",
+               "controlMode": "managed",
+               "runInstance": {"runId": "run-1", "jobName": "job",
+                               "rootPid": 4242, "processState": "alive"}}
+
+        def unavailable_index(apps, groups=None, anchor_repairs=None,
+                              unavailable_jobs=None):
+            unavailable_jobs.add("a")
+            return {"a": []}, {}, {}
+
+        with mock.patch.object(server, "managed_process_index",
+                               side_effect=unavailable_index), \
+                mock.patch.object(server, "listener_app_owners", return_value={}), \
+                mock.patch.object(server, "lsof_cwds", return_value={}), \
+                mock.patch.object(server, "inspect_app_health", return_value={
+                    "status": "unknown", "blocking": False, "issues": []}):
+            row = server.build_apps({"apps": [app]}, set())[0]
+
+        self.assertFalse(row["running"])
+        self.assertTrue(row["identityUnavailable"])
+        self.assertEqual(row["processState"], "alive")
 
     def test_service_listener_is_linked_by_managed_identity_not_configured_port(self):
         app = {**server.Config.APP_DEFAULT, "id": "old-card",
@@ -1554,6 +1753,85 @@ class IconTests(unittest.TestCase):
         self.assertIsNone(server.sniff_icon_bytes(
             b'<svg xmlns="http://www.w3.org/2000/svg"></svg>',
             "image/svg+xml"))
+
+
+class ReadinessProbeTests(unittest.TestCase):
+    def test_tcp_probe_accepts_ipv6_loopback_host(self):
+        class Connection:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        with mock.patch.object(server.socket, "create_connection",
+                               return_value=Connection()) as connect:
+            self.assertTrue(server._probe_readiness({
+                "type": "tcp", "host": "::1", "port": 43210}))
+        connect.assert_called_once_with(("::1", 43210), timeout=0.5)
+
+    def test_http_probe_reaches_ipv6_loopback(self):
+        class IPv6Server(ThreadingHTTPServer):
+            address_family = socket.AF_INET6
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(204)
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        try:
+            httpd = IPv6Server(("::1", 0), Handler)
+        except OSError as exc:
+            self.skipTest("IPv6 loopback is unavailable: %s" % exc)
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        try:
+            self.assertTrue(server._probe_readiness({
+                "type": "http", "host": "::1",
+                "port": httpd.server_port, "url": "/health"}))
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join(timeout=2)
+
+    def test_http_probe_blocks_external_redirect_and_accepts_local_response(self):
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path == "/external":
+                    self.send_response(302)
+                    self.send_header(
+                        "Location", "http://example.com:%d/track" %
+                        self.server.server_port)
+                    self.end_headers()
+                    return
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"ok")
+
+            def log_message(self, *args):
+                pass
+
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        port = httpd.server_address[1]
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        try:
+            self.assertTrue(server._probe_readiness({
+                "type": "http", "host": "127.0.0.1", "port": port,
+                "url": "/ok"}))
+            self.assertFalse(server._probe_readiness({
+                "type": "http", "host": "127.0.0.1", "port": port,
+                "url": "/external"}))
+            self.assertFalse(server._probe_readiness({
+                "type": "http", "host": "127.0.0.1", "port": port,
+                "url": "http://example.com:%d/track" % port}))
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join(timeout=2)
 
 
 class ConsoleRestartTests(unittest.TestCase):

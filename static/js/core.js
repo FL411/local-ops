@@ -352,7 +352,7 @@ export function taskExitSignature(lastExit) {
 }
 export function taskExitStatus(lastExit) {
   if (!lastExit) return '';
-  if (['succeeded', 'canceled', 'failed', 'stopped'].includes(lastExit.status)) {
+  if (['succeeded', 'canceled', 'failed', 'stopped', 'unknown'].includes(lastExit.status)) {
     return lastExit.status;
   }
   if (lastExit.code === 0) return 'succeeded';
@@ -420,6 +420,8 @@ export function notifyTaskCompletions(previousData, nextData) {
       toast(name + '运行成功' + suffix, 5000);
     } else if (status === 'canceled') {
       toast(name + '已取消' + suffix, 4200);
+    } else if (status === 'unknown') {
+      toast(name + '在控制台重启期间结束，退出码未知' + suffix, 5000);
     } else {
       const result = app.lastExit.code < 0
         ? '被终止' : '运行失败（exit ' + app.lastExit.code + '）';
@@ -430,6 +432,7 @@ export function notifyTaskCompletions(previousData, nextData) {
       succeeded: '运行成功' + suffix,
       canceled: '已取消' + suffix,
       failed: (app.lastExit.code < 0 ? '被终止' : '运行失败') + suffix,
+      unknown: '在控制台重启期间结束，退出码未知' + suffix,
     }[status];
     systemNotify(name + ' · 任务完成', notifyBody || '任务已结束');
   }

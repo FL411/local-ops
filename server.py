@@ -34,6 +34,7 @@ import sysops
 import windows_runtime
 from launch_spec import (LaunchSpecError, command_from_launch_spec,
                          default_readiness, is_launch_configured,
+                         http_readiness_url,
                          launch_signature_fields,
                          normalize_launch_spec)
 
@@ -139,6 +140,10 @@ LOG = logging.getLogger("console")
 LOG_LOCK = threading.RLock()
 MANUAL_STOP_LOCK = threading.RLock()
 MANUAL_STOP_TOKENS = set()
+WATCHER_LOCK = threading.RLock()
+ACTIVE_EXIT_WATCHERS = set()
+ACTIVE_READINESS_WATCHERS = set()
+RUN_JOB_REOPEN_FAILED = object()
 
 
 def configure_console_encoding():
@@ -1403,7 +1408,7 @@ def _open_run_job(app):
             or not instance.get("runId") or not instance.get("jobName")):
         return None
     if not isinstance(SELF_UID, str) or not SELF_UID.startswith("S-"):
-        return None
+        return RUN_JOB_REOPEN_FAILED
     try:
         return windows_runtime.reopen(
             instance["runId"], job_name=instance.get("jobName"),
@@ -1413,7 +1418,7 @@ def _open_run_job(app):
             anchor_create_time=instance.get("anchorCreateTime"))
     except (OSError, ValueError, TypeError) as exc:
         LOG.debug("无法重连应用 %s 的 Job Object: %s", app.get("id"), exc)
-        return None
+        return RUN_JOB_REOPEN_FAILED
 
 
 def observed_process_pid(app, listeners=None, snap=None, cwds=None):
@@ -1461,7 +1466,8 @@ def observed_process_pid(app, listeners=None, snap=None, cwds=None):
     return matches[0] if len(matches) == 1 else None
 
 
-def managed_process_index(apps, groups=None, anchor_repairs=None):
+def managed_process_index(apps, groups=None, anchor_repairs=None,
+                          unavailable_jobs=None):
     """批量校验应用的受控进程，返回 (appId -> [pid], ps, groups)。
 
     必须同时满足：属于记录的进程组、属于当前用户、argv 中带本次启动的
@@ -1478,7 +1484,11 @@ def managed_process_index(apps, groups=None, anchor_repairs=None):
     all_pids = set()
     for app in apps:
         job = _open_run_job(app)
-        if job is not None:
+        if job is RUN_JOB_REOPEN_FAILED:
+            if unavailable_jobs is not None:
+                unavailable_jobs.add(app.get("id"))
+            pids = set()
+        elif job is not None:
             try:
                 instance = app.get("runInstance") or {}
                 anchor_pid = getattr(job, "anchor_pid", None)
@@ -1627,8 +1637,10 @@ def build_apps(cfg, listeners, groups=None, attached_repairs=None,
     for pid, port in listeners:
         port_map.setdefault(port, []).append(pid)
     apps_cfg = cfg.get("apps") or []
+    unavailable_jobs = set()
     managed, snap, _ = managed_process_index(
-        apps_cfg, groups, anchor_repairs=anchor_repairs)
+        apps_cfg, groups, anchor_repairs=anchor_repairs,
+        unavailable_jobs=unavailable_jobs)
     listen_by_pid = {}
     for pid, port in listeners:
         listen_by_pid.setdefault(pid, []).append(port)
@@ -1749,6 +1761,10 @@ def build_apps(cfg, listeners, groups=None, attached_repairs=None,
             process_state = "alive" if live else "absent"
         elif persisted_process_state in ("starting", "stopping", "exited"):
             process_state = persisted_process_state
+        elif app.get("id") in unavailable_jobs:
+            # Do not turn an access/reopen failure into a false exited state.
+            # The start endpoint also rejects this unresolved identity.
+            process_state = persisted_process_state or "absent"
         elif (not live and isinstance(instance, dict)
               and instance.get("jobName")):
             # After a console restart there is no exit watcher attached to the
@@ -1775,6 +1791,7 @@ def build_apps(cfg, listeners, groups=None, attached_repairs=None,
             "attached": bool(app.get("attached")),
             "controlMode": control_mode,
             "processState": process_state,
+            "identityUnavailable": app.get("id") in unavailable_jobs,
             "readiness": (
                 "failed" if process_state == "exited"
                 and app.get("readinessState") == "checking"
@@ -2403,9 +2420,32 @@ def startup_failure_message(app_id, code):
     return "启动命令立即退出（exit %s），请查看日志" % code
 
 
+def _update_config_with_retry(cfg, operation, description, attempts=3):
+    """Retry watcher-owned state writes briefly before logging a hard failure."""
+    for attempt in range(max(1, int(attempts))):
+        try:
+            return cfg.update(operation)
+        except Exception:
+            if attempt + 1 >= attempts:
+                LOG.exception("%s：配置写入重试耗尽", description)
+                return None
+            LOG.warning("%s：配置写入失败，将重试（%d/%d）",
+                        description, attempt + 1, attempts, exc_info=True)
+            time.sleep(0.1 * (attempt + 1))
+    return None
+
+
 def watch_app_exit(cfg, app_id, proc, token, started_at=None):
     """Wait for the root and every Job Object member, then persist its exit."""
     started_at = time.time() if started_at is None else started_at
+    watcher_key = (app_id, token)
+    with WATCHER_LOCK:
+        if watcher_key in ACTIVE_EXIT_WATCHERS:
+            close = getattr(proc, "close", None)
+            if close:
+                close()
+            return None
+        ACTIVE_EXIT_WATCHERS.add(watcher_key)
 
     def _wait():
         try:
@@ -2447,21 +2487,32 @@ def watch_app_exit(cfg, app_id, proc, token, started_at=None):
                         "durationSec": duration,
                     }
                     if (target.get("kind") or "service") == "task":
-                        last_exit["status"] = classify_task_exit(code)
-                    target["lastExit"] = last_exit
+                        last_exit["status"] = (
+                            classify_task_exit(code) if code is not None
+                            else "unknown")
+                    if code is not None or (target.get("kind") or "service") == "task":
+                        target["lastExit"] = last_exit
                     if isinstance(instance, dict) and instance.get("runId") == token:
                         instance["processState"] = "exited"
                         instance["exitResult"] = last_exit
                     if target.get("readinessState") == "checking":
                         target["readinessState"] = "failed"
-            cfg.update(op)
+            _update_config_with_retry(
+                cfg, op, "应用 %s 退出状态" % app_id)
             rotate_log_file(os.path.join(LOGS_DIR, "%s.log" % app_id))
         finally:
             close = getattr(proc, "close", None)
             if close:
                 close()
+            with WATCHER_LOCK:
+                ACTIVE_EXIT_WATCHERS.discard(watcher_key)
     thread = threading.Thread(target=_wait, daemon=True)
-    thread.start()
+    try:
+        thread.start()
+    except Exception:
+        with WATCHER_LOCK:
+            ACTIVE_EXIT_WATCHERS.discard(watcher_key)
+        raise
     return thread
 
 
@@ -2497,6 +2548,7 @@ def persist_started_app(cfg, app_id, proc, pgid, token):
                 "rootCreateTime": creation_time,
                 "anchorPid": anchor_pid,
                 "anchorCreateTime": anchor_create_time,
+                "startedAt": int(started_at * 1000),
                 "processState": "starting",
                 "exitResult": None,
             } if job_name and pid else None)
@@ -2531,7 +2583,7 @@ def _probe_readiness(readiness):
     probe_type = readiness.get("type")
     if probe_type == "none":
         return None
-    host = readiness.get("host") or "127.0.0.1"
+    host = readiness.get("host") or "localhost"
     port = readiness.get("port")
     if not isinstance(port, int):
         return False
@@ -2543,11 +2595,23 @@ def _probe_readiness(readiness):
             return False
     if probe_type == "http":
         url = readiness.get("url") or "/"
-        if not re.match(r"^https?://", url, re.I):
-            url = "http://%s:%d/%s" % (host, port, url.lstrip("/"))
         try:
+            url, target_host = http_readiness_url(host, port, url)
+
+            class SameLoopbackRedirectHandler(urllib.request.HTTPRedirectHandler):
+                def redirect_request(self, req, fp, code, msg, headers, newurl):
+                    try:
+                        http_readiness_url(
+                            host, port, newurl, expected_host=target_host)
+                    except LaunchSpecError:
+                        return None
+                    return super().redirect_request(
+                        req, fp, code, msg, headers, newurl)
+
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({}), SameLoopbackRedirectHandler())
             request = urllib.request.Request(url, method="GET")
-            with urllib.request.urlopen(request, timeout=1.0) as response:
+            with opener.open(request, timeout=1.0) as response:
                 return 200 <= int(response.status) < 400
         except Exception:
             return False
@@ -2562,37 +2626,133 @@ def watch_app_readiness(cfg, app_id, run_id, app):
     readiness = spec.get("readiness") or default_readiness(app.get("port"))
     if readiness.get("type") == "none":
         return None
-    deadline = time.monotonic() + float(readiness.get("timeoutSec", 20))
+    watcher_key = (app_id, run_id)
+    with WATCHER_LOCK:
+        if watcher_key in ACTIVE_READINESS_WATCHERS:
+            return None
+        ACTIVE_READINESS_WATCHERS.add(watcher_key)
+    instance = app.get("runInstance") or {}
+    started_ms = instance.get("startedAt")
+    if type(started_ms) not in (int, float) or started_ms <= 0:
+        started_at = time.time()
+    else:
+        started_at = float(started_ms) / 1000.0
+    timeout = float(readiness.get("timeoutSec", 20))
+    deadline = time.monotonic() + max(0.0, timeout - max(0.0, time.time() - started_at))
 
     def _probe():
-        state = "timeout"
-        while time.monotonic() < deadline:
-            current = find_app(cfg.snapshot(), app_id)
-            instance = current.get("runInstance") if current else None
-            if (not current or not isinstance(instance, dict)
-                    or instance.get("runId") != run_id
-                    or instance.get("processState") == "exited"):
-                state = "failed"
-                break
-            if _probe_readiness(readiness):
-                state = "ready"
-                break
-            time.sleep(0.25)
+        try:
+            state = "timeout"
+            first_probe = True
+            while first_probe or time.monotonic() < deadline:
+                first_probe = False
+                current = find_app(cfg.snapshot(), app_id)
+                current_instance = current.get("runInstance") if current else None
+                if (not current or not isinstance(current_instance, dict)
+                        or current_instance.get("runId") != run_id
+                        or current_instance.get("processState") in ("exited", "stopping")):
+                    state = "failed"
+                    break
+                if _probe_readiness(readiness):
+                    state = "ready"
+                    break
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(0.25)
 
-        def op(data):
-            target = find_app(data, app_id)
-            instance = target.get("runInstance") if target else None
-            if isinstance(instance, dict) and instance.get("runId") == run_id:
-                # A stop/exit that won the race keeps its terminal process state.
-                if target.get("readinessState") == "checking":
-                    target["readinessState"] = state
+            def op(data):
+                target = find_app(data, app_id)
+                current_instance = target.get("runInstance") if target else None
+                if (isinstance(current_instance, dict)
+                        and current_instance.get("runId") == run_id):
+                    # A stop/exit that won the race keeps its terminal process state.
+                    if target.get("readinessState") == "checking":
+                        target["readinessState"] = state
 
-        cfg.update(op)
+            _update_config_with_retry(
+                cfg, op, "应用 %s readiness 状态" % app_id)
+        finally:
+            with WATCHER_LOCK:
+                ACTIVE_READINESS_WATCHERS.discard(watcher_key)
 
     thread = threading.Thread(target=_probe, daemon=True,
                               name="app-readiness-%s" % app_id)
-    thread.start()
+    try:
+        thread.start()
+    except Exception:
+        with WATCHER_LOCK:
+            ACTIVE_READINESS_WATCHERS.discard(watcher_key)
+        raise
     return thread
+
+
+def _record_recovered_empty_job(cfg, app_id, run_id, instance):
+    """Persist a terminal state when the named Job Object is already empty.
+
+    Windows no longer exposes the root exit code after its process handle was
+    lost with the previous console. Keep that fact explicit for task history.
+    """
+    now = time.time()
+    started_ms = instance.get("startedAt")
+    if type(started_ms) not in (int, float) or started_ms <= 0:
+        started_ms = int(now * 1000)
+    started_at = float(started_ms) / 1000.0
+    exit_result = {
+        "code": None,
+        "at": int(now),
+        "startedAt": int(started_ms),
+        "durationSec": round(max(0.0, now - started_at), 3),
+    }
+    def op(data):
+        target = find_app(data, app_id)
+        current = target.get("runInstance") if target else None
+        if (not isinstance(current, dict)
+                or current.get("runId") != run_id
+                or current.get("processState") == "exited"):
+            return
+        current["processState"] = "exited"
+        current["exitResult"] = dict(exit_result)
+        if (target.get("kind") or "service") == "task":
+            target["lastExit"] = dict(exit_result, status="unknown")
+        if target.get("readinessState") == "checking":
+            target["readinessState"] = "failed"
+    _update_config_with_retry(
+        cfg, op, "应用 %s Job Object 退出状态" % app_id)
+
+
+def restore_run_watchers(cfg):
+    """Reconnect exit/readiness watchers for structured runs after restart."""
+    for app in cfg.snapshot().get("apps", []):
+        instance = app.get("runInstance")
+        if (app.get("controlMode") == "monitor"
+                or not isinstance(instance, dict)
+                or not instance.get("jobName")
+                or not instance.get("runId")
+                or instance.get("processState") == "exited"):
+            continue
+        proc = _open_run_job(app)
+        run_id = instance["runId"]
+        if proc is RUN_JOB_REOPEN_FAILED:
+            LOG.warning("应用 %s 的 Job Object 暂时无法重连，保留原运行状态",
+                        app.get("id"))
+            if app.get("readinessState") == "checking":
+                # Readiness only describes the endpoint; it does not establish
+                # process ownership, so this independent probe remains safe.
+                watch_app_readiness(cfg, app.get("id"), run_id, app)
+            continue
+        if proc is None:
+            _record_recovered_empty_job(cfg, app.get("id"), run_id, instance)
+            continue
+        started_ms = instance.get("startedAt")
+        started_at = (float(started_ms) / 1000.0
+                      if type(started_ms) in (int, float) and started_ms > 0
+                      else time.time())
+        if instance.get("processState") == "starting":
+            mark_app_alive(cfg, app.get("id"), run_id)
+        watch_app_exit(cfg, app.get("id"), proc, run_id, started_at)
+        current = find_app(cfg.snapshot(), app.get("id"))
+        if current and current.get("readinessState") == "checking":
+            watch_app_readiness(cfg, app.get("id"), run_id, current)
 
 
 def start_app_transaction(cfg, app_id, require_autostart=False):
@@ -2617,6 +2777,21 @@ def start_app_transaction(cfg, app_id, require_autostart=False):
             return {"ok": False, "status": 409,
                     "error": "请先确认启动配置，再由总控台托管此服务",
                     "launchSpecRequired": True}
+        current_instance = current.get("runInstance")
+        if (isinstance(current_instance, dict)
+                and current_instance.get("jobName")
+                and current_instance.get("processState") != "exited"):
+            job = _open_run_job(current)
+            if job is RUN_JOB_REOPEN_FAILED:
+                return {"ok": False, "status": 409,
+                        "error": "无法验证当前 Job Object 状态，请检查总控台日志后重试"}
+            if job is not None:
+                try:
+                    if job.members():
+                        return {"ok": False, "status": 409,
+                                "error": "应用已在运行"}
+                finally:
+                    job.close()
         if require_autostart and (
                 (current.get("kind") or "service") != "service"
                 or not current.get("autostart")):
@@ -2948,9 +3123,9 @@ def _split_windows_command_line(command):
     """Parse a Windows command line into argv without invoking a shell.
 
     This follows the Microsoft C runtime backslash/quote rules used by
-    ``CreateProcessW``. Characters such as ``&``, ``%``, ``^`` and ``|`` stay
-    ordinary argument data here; only an explicitly selected batch file is
-    later passed through CMD's dedicated quoting path.
+    ``CreateProcessW``. Unquoted shell operators are rejected so a command
+    such as ``python app.py && echo done`` cannot silently change meaning.
+    Operators inside quoted argv remain ordinary argument data.
     """
     if not isinstance(command, str) or not command.strip():
         raise LaunchSpecError("请填写启动命令")
@@ -2985,6 +3160,11 @@ def _split_windows_command_line(command):
             else:
                 token.extend("\\" * slash_count)
                 if index < length and not (command[index].isspace() and not quoted):
+                    if not quoted and command[index] in "&|<>^":
+                        raise LaunchSpecError(
+                            "命令包含未加引号的 Shell 运算符（&、|、<、>、^）；"
+                            "结构化启动不执行 Shell 语法，请将命令写入 .bat/.cmd "
+                            "或 .ps1 脚本后选择该脚本")
                     token.append(command[index])
                     index += 1
         if quoted:
@@ -3896,6 +4076,8 @@ def resolve_app_stop_target(app, listeners=None):
             and isinstance(instance, dict) and instance.get("jobName")
             and instance.get("processState") != "exited"):
         job = _open_run_job(app)
+        if job is RUN_JOB_REOPEN_FAILED:
+            return None, "无法重连应用的 Job Object，未执行停止"
         if job is not None:
             members = job.members()
             if members:
@@ -5340,9 +5522,13 @@ class Handler(BaseHTTPRequestHandler):
         _, app = self._get_app_or_404(app_id)
         if app is None:
             return
-        live = set(managed_pids(app))
         port = None
         listeners = scan_listeners()
+        if app.get("controlMode") == "monitor":
+            observed_pid = observed_process_pid(app, listeners=listeners)
+            live = {observed_pid} if observed_pid is not None else set()
+        else:
+            live = set(managed_pids(app))
         configured_port = app.get("port")
         if configured_port and any(pid in live and p == configured_port
                                    for pid, p in listeners):
@@ -6158,6 +6344,7 @@ def _run_console(preferred_port=None, open_browser=True,
             "launchpad still empty after restore: memory=0 disk=%d path=%s",
             disk_apps, cfg.path)
     control_token = load_control_token(os.path.join(DATA_DIR, "control.token"))
+    restore_run_watchers(cfg)
 
     server, port = None, None
     candidates = list(range(PORT_START, PORT_START + PORT_TRIES))

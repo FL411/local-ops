@@ -36,6 +36,18 @@ _WAIT_OBJECT_0 = 0
 _WAIT_TIMEOUT = 258
 _STILL_ACTIVE = 259
 _INFINITE = 0xFFFFFFFF
+_MAX_WINDOWS_COMMAND_LINE_CHARS = 32767
+_MAX_WINDOWS_ENVIRONMENT_CHARS = 32767
+
+
+def _utf16_units(value: str) -> int:
+    return len(value.encode("utf-16-le")) // 2
+
+
+def _checked_command_line(value: str) -> str:
+    if _utf16_units(value) + 1 > _MAX_WINDOWS_COMMAND_LINE_CHARS:
+        raise ValueError("Windows process command line exceeds 32767 UTF-16 characters")
+    return value
 
 
 def job_name_for(run_id: str, sid: str) -> str:
@@ -83,7 +95,10 @@ def _environment_block(overlay: Mapping[str, str] | None) -> str | None:
     # first, as they do in the native environment block.
     entries = ["%s=%s" % pair for pair in by_folded.values()]
     entries.sort(key=lambda item: item.casefold())
-    return "\x00".join(entries) + "\x00\x00"
+    block = "\x00".join(entries) + "\x00\x00"
+    if _utf16_units(block) > _MAX_WINDOWS_ENVIRONMENT_CHARS:
+        raise ValueError("Windows process environment block exceeds 32767 UTF-16 characters")
+    return block
 
 
 def _resolve_executable(executable: str, cwd: str | None,
@@ -145,8 +160,9 @@ def _cmd_line(executable: str, args: Sequence[str]) -> tuple[str, str]:
     if args:
         inner += " " + " ".join(_cmd_quote_argument(arg) for arg in args)
     cmd_exe = os.path.abspath(cmd_exe)
-    return cmd_exe, '%s /d /s /c "%s"' % (
+    command_line = '%s /d /s /c "%s"' % (
         subprocess.list2cmdline([cmd_exe]), inner)
+    return cmd_exe, _checked_command_line(command_line)
 
 
 def _command_for(mode: str, executable: str, args: Sequence[str], cwd: str | None,
@@ -166,13 +182,15 @@ def _command_for(mode: str, executable: str, args: Sequence[str], cwd: str | Non
         if not os.path.isfile(cmd_exe):
             cmd_exe = shutil.which("cmd.exe") or cmd_exe
         cmd_exe = os.path.abspath(cmd_exe)
-        return cmd_exe, '%s /d /s /c "%s"' % (
+        command_line = '%s /d /s /c "%s"' % (
             subprocess.list2cmdline([cmd_exe]), command)
+        return cmd_exe, _checked_command_line(command_line)
     if mode == "cmd":
         resolved = _resolve_executable(executable, cwd, env)
         return _cmd_line(resolved, args)
     resolved = _resolve_executable(executable, cwd, env)
-    return resolved, subprocess.list2cmdline([resolved, *args])
+    return resolved, _checked_command_line(
+        subprocess.list2cmdline([resolved, *args]))
 
 
 class _SECURITY_ATTRIBUTES(ctypes.Structure):

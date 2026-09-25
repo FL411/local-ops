@@ -539,7 +539,9 @@ async function resolveLaunchSpec(body, appId = null) {
     const resolved = await act(post('/api/launch/resolve', {
       command: body.command, cwd: body.cwd, port: body.port, kind: body.kind,
     }));
-    if (!resolved || resolved.ok === false || !resolved.launchSpec) return null;
+    if (!resolved || resolved.ok === false || !resolved.launchSpec) {
+      return null;
+    }
     body.launchSpec = cloneLaunchSpec(resolved.launchSpec);
     if (typeof resolved.command === 'string' && resolved.command) {
       body.command = resolved.command;
@@ -553,7 +555,9 @@ async function resolveLaunchSpec(body, appId = null) {
       ...(launchSpec ? { launchSpec } : {}),
       command: body.command, cwd: body.cwd, port: body.port, kind: body.kind,
     }));
-    if (!validated || validated.ok === false || !validated.launchSpec) return null;
+    if (!validated || validated.ok === false || !validated.launchSpec) {
+      return null;
+    }
     body.launchSpec = cloneLaunchSpec(validated.launchSpec);
     if (typeof validated.command === 'string' && validated.command) {
       body.command = validated.command;
