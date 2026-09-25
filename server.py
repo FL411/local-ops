@@ -10,6 +10,7 @@ API 契约与实现要点见 AGENTS.md。
 import glob
 import functools
 import errno
+import hashlib
 import json
 import logging
 import os
@@ -17,6 +18,7 @@ import re
 import secrets
 import shutil
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -29,6 +31,11 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import sysops
+import windows_runtime
+from launch_spec import (LaunchSpecError, command_from_launch_spec,
+                         default_readiness, is_launch_configured,
+                         launch_signature_fields,
+                         normalize_launch_spec)
 
 # Windows 系统托盘（纯 ctypes，零依赖）。
 try:
@@ -82,7 +89,7 @@ CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
 INSTANCE_LOCK_PATH = os.path.join(DATA_DIR, "console.lock")
 CONTROL_TOKEN_PATH = os.path.join(DATA_DIR, "control.token")
 
-CURRENT_SCHEMA_VERSION = 1
+CURRENT_SCHEMA_VERSION = 2
 
 # 默认 UI 主题：新安装与无偏好回退均使用它，主题清单中固定排首位。
 DEFAULT_UI_THEME = "ops"
@@ -216,7 +223,7 @@ code{background:#f5f5f7;border:1px solid rgba(0,0,0,.05);border-radius:6px;paddi
 </div></body></html>"""
 
 APP_ROUTE_RE = re.compile(
-    r"^/api/apps/([0-9a-fA-F]{8})(?:/(start|stop|restart|icon|logs|favicon|diagnose|attach))?$")
+    r"^/api/apps/([0-9a-fA-F]{8})(?:/(start|stop|restart|icon|logs|favicon|diagnose|attach|validate-launch))?$")
 
 
 # ---------------------------------------------------------------- 运行目录
@@ -465,7 +472,93 @@ def migrate_config_v0_to_v1(raw):
     return migrated
 
 
-CONFIG_MIGRATIONS = {0: migrate_config_v0_to_v1}
+def migrate_config_v1_to_v2(raw):
+    """Separate launch definitions from observed and running identities.
+
+    Free-form commands are retained verbatim in ``legacy-shell`` mode so this
+    schema migration cannot silently alter a user's existing shell syntax.
+    Old attached cards become observation-only cards; their command and PID
+    remain available as history, but are not treated as a restart definition.
+    """
+    migrated = dict(raw)
+    apps = []
+    for raw_item in raw.get("apps", []) if isinstance(raw.get("apps"), list) else []:
+        if not isinstance(raw_item, dict):
+            apps.append(raw_item)
+            continue
+        app = dict(raw_item)
+        attached = bool(app.get("attached"))
+        control_mode = app.get("controlMode")
+        if control_mode not in ("managed", "monitor"):
+            control_mode = "monitor" if attached else "managed"
+        app["controlMode"] = control_mode
+        if control_mode == "monitor":
+            app["attached"] = True
+            app["launchSpec"] = None
+            app["launchConfigured"] = False
+            observation = app.get("observation")
+            if not isinstance(observation, dict):
+                observation = None
+            if observation is None and app.get("lastPid"):
+                port = app.get("port")
+                observation = {
+                    "pid": app.get("lastPid"),
+                    "createTime": app.get("lastCreateTime"),
+                    "sid": None,
+                    "cwd": app.get("cwd"),
+                    "ports": [port] if type(port) is int else [],
+                    "observedAt": None,
+                }
+            app["observation"] = observation
+            app["runInstance"] = None
+            app["readinessState"] = "unknown"
+        else:
+            app["attached"] = False
+            # One-time v1 compatibility repair: old versions could persist
+            # uv's shared Python cache as the interpreter for a managed card.
+            # Observation cards keep their historic command untouched.
+            old_command = app.get("command", "")
+            parsed_python = _command_python_executable(old_command)
+            if (parsed_python and _is_uv_python_path(parsed_python[2])
+                    and app.get("cwd")):
+                repaired_command = normalize_attached_python_command(
+                    old_command, app.get("cwd"))
+                if repaired_command != old_command:
+                    app["command"] = repaired_command
+            spec = app.get("launchSpec")
+            if spec is None:
+                spec = normalize_launch_spec(
+                    None, command=app.get("command", ""),
+                    cwd=app.get("cwd"), port=app.get("port"))
+            app["launchSpec"] = normalize_launch_spec(
+                spec, command=app.get("command", ""), cwd=app.get("cwd"),
+                port=app.get("port"))
+            app["command"] = command_from_launch_spec(app["launchSpec"])
+            app["launchConfigured"] = is_launch_configured(app["launchSpec"])
+            app["observation"] = None
+            old_instance = app.get("runInstance")
+            if not isinstance(old_instance, dict):
+                old_instance = None
+            if old_instance is None and app.get("lastPid"):
+                token = app.get("runToken")
+                old_instance = {
+                    "runId": token or "legacy-%s-%s" % (
+                        app.get("id", "unknown"), app.get("lastPid")),
+                    "jobName": None,
+                    "rootPid": app.get("lastPid"),
+                    "rootCreateTime": app.get("lastCreateTime"),
+                    "processState": "alive" if token else "absent",
+                    "exitResult": app.get("lastExit"),
+                }
+            app["runInstance"] = old_instance
+            app["readinessState"] = "unknown"
+        apps.append(app)
+    migrated["apps"] = apps
+    migrated["schemaVersion"] = 2
+    return migrated
+
+
+CONFIG_MIGRATIONS = {0: migrate_config_v0_to_v1, 1: migrate_config_v1_to_v2}
 
 
 def migrate_config(raw):
@@ -506,6 +599,35 @@ def _load_config_raw(path):
     return raw if isinstance(raw, dict) else None
 
 
+def app_config_signature(apps):
+    """Return a stable signature for the persisted launchpad definition.
+
+    Runtime identity (PID, run token and exit history) is deliberately omitted:
+    those fields change while an otherwise identical card is running. The
+    launcher uses this value to reject a live console whose in-memory card has
+    drifted from the on-disk card, even when both contain the same number of
+    apps.
+    """
+    stable_defaults = {
+        "id": None, "name": "", "command": "", "cwd": None,
+        "port": None, "emoji": None, "glyph": None, "icon": None,
+        "favicon": None, "kind": "service", "controlMode": "managed",
+        "launchSpec": None,
+    }
+    stable_apps = []
+    for app in apps or []:
+        if not isinstance(app, dict) or not app.get("id"):
+            continue
+        stable_apps.append({key: app.get(key, default)
+                            for key, default in stable_defaults.items()})
+        stable_apps[-1].update(launch_signature_fields(app))
+    payload = json.dumps(
+        stable_apps, ensure_ascii=False, sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
 class Config:
     """配置读写：显式 schema 迁移 + 原子写 + 上一份良好备份。"""
 
@@ -518,7 +640,10 @@ class Config:
                    "favicon": None, "kind": "service", "lastPid": None,
                    "lastPgid": None, "runToken": None,
                    "attached": False, "lastExit": None, "createdAt": 0,
-                   "lastCreateTime": None, "autostart": False}
+                   "lastCreateTime": None, "autostart": False,
+                   "launchSpec": None, "controlMode": "managed",
+                   "observation": None, "runInstance": None,
+                   "readinessState": "unknown", "launchConfigured": False}
 
     def __init__(self, path):
         self._lock = threading.RLock()
@@ -557,6 +682,52 @@ class Config:
             for key in app:
                 if key in item:
                     app[key] = item[key]
+            try:
+                app["controlMode"] = (
+                    "monitor" if item.get("controlMode") == "monitor"
+                    or item.get("attached") else "managed")
+                app["attached"] = app["controlMode"] == "monitor"
+                if app["controlMode"] == "monitor":
+                    if isinstance(app.get("launchSpec"), dict):
+                        app["launchSpec"] = normalize_launch_spec(
+                            app["launchSpec"], command=app.get("command", ""),
+                            cwd=app.get("cwd"), port=app.get("port"))
+                        app["command"] = command_from_launch_spec(
+                            app["launchSpec"])
+                        app["launchConfigured"] = is_launch_configured(
+                            app["launchSpec"])
+                    else:
+                        app["launchSpec"] = None
+                        app["launchConfigured"] = False
+                    if not isinstance(app["observation"], dict):
+                        app["observation"] = None
+                    if app["observation"] is None and app.get("lastPid"):
+                        port = app.get("port")
+                        app["observation"] = {
+                            "pid": app.get("lastPid"),
+                            "createTime": app.get("lastCreateTime"),
+                            "sid": None,
+                            "cwd": app.get("cwd"),
+                            "ports": [port] if type(port) is int else [],
+                            "observedAt": None,
+                        }
+                    app["runInstance"] = None
+                else:
+                    app["launchSpec"] = normalize_launch_spec(
+                        app["launchSpec"], command=app.get("command", ""),
+                        cwd=app.get("cwd"), port=app.get("port"))
+                    app["command"] = command_from_launch_spec(app["launchSpec"])
+                    app["launchConfigured"] = is_launch_configured(
+                        app["launchSpec"])
+                    app["observation"] = None
+                    if not isinstance(app["runInstance"], dict):
+                        app["runInstance"] = None
+                if app.get("readinessState") not in (
+                        "unknown", "checking", "ready", "timeout", "failed"):
+                    app["readinessState"] = "unknown"
+            except LaunchSpecError as e:
+                raise ConfigSchemaError(
+                    "应用 %s 的 launchSpec 无效: %s" % (app.get("id"), e))
             apps.append(app)
         data["apps"] = apps
         return data
@@ -636,6 +807,14 @@ class Config:
         restored = []
         if not isinstance(raw, dict) or not isinstance(raw.get("apps"), list):
             return restored
+        try:
+            migrated, _ = migrate_config(raw)
+            return self._normalize(migrated)["apps"]
+        except (ConfigSchemaError, TypeError, ValueError):
+            # Keep the last-resort raw reader tolerant. The regular config
+            # loader reports invalid schemas; state reconstruction should not
+            # turn a transient parse problem into an empty in-memory list.
+            LOG.exception("无法规范化磁盘中的启动台卡片")
         for item in raw["apps"]:
             if not isinstance(item, dict) or not item.get("id"):
                 continue
@@ -710,6 +889,7 @@ class Config:
                 "configPath": self._path,
                 "memoryAppCount": len(self._data.get("apps") or []),
                 "diskAppCount": disk_app_count,
+                "appSignature": app_config_signature(self._data.get("apps")),
             }
 
     def update(self, fn):
@@ -731,6 +911,21 @@ class Config:
                         LOG.warning(
                             "kept %d disk apps while persisting config (memory list was empty)",
                             len(disk_apps))
+                # Every successful write is schema v2, including cards added
+                # by older API paths which still submit only ``command``.
+                # Normalize after the callback so compatibility cards are
+                # wrapped once and monitor cards cannot accidentally acquire a
+                # launch definition from their historical command.
+                normalized = self._normalize(self._data)
+                self._data.clear()
+                self._data.update(normalized)
+                # Callbacks commonly return a shallow copy of the changed app.
+                # Keep their response in sync with the normalized persisted
+                # object without changing non-app result dictionaries.
+                if isinstance(result, dict) and result.get("id"):
+                    saved_app = find_app(self._data, result.get("id"))
+                    if saved_app is not None:
+                        result.update(saved_app)
                 payload = self._payload(self._data)
                 previous_payload = self._payload(previous)
                 # 先保存上一份良好内容，再替换主文件。
@@ -1200,7 +1395,73 @@ def _managed_candidates(app, groups):
     return set(sysops.group_members(pgid))
 
 
-def managed_process_index(apps, groups=None):
+def _open_run_job(app):
+    """Reopen this user's named Job Object for a structured run instance."""
+    instance = app.get("runInstance")
+    if (not isinstance(instance, dict)
+            or instance.get("processState") == "exited"
+            or not instance.get("runId") or not instance.get("jobName")):
+        return None
+    if not isinstance(SELF_UID, str) or not SELF_UID.startswith("S-"):
+        return None
+    try:
+        return windows_runtime.reopen(
+            instance["runId"], job_name=instance.get("jobName"),
+            root_pid=instance.get("rootPid"),
+            root_create_time=instance.get("rootCreateTime"), sid=SELF_UID,
+            anchor_pid=instance.get("anchorPid"),
+            anchor_create_time=instance.get("anchorCreateTime"))
+    except (OSError, ValueError, TypeError) as exc:
+        LOG.debug("无法重连应用 %s 的 Job Object: %s", app.get("id"), exc)
+        return None
+
+
+def observed_process_pid(app, listeners=None, snap=None, cwds=None):
+    """Resolve an observation card's current listener without granting control."""
+    if app.get("controlMode") != "monitor":
+        return None
+    observation = app.get("observation")
+    port = app.get("port")
+    cwd = (observation.get("cwd") if isinstance(observation, dict) else None)
+    if not isinstance(port, int) or port <= 0 or not cwd:
+        return None
+    if listeners is None:
+        listeners = scan_listeners()
+    pids = {pid for pid, listening_port in listeners
+            if listening_port == port}
+    if not pids:
+        return None
+    if snap is None:
+        snap = ps_snapshot(pids, with_uid=True)
+    if cwds is None:
+        cwds = lsof_cwds(pids)
+    expected_pid = observation.get("pid") if isinstance(observation, dict) else None
+    expected_ctime = (observation.get("createTime")
+                       if isinstance(observation, dict) else None)
+    matches = []
+    for pid in sorted(pids):
+        info = snap.get(pid, {})
+        if not is_current_user(info.get("uid")):
+            continue
+        if pid == expected_pid and expected_ctime is not None:
+            current_ctime = info.get("ctime")
+            if (current_ctime is None or current_ctime != expected_ctime):
+                continue
+        actual_cwd = cwds.get(pid)
+        if not actual_cwd:
+            continue
+        try:
+            if os.path.normcase(os.path.realpath(actual_cwd)) == os.path.normcase(
+                    os.path.realpath(cwd)):
+                matches.append(pid)
+        except OSError:
+            continue
+    if expected_pid in matches:
+        return expected_pid
+    return matches[0] if len(matches) == 1 else None
+
+
+def managed_process_index(apps, groups=None, anchor_repairs=None):
     """批量校验应用的受控进程，返回 (appId -> [pid], ps, groups)。
 
     必须同时满足：属于记录的进程组、属于当前用户、argv 中带本次启动的
@@ -1209,23 +1470,57 @@ def managed_process_index(apps, groups=None):
     if groups is None:
         needs_groups = any(
             app.get("runToken")
+            and not ((app.get("runInstance") or {}).get("jobName"))
             and isinstance(app.get("lastPgid") or app.get("lastPid"), int)
             for app in apps)
         groups = pgid_members_map() if needs_groups else {}
     candidates = {}
     all_pids = set()
     for app in apps:
-        pids = _managed_candidates(app, groups)
+        job = _open_run_job(app)
+        if job is not None:
+            try:
+                instance = app.get("runInstance") or {}
+                anchor_pid = getattr(job, "anchor_pid", None)
+                anchor_ctime = getattr(job, "anchor_create_time", None)
+                if (anchor_repairs is not None
+                        and (instance.get("anchorPid") != anchor_pid
+                             or instance.get("anchorCreateTime") != anchor_ctime)):
+                    anchor_repairs.append({
+                        "id": app.get("id"),
+                        "runId": instance.get("runId"),
+                        "jobName": instance.get("jobName"),
+                        "anchorPid": anchor_pid,
+                        "anchorCreateTime": anchor_ctime,
+                    })
+                pids = set(job.members())
+            finally:
+                job.close()
+        elif app.get("controlMode") == "monitor":
+            pids = set()
+        elif ((app.get("runInstance") or {}).get("jobName")):
+            # A structured run is owned only by its named Job Object. If that
+            # boundary cannot be reopened, never infer ownership from PPID or
+            # a command-line token.
+            pids = set()
+        else:
+            pids = _managed_candidates(app, groups)
         candidates[app.get("id")] = pids
         all_pids.update(pids)
     snap = ps_snapshot(all_pids, with_uid=True) if all_pids else {}
     result = {}
     for app in apps:
         token = app.get("runToken")
-        marker = RUN_TOKEN_ARG_PREFIX + token if token else None
         current_user = sorted(
             pid for pid in candidates.get(app.get("id"), set())
             if is_current_user(snap.get(pid, {}).get("uid")))
+        instance = app.get("runInstance")
+        if (isinstance(instance, dict) and instance.get("jobName")):
+            # Membership in a SID protected Job Object is the ownership
+            # boundary. Run tokens remain useful diagnostics but are not proof.
+            result[app.get("id")] = current_user
+            continue
+        marker = RUN_TOKEN_ARG_PREFIX + token if token else None
         controller_found = bool(marker and any(
             marker in snap.get(pid, {}).get("args", "") for pid in current_user))
         # 随机标记在进程组的常驻外层 shell 上；校验后整组均为受控后代。
@@ -1245,7 +1540,7 @@ def legacy_managed_pid(app, listeners=None, snap=None, cwds=None):
     换 PID，但仍必须在配置端口上按当前 UID + 真实 cwd 唯一命中；因此
     Next/Vite 等重建子进程后不会丢失关联，也不会只凭端口误认其他项目。
     """
-    if app.get("runToken"):
+    if app.get("controlMode") == "monitor" or app.get("runToken"):
         return None
     recorded_pid = app.get("lastPid")
     port = app.get("port")
@@ -1304,8 +1599,12 @@ def listener_app_owners(apps, listeners, snap, cwds, groups=None):
     managed, _, _ = managed_process_index(apps, groups)
     candidates = {}
     for app in apps:
-        live = managed.get(app.get("id"), [])
-        if not live:
+        if app.get("controlMode") == "monitor":
+            observed = observed_process_pid(app, listeners, snap, cwds)
+            live = [observed] if observed else []
+        else:
+            live = managed.get(app.get("id"), [])
+        if not live and app.get("controlMode") != "monitor":
             legacy_pid = legacy_managed_pid(app, listeners, snap, cwds)
             live = [legacy_pid] if legacy_pid else []
         for pid in live:
@@ -1317,7 +1616,8 @@ def listener_app_owners(apps, listeners, snap, cwds, groups=None):
     }
 
 
-def build_apps(cfg, listeners, groups=None, attached_repairs=None):
+def build_apps(cfg, listeners, groups=None, attached_repairs=None,
+               anchor_repairs=None, observation_repairs=None):
     """token 校验通过或严格命中旧版身份的进程才算 running。
 
     多张卡片可共享配置端口；只有当前真实监听者不属于本卡片时才返回
@@ -1327,7 +1627,8 @@ def build_apps(cfg, listeners, groups=None, attached_repairs=None):
     for pid, port in listeners:
         port_map.setdefault(port, []).append(pid)
     apps_cfg = cfg.get("apps") or []
-    managed, snap, _ = managed_process_index(apps_cfg, groups)
+    managed, snap, _ = managed_process_index(
+        apps_cfg, groups, anchor_repairs=anchor_repairs)
     listen_by_pid = {}
     for pid, port in listeners:
         listen_by_pid.setdefault(pid, []).append(port)
@@ -1345,13 +1646,20 @@ def build_apps(cfg, listeners, groups=None, attached_repairs=None):
 
     apps = []
     for app in apps_cfg:
+        control_mode = app.get("controlMode") or "managed"
         managed_live = managed.get(app["id"], [])
-        legacy_pid = None if managed_live else legacy_managed_pid(
-            app, listeners, listener_snap, listener_cwds)
-        if (legacy_pid and
-                (verified_owner.get(legacy_pid) or {}).get("id") != app.get("id")):
+        if control_mode == "monitor":
+            observed_pid = observed_process_pid(
+                app, listeners, listener_snap, listener_cwds)
+            live = [observed_pid] if observed_pid else []
             legacy_pid = None
-        live = managed_live or ([legacy_pid] if legacy_pid else [])
+        else:
+            legacy_pid = None if managed_live else legacy_managed_pid(
+                app, listeners, listener_snap, listener_cwds)
+            if (legacy_pid and
+                    (verified_owner.get(legacy_pid) or {}).get("id") != app.get("id")):
+                legacy_pid = None
+            live = managed_live or ([legacy_pid] if legacy_pid else [])
         if (attached_repairs is not None and legacy_pid
                 and app.get("attached") and not app.get("runToken")
                 and legacy_pid != app.get("lastPid")):
@@ -1368,6 +1676,36 @@ def build_apps(cfg, listeners, groups=None, attached_repairs=None):
         lp = app.get("lastPid")
         pid = lp if lp in live else (live[0] if live else None)
         port = app.get("port")
+        observation = app.get("observation")
+        if control_mode == "monitor" and isinstance(observation, dict):
+            observation = dict(observation)
+            if observed_pid:
+                info = listener_snap.get(observed_pid) or {}
+                old_observation = app.get("observation") or {}
+                current_ctime = info.get("ctime")
+                observation.update({
+                    "pid": observed_pid,
+                    "createTime": (current_ctime
+                                    if current_ctime is not None
+                                    else old_observation.get("createTime")),
+                    "sid": info.get("uid") or old_observation.get("sid"),
+                    "cwd": listener_cwds.get(observed_pid)
+                    or old_observation.get("cwd"),
+                    "ports": [port] if isinstance(port, int) else [],
+                    "observedAt": int(time.time()),
+                })
+                # Avoid rewriting config.json on every poll. A later CAS repair
+                # persists only a changed listener identity; the response still
+                # exposes the current observation timestamp immediately.
+                if (observation_repairs is not None
+                        and any(observation.get(key) != old_observation.get(key)
+                                for key in ("pid", "createTime", "sid", "cwd", "ports"))):
+                    observation_repairs.append({
+                        "id": app.get("id"),
+                        "port": port,
+                        "recordedObservation": dict(old_observation),
+                        "observation": dict(observation),
+                    })
         configured_listeners = port_map.get(port, []) if port else []
         listening = bool(port and any(p in live for p in configured_listeners))
         occupied = bool(port and configured_listeners and not listening)
@@ -1404,6 +1742,27 @@ def build_apps(cfg, listeners, groups=None, attached_repairs=None):
         except Exception as exc:
             LOG.warning("检查应用配置失败（%s）：%s", app.get("id"), exc)
             health = {"status": "unknown", "blocking": False, "issues": []}
+        instance = app.get("runInstance")
+        persisted_process_state = (
+            instance.get("processState") if isinstance(instance, dict) else None)
+        if control_mode == "monitor":
+            process_state = "alive" if live else "absent"
+        elif persisted_process_state in ("starting", "stopping", "exited"):
+            process_state = persisted_process_state
+        elif (not live and isinstance(instance, dict)
+              and instance.get("jobName")):
+            # After a console restart there is no exit watcher attached to the
+            # old process handle. An empty/missing named Job Object is still a
+            # reliable signal that this structured run has ended.
+            process_state = "exited"
+        elif live:
+            process_state = "alive"
+        else:
+            process_state = "absent"
+        public_instance = dict(instance) if isinstance(instance, dict) else instance
+        if isinstance(public_instance, dict):
+            public_instance["processState"] = process_state
+
         apps.append({
             "id": app["id"], "name": app["name"], "command": app["command"],
             "cwd": app.get("cwd"), "port": port,
@@ -1414,6 +1773,28 @@ def build_apps(cfg, listeners, groups=None, attached_repairs=None):
                           if pid else None),
             "kind": app.get("kind") or "service",
             "attached": bool(app.get("attached")),
+            "controlMode": control_mode,
+            "processState": process_state,
+            "readiness": (
+                "failed" if process_state == "exited"
+                and app.get("readinessState") == "checking"
+                else app.get("readinessState") or "unknown"
+                if control_mode == "managed" else "unknown"),
+            "readinessState": (
+                "failed" if process_state == "exited"
+                and app.get("readinessState") == "checking"
+                else app.get("readinessState") or "unknown"
+                if control_mode == "managed" else "unknown"),
+            "identityStrength": (
+                "observation" if control_mode == "monitor"
+                else "job" if (app.get("runInstance") or {}).get("jobName")
+                and managed_live else "legacy-tree" if legacy_pid else "job"
+                if managed_live else "legacy-tree" if app.get("runToken")
+                else "observation" if live else "job"),
+            "launchConfigured": bool(app.get("launchConfigured")),
+            "launchSpec": app.get("launchSpec"),
+            "runInstance": public_instance,
+            "observation": observation,
             "lastExit": public_last_exit(app),
             "health": health,
             "ports": actual_ports,
@@ -1465,6 +1846,68 @@ def repair_attached_app_identities(cfg, repairs):
         return False
 
 
+def repair_run_instance_anchors(cfg, repairs):
+    """Persist a replacement Job Object keeper after PID reuse or keeper loss."""
+    if not repairs:
+        return False
+
+    def op(data):
+        changed = False
+        for repair in repairs:
+            target = find_app(data, repair.get("id"))
+            instance = target.get("runInstance") if target else None
+            if (not isinstance(instance, dict)
+                    or instance.get("runId") != repair.get("runId")
+                    or instance.get("jobName") != repair.get("jobName")
+                    or instance.get("processState") == "exited"):
+                continue
+            if (instance.get("anchorPid") != repair.get("anchorPid")
+                    or instance.get("anchorCreateTime") !=
+                    repair.get("anchorCreateTime")):
+                instance["anchorPid"] = repair.get("anchorPid")
+                instance["anchorCreateTime"] = repair.get("anchorCreateTime")
+                changed = True
+        return changed
+
+    try:
+        return bool(cfg.update(op))
+    except OSError as exc:
+        LOG.warning("无法持久化 Job Object 保活进程身份: %s", exc)
+        return False
+
+
+def repair_observation_identities(cfg, repairs):
+    """Persist a monitor card's replacement listener identity with CAS."""
+    if not repairs:
+        return False
+
+    def op(data):
+        changed = False
+        for repair in repairs:
+            target = find_app(data, repair.get("id"))
+            if (not target or target.get("controlMode") != "monitor"
+                    or target.get("port") != repair.get("port")
+                    or target.get("observation") !=
+                    repair.get("recordedObservation")):
+                continue
+            observation = repair.get("observation")
+            if not isinstance(observation, dict):
+                continue
+            target["observation"] = dict(observation)
+            # Keep legacy fields coherent for migration and diagnostics. They
+            # never grant control to a monitor card.
+            target["lastPid"] = observation.get("pid")
+            target["lastCreateTime"] = observation.get("createTime")
+            changed = True
+        return changed
+
+    try:
+        return bool(cfg.update(op))
+    except OSError as exc:
+        LOG.warning("无法持久化监控卡片的最新进程身份: %s", exc)
+        return False
+
+
 def build_state(cfg, console_port, config_health=None):
     degraded_reasons = []
     # 一次 pgid 快照供 build_services / build_apps 共享，避免每轮两次全量 ps。
@@ -1487,7 +1930,10 @@ def build_state(cfg, console_port, config_health=None):
         degraded_reasons.append({"component": "watched"})
     try:
         attached_repairs = []
-        apps = build_apps(cfg, listeners, groups, attached_repairs)
+        anchor_repairs = []
+        observation_repairs = []
+        apps = build_apps(cfg, listeners, groups, attached_repairs,
+                          anchor_repairs, observation_repairs)
     except Exception:
         LOG.exception("构建启动台状态失败")
         apps = []
@@ -1522,6 +1968,10 @@ def build_state(cfg, console_port, config_health=None):
     # 仅在有可修复身份时附带内部字段；_refresh_state 在序列化前取走它。
     if "attached_repairs" in locals() and attached_repairs:
         state["_attachedRepairs"] = attached_repairs
+    if "anchor_repairs" in locals() and anchor_repairs:
+        state["_anchorRepairs"] = anchor_repairs
+    if "observation_repairs" in locals() and observation_repairs:
+        state["_observationRepairs"] = observation_repairs
     # Keep the expensive process scan cached, while rebuilding cards from
     # the current on-disk configuration for each response.
     state["_listeners"] = set(listeners)
@@ -1589,9 +2039,13 @@ def _refresh_state(cfg, console_port, generation, raise_errors=False):
         config_health = cfg.health_info()
         state = build_state(cfg_snapshot, console_port, config_health)
         attached_repairs = state.pop("_attachedRepairs", [])
+        anchor_repairs = state.pop("_anchorRepairs", [])
+        observation_repairs = state.pop("_observationRepairs", [])
         listeners = state.pop("_listeners", set())
         groups = state.pop("_groups", None)
         repair_attached_app_identities(cfg, attached_repairs)
+        repair_run_instance_anchors(cfg, anchor_repairs)
+        repair_observation_identities(cfg, observation_repairs)
     except Exception:
         _finish_state_refresh(None, generation)
         if raise_errors:
@@ -1655,7 +2109,14 @@ def _overlay_launchpad_from_disk(cfg, state, listeners=None, groups=None):
         return state
     overlaid = dict(state)
     try:
-        overlaid["apps"] = build_apps(snapshot, listeners or set(), groups)
+        anchor_repairs = []
+        observation_repairs = []
+        overlaid["apps"] = build_apps(
+            snapshot, listeners or set(), groups,
+            anchor_repairs=anchor_repairs,
+            observation_repairs=observation_repairs)
+        repair_run_instance_anchors(cfg, anchor_repairs)
+        repair_observation_identities(cfg, observation_repairs)
     except Exception:
         LOG.exception("按磁盘配置重建启动台失败")
         overlaid["apps"] = list(snapshot.get("apps") or [])
@@ -1830,6 +2291,8 @@ def stop_pid_tree(pid, sig=signal.SIGTERM):
 
 
 def app_running(app, listeners=None):
+    if app.get("controlMode") == "monitor":
+        return False
     return bool(managed_pids(app) or legacy_managed_pid(app, listeners))
 
 
@@ -1889,17 +2352,38 @@ def start_app(app):
         logf = os.fdopen(log_fd, "ab", buffering=0)
     except OSError as e:
         return False, "无法打开日志文件: %s" % e, None, None, None
-    token = secrets.token_urlsafe(24)
-    env = build_launch_env(token)
-    marker = RUN_TOKEN_ARG_PREFIX + token
-    # 外层 shell（或 Windows cmd）在 argv 中持有随机标记并等待内层；
-    # 内层等待用户命令留下的后台作业。进程组既可验证，也不会因启动
-    # 脚本过早退出而失去锚点（Windows 用进程树回溯保持同样语义）。
     try:
         header = "\n===== 启动于 %s =====\n" % time.strftime("%Y-%m-%d %H:%M:%S")
         logf.write(header.encode("utf-8"))
-        proc = sysops.spawn_managed(
-            app["command"], cwd, env, marker, logf)
+    except OSError:
+        pass
+    token = secrets.token_urlsafe(24)
+    spec = app.get("launchSpec")
+    try:
+        spec = normalize_launch_spec(
+            spec, command=app.get("command", ""), cwd=cwd,
+            port=app.get("port"))
+        env = build_launch_env(token)
+        for key, value in spec.get("env", {}).items():
+            # Windows environment names are case insensitive; remove an older
+            # spelling before applying the user's explicit overlay.
+            for previous in list(env):
+                if previous.casefold() == key.casefold():
+                    del env[previous]
+                    break
+            env[key] = value
+        if spec["mode"] == "legacy-shell":
+            proc = windows_runtime.launch(
+                command=spec.get("legacyCommand", app.get("command", "")),
+                args=(), cwd=cwd, env=env, run_id=token,
+                stdout=logf, stderr=subprocess.STDOUT,
+                mode="legacy-shell", sid=SELF_UID)
+        else:
+            proc = windows_runtime.launch(
+                executable=spec["executable"], args=spec["args"],
+                cwd=spec.get("cwd") or cwd, env=env, run_id=token,
+                stdout=logf, stderr=subprocess.STDOUT,
+                mode=spec["mode"], sid=SELF_UID)
     except Exception as e:
         logf.close()
         return False, "启动失败: %s" % e, None, None, None
@@ -1920,35 +2404,62 @@ def startup_failure_message(app_id, code):
 
 
 def watch_app_exit(cfg, app_id, proc, token, started_at=None):
-    """后台线程等子进程退出：若期间未被手动 stop/重启（lastPid 仍指向它），
-    记录 lastExit（退出码、结束时间和运行耗时）。保留 lastPid 作为进程组锚点——
-    脚本可能把服务放后台后退出，后续的运行判定/停止都靠 pgid 找到存活成员。"""
+    """Wait for the root and every Job Object member, then persist its exit."""
     started_at = time.time() if started_at is None else started_at
 
     def _wait():
-        code = proc.wait()
-        ended_at = time.time()
-        duration = round(max(0.0, ended_at - started_at), 3)
+        try:
+            code = proc.wait()
+            # A service may launch a background child and then exit. Wait until
+            # the Job Object is empty, so no descendant is left unmanaged.
+            wait_for_empty = getattr(proc, "wait_for_empty", None)
+            if callable(wait_for_empty):
+                wait_for_empty()
+            else:
+                members_method = getattr(proc, "members", None)
+                while callable(members_method):
+                    try:
+                        members = members_method()
+                    except (AttributeError, OSError):
+                        break
+                    # RuntimeManager returns concrete PID collections. Treat
+                    # opaque test doubles and older process wrappers as no
+                    # descendants, rather than spinning forever on Mock truth.
+                    if not isinstance(members, (list, tuple, set, frozenset)) or not members:
+                        break
+                    time.sleep(0.05)
+            ended_at = time.time()
+            duration = round(max(0.0, ended_at - started_at), 3)
 
-        with MANUAL_STOP_LOCK:
-            manually_stopped = (app_id, token) in MANUAL_STOP_TOKENS
+            with MANUAL_STOP_LOCK:
+                manually_stopped = (app_id, token) in MANUAL_STOP_TOKENS
 
-        def op(c):
-            target = find_app(c, app_id)
-            if (not manually_stopped and target
-                    and target.get("lastPid") == proc.pid
-                    and target.get("runToken") == token):
-                last_exit = {
-                    "code": code,
-                    "at": int(ended_at),
-                    "startedAt": int(started_at * 1000),
-                    "durationSec": duration,
-                }
-                if (target.get("kind") or "service") == "task":
-                    last_exit["status"] = classify_task_exit(code)
-                target["lastExit"] = last_exit
-        cfg.update(op)
-        rotate_log_file(os.path.join(LOGS_DIR, "%s.log" % app_id))
+            def op(c):
+                target = find_app(c, app_id)
+                instance = target.get("runInstance") if target else None
+                if (not manually_stopped and target
+                        and target.get("lastPid") == proc.pid
+                        and target.get("runToken") == token):
+                    last_exit = {
+                        "code": code,
+                        "at": int(ended_at),
+                        "startedAt": int(started_at * 1000),
+                        "durationSec": duration,
+                    }
+                    if (target.get("kind") or "service") == "task":
+                        last_exit["status"] = classify_task_exit(code)
+                    target["lastExit"] = last_exit
+                    if isinstance(instance, dict) and instance.get("runId") == token:
+                        instance["processState"] = "exited"
+                        instance["exitResult"] = last_exit
+                    if target.get("readinessState") == "checking":
+                        target["readinessState"] = "failed"
+            cfg.update(op)
+            rotate_log_file(os.path.join(LOGS_DIR, "%s.log" % app_id))
+        finally:
+            close = getattr(proc, "close", None)
+            if close:
+                close()
     thread = threading.Thread(target=_wait, daemon=True)
     thread.start()
     return thread
@@ -1958,14 +2469,43 @@ def persist_started_app(cfg, app_id, proc, pgid, token):
     """保存新的受控身份并启动退出监视线程。"""
     started_at = time.time()
 
+    def scalar(value, types):
+        return value if isinstance(value, types) and not isinstance(value, bool) else None
+
     def op(c):
         target = find_app(c, app_id)
         if target:
-            target["lastPid"] = proc.pid
-            target["lastPgid"] = pgid
+            pid = scalar(getattr(proc, "pid", None), (int,))
+            target["lastPid"] = pid
+            target["lastPgid"] = scalar(pgid, (int,))
             target["runToken"] = token
             target["attached"] = False
-            target["lastCreateTime"] = None
+            target["controlMode"] = "managed"
+            target["observation"] = None
+            creation_time = scalar(getattr(proc, "creation_time", None),
+                                   (int, float))
+            target["lastCreateTime"] = creation_time
+            job_name = scalar(getattr(proc, "job_name", None), (str,))
+            run_id = scalar(getattr(proc, "run_id", token), (str,)) or token
+            anchor_pid = scalar(getattr(proc, "anchor_pid", None), (int,))
+            anchor_create_time = scalar(
+                getattr(proc, "anchor_create_time", None), (int, float))
+            target["runInstance"] = ({
+                "runId": run_id,
+                "jobName": job_name,
+                "rootPid": pid,
+                "rootCreateTime": creation_time,
+                "anchorPid": anchor_pid,
+                "anchorCreateTime": anchor_create_time,
+                "processState": "starting",
+                "exitResult": None,
+            } if job_name and pid else None)
+            target["launchConfigured"] = is_launch_configured(
+                target.get("launchSpec"))
+            target["readinessState"] = (
+                "checking" if (target.get("kind") or "service") == "service"
+                and (target.get("launchSpec") or {}).get("readiness", {}).get("type")
+                in ("tcp", "http") else "unknown")
             # 批处理任务运行时先保留上一次结果；自然退出或手动停止后再原子覆盖。
             if (target.get("kind") or "service") != "task":
                 target["lastExit"] = None
@@ -1975,6 +2515,84 @@ def persist_started_app(cfg, app_id, proc, pgid, token):
     if saved:
         watch_app_exit(cfg, app_id, proc, token, started_at)
     return saved
+
+
+def mark_app_alive(cfg, app_id, run_id):
+    def op(data):
+        target = find_app(data, app_id)
+        instance = target.get("runInstance") if target else None
+        if (isinstance(instance, dict) and instance.get("runId") == run_id
+                and instance.get("processState") == "starting"):
+            instance["processState"] = "alive"
+    cfg.update(op)
+
+
+def _probe_readiness(readiness):
+    probe_type = readiness.get("type")
+    if probe_type == "none":
+        return None
+    host = readiness.get("host") or "127.0.0.1"
+    port = readiness.get("port")
+    if not isinstance(port, int):
+        return False
+    if probe_type == "tcp":
+        try:
+            with socket.create_connection((host, port), timeout=0.5):
+                return True
+        except OSError:
+            return False
+    if probe_type == "http":
+        url = readiness.get("url") or "/"
+        if not re.match(r"^https?://", url, re.I):
+            url = "http://%s:%d/%s" % (host, port, url.lstrip("/"))
+        try:
+            request = urllib.request.Request(url, method="GET")
+            with urllib.request.urlopen(request, timeout=1.0) as response:
+                return 200 <= int(response.status) < 400
+        except Exception:
+            return False
+    return False
+
+
+def watch_app_readiness(cfg, app_id, run_id, app):
+    """Update readiness from a TCP/HTTP probe without inferring ownership."""
+    if (app.get("kind") or "service") != "service":
+        return None
+    spec = app.get("launchSpec") or {}
+    readiness = spec.get("readiness") or default_readiness(app.get("port"))
+    if readiness.get("type") == "none":
+        return None
+    deadline = time.monotonic() + float(readiness.get("timeoutSec", 20))
+
+    def _probe():
+        state = "timeout"
+        while time.monotonic() < deadline:
+            current = find_app(cfg.snapshot(), app_id)
+            instance = current.get("runInstance") if current else None
+            if (not current or not isinstance(instance, dict)
+                    or instance.get("runId") != run_id
+                    or instance.get("processState") == "exited"):
+                state = "failed"
+                break
+            if _probe_readiness(readiness):
+                state = "ready"
+                break
+            time.sleep(0.25)
+
+        def op(data):
+            target = find_app(data, app_id)
+            instance = target.get("runInstance") if target else None
+            if isinstance(instance, dict) and instance.get("runId") == run_id:
+                # A stop/exit that won the race keeps its terminal process state.
+                if target.get("readinessState") == "checking":
+                    target["readinessState"] = state
+
+        cfg.update(op)
+
+    thread = threading.Thread(target=_probe, daemon=True,
+                              name="app-readiness-%s" % app_id)
+    thread.start()
+    return thread
 
 
 def start_app_transaction(cfg, app_id, require_autostart=False):
@@ -1992,6 +2610,13 @@ def start_app_transaction(cfg, app_id, require_autostart=False):
         current = find_app(cfg.snapshot(), app_id)
         if current is None:
             return {"ok": False, "status": 404, "error": "应用不存在"}
+        if (current.get("controlMode") == "monitor"
+                or ("launchSpec" in current
+                    and (not current.get("launchConfigured")
+                         or not is_launch_configured(current.get("launchSpec"))))):
+            return {"ok": False, "status": 409,
+                    "error": "请先确认启动配置，再由总控台托管此服务",
+                    "launchSpecRequired": True}
         if require_autostart and (
                 (current.get("kind") or "service") != "service"
                 or not current.get("autostart")):
@@ -2025,9 +2650,17 @@ def start_app_transaction(cfg, app_id, require_autostart=False):
         if not ok:
             return {"ok": False, "status": 500, "error": error}
         if not persist_started_app(cfg, app_id, proc, pgid, token):
-            stop_pid_tree(pgid)
+            try:
+                proc.terminate(force=True)
+            except Exception:
+                pass
+            close = getattr(proc, "close", None)
+            if close:
+                close()
             return {"ok": False, "status": 409,
                     "error": "应用已被删除，已取消启动"}
+        mark_app_alive(cfg, app_id, token)
+        watch_app_readiness(cfg, app_id, token, current)
         # 一次性任务的正常形态就是快速退出，不能把成功任务误判成启动失败。
         if (current.get("kind") or "service") == "task":
             return {"ok": True, "status": 200, "pid": proc.pid}
@@ -2036,10 +2669,16 @@ def start_app_transaction(cfg, app_id, require_autostart=False):
         while code is None and time.monotonic() < deadline:
             time.sleep(0.025)
             code = proc.poll()
-        if code is not None:
+        members = getattr(proc, "members", None)
+        live_members = members() if callable(members) else []
+        if (code is not None
+                and isinstance(live_members, (list, tuple, set, frozenset))
+                and not live_members):
             return {"ok": False, "status": 422,
                     "error": startup_failure_message(app_id, code)}
-        return {"ok": True, "status": 200, "pid": proc.pid}
+        return {"ok": True, "status": 200, "pid": proc.pid,
+                "readiness": "checking" if (current.get("launchSpec") or {}).get(
+                    "readiness", {}).get("type") in ("tcp", "http") else "unknown"}
     finally:
         lock.release()
 
@@ -2057,6 +2696,12 @@ def clear_app_runtime(cfg, app_id, expected_token=None, last_exit=None):
         target["runToken"] = None
         target["attached"] = False
         target["lastCreateTime"] = None
+        instance = target.get("runInstance")
+        if isinstance(instance, dict):
+            instance["processState"] = "exited"
+            if last_exit is not None:
+                instance["exitResult"] = last_exit
+        target["readinessState"] = "unknown"
         if last_exit is not None:
             target["lastExit"] = last_exit
         return True
@@ -2076,13 +2721,161 @@ def pick_path(what):
     return sysops.pick_path(what)
 
 
-def command_for_script(path):
-    """按脚本类型生成可直接保存的命令，并安全引用任意文件名。"""
+def _project_python(cwd):
+    """Return the first existing project-local Windows Python interpreter."""
+    if not isinstance(cwd, str) or not cwd:
+        return None
+    for directory in (".venv", "venv", "env"):
+        candidate = os.path.abspath(os.path.join(
+            cwd, directory, "Scripts", "python.exe"))
+        if _windows_command_file(candidate):
+            return candidate
+    return None
+
+
+def _runtime_path():
+    """PATH used by project candidates, including paths added for pythonw."""
+    try:
+        return build_launch_env("project-detect").get("PATH")
+    except Exception:
+        return os.environ.get("PATH")
+
+
+def _resolve_runtime(executable, *, cwd=None, python_project=False):
+    """Resolve a generated candidate executable to an absolute file path."""
+    name = str(executable or "").strip()
+    if not name:
+        return None
+    base = os.path.basename(name).lower()
+    if python_project and re.fullmatch(
+            r"(?:py|python|pythonw)(?:\d+(?:\.\d+)*)?(?:\.exe)?", base):
+        project_python = _project_python(cwd)
+        if project_python:
+            return project_python
+    if _looks_like_command_path(name) or os.path.isabs(name):
+        candidate = _resolve_command_path(name, cwd or os.getcwd())
+        return (os.path.abspath(candidate)
+                if _windows_command_file(candidate) else None)
+    found = shutil.which(name, path=_runtime_path())
+    if found and _windows_command_file(found):
+        return os.path.abspath(found)
+    return None
+
+
+def _powershell_executable():
+    """Resolve Windows PowerShell or pwsh without relying on a shell profile."""
+    for name in ("powershell.exe", "pwsh.exe", "powershell", "pwsh"):
+        found = _resolve_runtime(name)
+        if found:
+            return found
+    system_root = os.environ.get("SystemRoot") or r"C:\Windows"
+    candidate = os.path.join(
+        system_root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
+    return os.path.abspath(candidate) if _windows_command_file(candidate) else None
+
+
+def _bash_runtime():
+    """Resolve Bash or WSL for explicit .sh project scripts."""
+    for name in ("bash.exe", "bash"):
+        found = _resolve_runtime(name)
+        if found:
+            return found, "bash"
+    for name in ("wsl.exe", "wsl"):
+        found = _resolve_runtime(name)
+        if found:
+            return found, "wsl"
+    return None, None
+
+
+def _windows_command_file(path):
+    """Check whether a file has a Windows-executable format or extension."""
+    if not isinstance(path, str) or not os.path.isfile(path):
+        return False
+    suffix = os.path.splitext(path)[1].casefold()
+    if suffix in (".bat", ".cmd"):
+        return bool(_resolve_runtime("cmd.exe"))
+    if suffix == ".ps1":
+        return bool(_powershell_executable())
+    if suffix != ".exe":
+        return False
+    try:
+        with open(path, "rb") as handle:
+            header = handle.read(64)
+            if len(header) < 64 or header[:2] != b"MZ":
+                return False
+            pe_offset = int.from_bytes(header[0x3C:0x40], "little")
+            if pe_offset < 64 or pe_offset > 16 * 1024 * 1024:
+                return False
+            handle.seek(pe_offset)
+            return handle.read(4) == b"PE\0\0"
+    except (OSError, ValueError):
+        return False
+
+
+def _launch_spec_for_script(path, cwd=None, port=None):
+    """Build a structured LaunchSpec for an explicitly selected script.
+
+    The working directory is used to find a project virtual environment; it
+    defaults to the script's parent so selecting a script works on its own.
+    """
+    normalized = os.path.abspath(os.path.expanduser(str(path)))
+    working_dir = os.path.abspath(os.path.expanduser(
+        cwd or os.path.dirname(normalized)))
+    suffix = os.path.splitext(normalized)[1].lower()
+    executable = None
+    mode = "exec"
+    args = []
+    if suffix == ".py":
+        executable = _project_python(working_dir)
+        if not executable:
+            executable = (_resolve_runtime("python.exe") or
+                          _resolve_runtime("python"))
+        args = [normalized]
+    elif suffix in (".bat", ".cmd"):
+        executable = normalized if _windows_command_file(normalized) else None
+        mode = "cmd"
+    elif suffix == ".ps1":
+        executable = _powershell_executable()
+        args = ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", normalized]
+        mode = "powershell"
+    elif suffix in (".sh", ".bash"):
+        executable, shell = _bash_runtime()
+        if executable and shell == "wsl":
+            args = ["bash", "--", normalized]
+        elif executable:
+            args = ["--", normalized]
+    else:
+        executable = normalized if os.path.isfile(normalized) else None
+
+    if not executable:
+        reason = {
+            ".py": "找不到 Python 运行时；请安装 Python，或在项目中创建 .venv/venv/env。",
+            ".ps1": "找不到 Windows PowerShell 或 pwsh。",
+            ".sh": "找不到 Bash 或 WSL，无法运行此 Shell 脚本。",
+            ".bash": "找不到 Bash 或 WSL，无法运行此 Shell 脚本。",
+        }.get(suffix, "找不到可运行此脚本的程序。")
+        return None, reason
+    spec = {
+        "mode": mode, "executable": executable, "args": args,
+        "cwd": working_dir, "env": {},
+        "readiness": default_readiness(port),
+    }
+    try:
+        return normalize_launch_spec(spec, cwd=working_dir, port=port), None
+    except LaunchSpecError as exc:
+        return None, str(exc)
+
+
+def command_for_script(path, cwd=None):
+    """Return display text for a selected script using its project runtime."""
+    spec, _reason = _launch_spec_for_script(path, cwd)
+    if spec:
+        return command_from_launch_spec(spec)
     normalized = os.path.abspath(os.path.expanduser(str(path)))
     suffix = os.path.splitext(normalized)[1].lower()
     quoted = _quote_win(normalized)
     if suffix == ".py":
-        return "%s -- %s" % (_quote_win(sys.executable), quoted)
+        return "python -- %s" % quoted
     if suffix == ".ps1":
         return "powershell -NoProfile -ExecutionPolicy Bypass -File %s" % quoted
     if suffix in (".bat", ".cmd"):
@@ -2151,6 +2944,59 @@ def _simple_command_tokens(command):
     return _simple_windows_command_tokens(command)
 
 
+def _split_windows_command_line(command):
+    """Parse a Windows command line into argv without invoking a shell.
+
+    This follows the Microsoft C runtime backslash/quote rules used by
+    ``CreateProcessW``. Characters such as ``&``, ``%``, ``^`` and ``|`` stay
+    ordinary argument data here; only an explicitly selected batch file is
+    later passed through CMD's dedicated quoting path.
+    """
+    if not isinstance(command, str) or not command.strip():
+        raise LaunchSpecError("请填写启动命令")
+    if "\x00" in command or len(command) > 32760:
+        raise LaunchSpecError("启动命令包含无效字符或超出 Windows 长度限制")
+
+    argv = []
+    length = len(command)
+    index = 0
+    while index < length:
+        while index < length and command[index].isspace():
+            index += 1
+        if index >= length:
+            break
+        token = []
+        quoted = False
+        while index < length:
+            if command[index].isspace() and not quoted:
+                break
+            slash_count = 0
+            while index < length and command[index] == "\\":
+                slash_count += 1
+                index += 1
+            if index < length and command[index] == '"':
+                token.extend("\\" * (slash_count // 2))
+                if slash_count % 2:
+                    token.append('"')
+                    index += 1
+                else:
+                    quoted = not quoted
+                    index += 1
+            else:
+                token.extend("\\" * slash_count)
+                if index < length and not (command[index].isspace() and not quoted):
+                    token.append(command[index])
+                    index += 1
+        if quoted:
+            raise LaunchSpecError("启动命令中的双引号没有闭合")
+        argv.append("".join(token))
+        while index < length and command[index].isspace():
+            index += 1
+    if not argv or not argv[0]:
+        raise LaunchSpecError("启动命令必须以可执行程序或脚本开头")
+    return argv
+
+
 def normalize_attached_python_command(command, cwd):
     """Prefer a project virtualenv over Windows' reported base Python.
 
@@ -2160,6 +3006,11 @@ def normalize_attached_python_command(command, cwd):
     in the base interpreter.
     """
     if not isinstance(cwd, str) or not cwd or not os.path.isdir(cwd):
+        return command
+    # The small static parser below is not a full Windows command-line parser.
+    # In particular, it cannot preserve quotes escaped inside a -c argument.
+    # Leave those commands untouched instead of rebuilding them incorrectly.
+    if re.search(r'\\+"', command):
         return command
     tokens = _simple_command_tokens(command)
     if not tokens:
@@ -2179,6 +3030,15 @@ def normalize_attached_python_command(command, cwd):
     executable_base = os.path.basename(executable).lower()
     executable_name = ("pythonw.exe" if executable_base.startswith("pythonw")
                        else "python.exe")
+    # The Windows ``py`` launcher consumes a version selector before starting
+    # Python. The venv executable does not understand that launcher selector,
+    # so remove it when translating e.g. ``py -3 -m ...`` to the project venv.
+    if executable_base in ("py", "py.exe") and (
+            executable_index + 1 < len(tokens)):
+        selector = tokens[executable_index + 1]
+        if re.fullmatch(r"-\d+(?:\.\d+)*(?:-\d+)?|-V:\S+",
+                        selector, re.IGNORECASE):
+            tokens.pop(executable_index + 1)
     for directory in (".venv", "venv", "env"):
         candidate = os.path.join(cwd, directory, "Scripts", executable_name)
         if not os.path.isfile(candidate):
@@ -2191,6 +3051,94 @@ def normalize_attached_python_command(command, cwd):
         tokens[executable_index] = candidate
         return subprocess.list2cmdline(tokens)
     return command
+
+
+def _command_python_executable(command):
+    """Return ``(tokens, executable_index, executable)`` for Python commands.
+
+    Process command lines are not always quoted consistently, so this helper
+    deliberately reuses the conservative token parser used by health checks.
+    ``None`` means the command is too complex or does not start with Python.
+    """
+    tokens = _simple_command_tokens(command)
+    if not tokens:
+        return None
+    index = 0
+    while (index < len(tokens)
+           and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", tokens[index])):
+        index += 1
+    if index >= len(tokens):
+        return None
+    executable = tokens[index]
+    if not re.fullmatch(
+            r"(?:py|python|pythonw)(?:\d+(?:\.\d+)*)?(?:\.exe)?",
+            os.path.basename(executable), re.IGNORECASE):
+        return None
+    return tokens, index, executable
+
+
+def _is_uv_python_path(value):
+    """Whether an executable came from uv's managed Python cache."""
+    if not isinstance(value, str):
+        return False
+    normalized = os.path.normcase(os.path.expanduser(value)).replace("\\", "/")
+    return "/uv/python/" in normalized or "/.cache/uv/python/" in normalized
+
+
+def repair_legacy_app_commands(cfg):
+    """Persist safe virtualenv replacements for old claimed service cards.
+
+    Older versions saved the interpreter path reported by the running process.
+    That path can be uv's shared Python cache, whose environment does not have
+    the project's packages. A card created through port claiming is marked
+    ``attached`` until the first controlled start; after a failed old start
+    that marker is cleared, so the uv-cache path is also treated as evidence of
+    the legacy claim flow. Only a detected project virtualenv is substituted,
+    and command arguments are preserved byte-for-byte semantically.
+    """
+    try:
+        snapshot = cfg.snapshot()
+    except Exception:
+        return False
+    repairs = []
+    for app in snapshot.get("apps") or []:
+        if not isinstance(app, dict) or not app.get("id"):
+            continue
+        if app.get("controlMode") == "monitor":
+            continue
+        parsed = _command_python_executable(app.get("command"))
+        if not parsed:
+            continue
+        _, _, executable = parsed
+        if not app.get("attached") and not _is_uv_python_path(executable):
+            continue
+        normalized = normalize_attached_python_command(
+            app.get("command"), app.get("cwd"))
+        if normalized != app.get("command"):
+            repairs.append((app["id"], app.get("command"), normalized))
+    if not repairs:
+        return False
+
+    def op(data):
+        changed = False
+        for app_id, old_command, new_command in repairs:
+            target = find_app(data, app_id)
+            if target and target.get("command") == old_command:
+                target["command"] = new_command
+                # The compatibility command is derived from LaunchSpec, so
+                # update both fields atomically when migrating a legacy card.
+                spec = target.get("launchSpec")
+                if (isinstance(spec, dict)
+                        and spec.get("mode") == "legacy-shell"):
+                    spec["legacyCommand"] = new_command
+                changed = True
+        return changed
+
+    try:
+        return bool(cfg.update(op))
+    except OSError as exc:
+        LOG.warning("无法修复旧认领卡片的启动解释器: %s", exc)
+        return False
 
 
 def _resolve_command_path(value, cwd):
@@ -2275,8 +3223,122 @@ def _script_target(tokens, cwd):
     return None, False, False
 
 
+def inspect_launch_spec(spec, app=None):
+    """Read-only validation of the structured launch definition."""
+    app = app or {}
+    issues = []
+
+    def add(kind, title, detail, fix, action="edit-command"):
+        issues.append({
+            "kind": kind, "severity": "error", "title": title,
+            "detail": detail, "fix": fix, "action": action,
+        })
+
+    cwd = spec.get("cwd") or app.get("cwd") or os.path.expanduser("~")
+    cwd = os.path.abspath(os.path.expanduser(cwd))
+    if not os.path.isdir(cwd):
+        add("cwd-missing", "工作目录不可用",
+            "找不到配置的工作目录：%s" % cwd,
+            "编辑这个项目，重新选择工作区文件夹。", "pick-cwd")
+
+    mode = spec.get("mode")
+    executable = spec.get("executable")
+    if mode not in ("exec", "cmd", "powershell") or not isinstance(executable, str):
+        add("launch-spec-invalid", "启动配置无效",
+            "结构化启动配置缺少有效的执行模式或程序路径。",
+            "重新选择项目启动候选或脚本。")
+        return {"status": "error", "blocking": True, "issues": issues}
+
+    executable = os.path.abspath(os.path.expanduser(executable))
+    suffix = os.path.splitext(executable)[1].casefold()
+    if mode == "cmd":
+        if suffix not in (".bat", ".cmd"):
+            add("launch-mode-mismatch", "CMD 模式需要批处理文件",
+                "CMD 启动配置必须直接指定 .bat 或 .cmd 文件：%s" % executable,
+                "选择对应的批处理脚本，或改用直接执行模式。")
+        elif not os.path.isfile(executable):
+            add("script-missing", "脚本不可用",
+                "找不到批处理脚本：%s" % executable,
+                "重新选择存在的 .bat 或 .cmd 文件。", "pick-script")
+        elif not _windows_command_file(executable):
+            add("runtime-missing", "找不到 cmd.exe",
+                "Windows 命令解释器不可用，无法运行批处理脚本。",
+                "确认 Windows 系统目录可访问。")
+        for argument in spec.get("args") or []:
+            if any(char in argument for char in ('"', "%", "\r", "\n")):
+                add("cmd-argument-unsafe", "批处理参数无法安全引用",
+                    "CMD 无法无损表示包含百分号、双引号或换行的参数。",
+                    "把参数移入脚本配置，或改用可直接执行的运行时。")
+                break
+    elif mode == "powershell":
+        if not _windows_command_file(executable):
+            add("runtime-missing", "找不到 PowerShell",
+                "PowerShell 执行程序不存在或不是有效的 Windows 程序：%s" % executable,
+                "确认 Windows PowerShell 或 pwsh 已安装。")
+    else:
+        if suffix in (".bat", ".cmd"):
+            add("launch-mode-mismatch", "批处理文件需要 CMD 模式",
+                "直接执行模式不能运行批处理文件：%s" % executable,
+                "重新选择批处理脚本以生成 CMD 启动配置。")
+        elif suffix == ".ps1":
+            add("launch-mode-mismatch", "PowerShell 脚本需要 PowerShell 模式",
+                "直接执行模式不能运行 PowerShell 脚本：%s" % executable,
+                "重新选择 .ps1 脚本以生成 PowerShell 启动配置。")
+        elif not _windows_command_file(executable):
+            add("runtime-missing", "找不到启动程序",
+                "Windows 执行程序不存在或格式无效：%s" % executable,
+                "重新选择可用运行时或项目脚本。")
+
+    args = spec.get("args") or []
+    script_candidates = []
+    if mode == "powershell":
+        for index, arg in enumerate(args[:-1]):
+            if arg.casefold() in ("-file", "/file"):
+                script_candidates.append(args[index + 1])
+                break
+    elif mode == "exec":
+        exe_base = os.path.basename(executable).casefold()
+        if re.fullmatch(r"(?:python|pythonw|py)(?:\d+(?:\.\d+)*)?(?:\.exe)?", exe_base):
+            if "-c" in args or "-m" in args:
+                pass
+            else:
+                script_args = list(args)
+                if script_args and script_args[0] == "--":
+                    script_args = script_args[1:]
+                script_candidates.extend(
+                    arg for arg in script_args
+                    if not arg.startswith("-") and
+                    os.path.splitext(arg)[1].casefold() in SCRIPT_SUFFIXES)
+        else:
+            script_candidates.extend(
+                arg for arg in args
+                if not arg.startswith("-") and os.path.splitext(arg)[1].casefold()
+                in SCRIPT_SUFFIXES.union({".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx"}))
+
+    for raw_script in script_candidates:
+        script_path = (raw_script if os.path.isabs(raw_script)
+                       else os.path.join(cwd, raw_script))
+        script_path = os.path.abspath(script_path)
+        if not os.path.isfile(script_path):
+            add("script-missing", "脚本不可用",
+                "找不到启动脚本：%s" % script_path,
+                "重新选择存在的项目脚本或修改启动参数。", "pick-script")
+        elif not os.access(script_path, os.R_OK):
+            add("path-unreadable", "脚本不可读取",
+                "当前用户没有读取权限：%s" % script_path,
+                "检查脚本权限，或重新选择一个可读取的脚本。", "pick-script")
+        break
+
+    return {"status": "error" if issues else "ok",
+            "blocking": bool(issues), "issues": issues}
+
+
 def inspect_app_health(app):
     """静态检查配置是否可运行；只读文件系统，绝不执行或展开用户命令。"""
+    launch_spec = app.get("launchSpec")
+    if (isinstance(launch_spec, dict)
+            and launch_spec.get("mode") != "legacy-shell"):
+        return inspect_launch_spec(launch_spec, app)
     issues = []
 
     def add(kind, title, detail, fix, action):
@@ -2324,11 +3386,11 @@ def inspect_app_health(app):
                 "检查脚本权限，或重新选择一个可读取的脚本。",
                 "pick-script",
             )
-        elif direct and not os.access(script_path, os.X_OK):
+        elif direct and not _windows_command_file(script_path):
             add(
-                "script-not-executable", "脚本不可执行",
-                "直接运行的脚本没有执行权限：%s" % script_path,
-                "改用 python / powershell 启动脚本，或检查文件权限。",
+                "script-not-executable", "脚本不能由 Windows 直接运行",
+                "无法识别可直接运行的 Windows 文件格式或脚本扩展名：%s" % script_path,
+                "选择对应的 Python、CMD 或 PowerShell 启动方式，或选择有效的 Windows 可执行文件。",
                 "edit-command",
             )
 
@@ -2342,11 +3404,11 @@ def inspect_app_health(app):
     if executable and not direct and executable_base not in SHELL_BUILTINS:
         if _looks_like_command_path(executable):
             runtime = _resolve_command_path(executable, cwd)
-            runtime_ok = os.path.isfile(runtime) and os.access(runtime, os.X_OK)
+            runtime_ok = _windows_command_file(runtime)
         else:
             runtime = executable
-            runtime_ok = bool(shutil.which(
-                executable, path=build_launch_env("health-check").get("PATH")))
+            resolved = _resolve_runtime(executable, cwd=cwd)
+            runtime_ok = bool(resolved and _windows_command_file(resolved))
         if not runtime_ok:
             add(
                 "runtime-missing", "找不到 %s" % executable_base,
@@ -2417,8 +3479,157 @@ def _package_default_port(script_name, command, dependencies):
     return None
 
 
+def _launch_spec_for_candidate(command, cwd, port=None):
+    """Resolve a generated, shell-free project command to a LaunchSpec."""
+    tokens = _simple_command_tokens(command)
+    if not tokens:
+        return None, "启动命令包含无法安全解析的 Shell 语法。"
+    raw_executable = tokens[0]
+    args = tokens[1:]
+    base = os.path.basename(raw_executable).casefold()
+    mode = "exec"
+
+    if re.fullmatch(r"(?:py|python|pythonw)(?:\d+(?:\.\d+)*)?(?:\.exe)?",
+                    base, re.IGNORECASE):
+        executable = None
+        if base.startswith("py"):
+            executable = _project_python(cwd)
+            if executable and args and re.fullmatch(
+                    r"-\d+(?:\.\d+)*(?:-\d+)?|-V:\S+", args[0],
+                    re.IGNORECASE):
+                args = args[1:]
+        if not executable:
+            executable = _resolve_runtime(
+                raw_executable, cwd=cwd, python_project=True)
+        if not executable and base.startswith("python"):
+            # The Python launcher is a reliable Windows fallback when a
+            # python.exe alias is not on PATH. Prefer a concrete executable.
+            executable = _resolve_runtime("py.exe", cwd=cwd)
+            if executable:
+                args = ["-3"] + args
+    elif base in ("powershell", "powershell.exe", "pwsh", "pwsh.exe"):
+        executable = _powershell_executable()
+        mode = "powershell"
+    elif base in ("bash", "bash.exe"):
+        executable, shell = _bash_runtime()
+        if executable and shell == "wsl":
+            args = ["bash"] + args
+    else:
+        executable = _resolve_runtime(raw_executable, cwd=cwd)
+        suffix = os.path.splitext(executable or raw_executable)[1].casefold()
+        if suffix in (".bat", ".cmd"):
+            mode = "cmd"
+        elif suffix == ".ps1":
+            mode = "powershell"
+            args = ["-NoProfile", "-ExecutionPolicy", "Bypass",
+                    "-File", _resolve_command_path(raw_executable, cwd)]
+            executable = _powershell_executable()
+        elif base in ("sh", "sh.exe", "wsl", "wsl.exe"):
+            bash, shell = _bash_runtime()
+            executable = bash
+            if shell == "wsl":
+                args = ["bash"] + args
+
+    if not executable:
+        runtime_name = os.path.basename(raw_executable)
+        return None, "找不到运行时 %s；请安装它，或在项目配置中选择可用运行时。" % runtime_name
+    spec = {
+        "mode": mode,
+        "executable": os.path.abspath(executable),
+        "args": args,
+        "cwd": cwd,
+        "env": {},
+        "readiness": default_readiness(port),
+    }
+    try:
+        return normalize_launch_spec(spec, cwd=cwd, port=port), None
+    except LaunchSpecError as exc:
+        return None, str(exc)
+
+
+def resolve_launch_spec(command, cwd=None, port=None, kind="service"):
+    """Resolve a user's command line to a shell-free Windows launch spec.
+
+    The only modes inferred here are direct execution, explicit PowerShell,
+    and batch-file execution. A free-form legacy shell command is never
+    generated for a newly configured card.
+    """
+    if kind not in ("service", "task"):
+        raise LaunchSpecError("kind 必须是 service/task")
+    if kind == "task":
+        port = None
+    elif port is not None and (type(port) is not int or not 1 <= port <= 65535):
+        raise LaunchSpecError("port 必须是 1-65535 的整数")
+    if cwd is not None and not isinstance(cwd, str):
+        raise LaunchSpecError("cwd 必须是字符串或 null")
+    working_dir = os.path.abspath(os.path.expanduser(
+        cwd.strip() if cwd and cwd.strip() else os.path.expanduser("~")))
+    argv = _split_windows_command_line(command)
+    raw_executable, args = argv[0], argv[1:]
+    suffix = os.path.splitext(raw_executable)[1].casefold()
+    base = os.path.basename(raw_executable).casefold()
+    mode = "exec"
+    executable = None
+
+    # Script selection and typed script paths share the same project-aware
+    # runtime resolution (Python venv, PowerShell, CMD, Bash/WSL).
+    if suffix in SCRIPT_SUFFIXES:
+        script_path = _resolve_command_path(raw_executable, working_dir)
+        spec, reason = _launch_spec_for_script(script_path, working_dir, port)
+        if spec is None:
+            raise LaunchSpecError(reason or "找不到可运行此脚本的程序")
+        if args:
+            spec["args"].extend(args)
+        return normalize_launch_spec(spec, cwd=working_dir, port=port)
+
+    if base in ("powershell", "powershell.exe", "pwsh", "pwsh.exe"):
+        executable = _powershell_executable()
+        mode = "powershell"
+        if not executable:
+            raise LaunchSpecError("找不到 Windows PowerShell 或 pwsh")
+    elif re.fullmatch(r"(?:py|python|pythonw)(?:\d+(?:\.\d+)*)?(?:\.exe)?",
+                      base):
+        executable = _resolve_runtime(
+            raw_executable, cwd=working_dir, python_project=True)
+        if executable:
+            if base.startswith("py") and _project_python(working_dir) and args and re.fullmatch(
+                    r"-\d+(?:\.\d+)*(?:-\d+)?|-V:\S+", args[0], re.IGNORECASE):
+                args = args[1:]
+        elif base.startswith("python"):
+            executable = _resolve_runtime("py.exe", cwd=working_dir)
+            if executable:
+                args = ["-3"] + args
+        if not executable:
+            raise LaunchSpecError("找不到 Python 运行时；请安装 Python 或在项目中创建 .venv/venv/env")
+    else:
+        executable = _resolve_runtime(raw_executable, cwd=working_dir)
+        if not executable:
+            raise LaunchSpecError("找不到 Windows 运行时或可执行文件：%s" % raw_executable)
+        resolved_suffix = os.path.splitext(executable)[1].casefold()
+        if resolved_suffix in (".bat", ".cmd"):
+            mode = "cmd"
+        elif resolved_suffix == ".ps1":
+            powershell = _powershell_executable()
+            if not powershell:
+                raise LaunchSpecError("找不到 Windows PowerShell 或 pwsh")
+            args = ["-NoProfile", "-ExecutionPolicy", "Bypass",
+                    "-File", os.path.abspath(executable)] + args
+            executable = powershell
+            mode = "powershell"
+
+    spec = {
+        "mode": mode,
+        "executable": os.path.abspath(executable),
+        "args": args,
+        "cwd": working_dir,
+        "env": {},
+        "readiness": default_readiness(port),
+    }
+    return normalize_launch_spec(spec, cwd=working_dir, port=port)
+
+
 def detect_project(root):
-    """只读分析项目根目录，返回可由启动台直接使用的启动候选。"""
+    """只读分析项目根目录，返回已解析的 Windows 启动候选。"""
     if not isinstance(root, str) or not root.strip():
         return None, "请选择项目文件夹"
     root = os.path.abspath(os.path.expanduser(root.strip()))
@@ -2436,12 +3647,15 @@ def detect_project(root):
         return exists
 
     def add(command, label, source, port=None, priority=50, detail=None,
-            kind="service"):
+            kind="service", launch_spec=None, unavailable_reason=None):
         if not command or any(item["command"] == command for item in candidates):
             return
         if port is not None and not (isinstance(port, int) and 1 <= port <= 65535):
             port = None
-        candidates.append({
+        if launch_spec is None and unavailable_reason is None:
+            launch_spec, unavailable_reason = _launch_spec_for_candidate(
+                command, root, port if kind != "task" else None)
+        candidate = {
             "command": command,
             "label": label,
             "source": source,
@@ -2449,7 +3663,13 @@ def detect_project(root):
             "kind": "task" if kind == "task" else "service",
             "detail": detail,
             "_priority": priority,
-        })
+            "available": launch_spec is not None,
+        }
+        if launch_spec is not None:
+            candidate["launchSpec"] = launch_spec
+        else:
+            candidate["unavailableReason"] = unavailable_reason or "无法解析启动运行时。"
+        candidates.append(candidate)
 
     # Node / 前端 / 博客项目：优先读取 package.json 的 scripts。
     package = {}
@@ -2614,19 +3834,30 @@ def detect_project(root):
 
     for script_name in ("start.bat", "start.cmd", "dev.bat", "run.bat",
                         "start.ps1", "start.sh", "dev.sh", "run.sh"):
-        if os.path.isfile(os.path.join(root, script_name)):
-            note_file(script_name)
-            quoted = _quote_win("./" + script_name)
-            if script_name.endswith(".ps1"):
-                command = "powershell -NoProfile -ExecutionPolicy Bypass -File %s" % quoted
-            elif script_name.endswith((".bat", ".cmd")):
-                command = quoted
-            else:
-                command = "bash %s" % quoted
-            add(command,
-                "现有启动脚本", script_name, None, 70,
-                "也可以继续使用“选择脚本”手动指定")
-            break
+        script_path = os.path.join(root, script_name)
+        if not os.path.isfile(script_path):
+            continue
+        suffix = os.path.splitext(script_name)[1].lower()
+        spec, reason = _launch_spec_for_script(script_path, root)
+        # A .sh file is not a useful candidate unless this machine can execute
+        # it through Bash or WSL. Do not advertise a command that can only fail.
+        if suffix in (".sh", ".bash") and spec is None:
+            continue
+        note_file(script_name)
+        if spec:
+            command = command_from_launch_spec(spec)
+        elif suffix in (".bat", ".cmd"):
+            command = _quote_win(os.path.abspath(script_path))
+        elif suffix == ".ps1":
+            command = "powershell -NoProfile -ExecutionPolicy Bypass -File %s" % _quote_win(
+                os.path.abspath(script_path))
+        else:
+            command = "bash -- %s" % _quote_win(os.path.abspath(script_path))
+        add(command,
+            "现有启动脚本", script_name, None, 70,
+            "也可以继续使用“选择脚本”手动指定",
+            launch_spec=spec, unavailable_reason=reason)
+        break
 
     # 纯静态站点最后兜底，避免把 Vite/Next 等项目误当成普通文件目录。
     if not candidates and os.path.isfile(os.path.join(root, "index.html")):
@@ -2660,6 +3891,17 @@ def _current_user_group_members(pgid):
 
 def resolve_app_stop_target(app, listeners=None):
     """Resolve and validate a stop target before any signal is sent."""
+    instance = app.get("runInstance")
+    if (app.get("controlMode") == "managed"
+            and isinstance(instance, dict) and instance.get("jobName")
+            and instance.get("processState") != "exited"):
+        job = _open_run_job(app)
+        if job is not None:
+            members = job.members()
+            if members:
+                return {"kind": "job", "id": instance.get("runId"),
+                        "members": list(members), "job": job}, None
+            job.close()
     current = managed_pids(app)
     if current:
         pgid = app.get("lastPgid") or app.get("lastPid")
@@ -2669,12 +3911,14 @@ def resolve_app_stop_target(app, listeners=None):
     legacy_pid = legacy_managed_pid(app, listeners)
     if legacy_pid:
         return {"kind": "pid", "id": legacy_pid, "members": [legacy_pid]}, None
-        return {"kind": "pid", "id": legacy_pid, "members": [legacy_pid]}, None
     return None, "无法确认受控进程，未执行停止"
 
 
 def signal_app_stop(target, sig=signal.SIGTERM):
     """Signal a target returned by resolve_app_stop_target."""
+    if target["kind"] == "job":
+        return target["job"].terminate(force=False,
+                                       timeout=APP_STOP_TIMEOUT_SEC)
     ident = target["id"]
     if target["kind"] == "group":
         members = target.get("members")
@@ -2683,6 +3927,11 @@ def signal_app_stop(target, sig=signal.SIGTERM):
 
 
 def stop_target_alive(target, expected_uid=None):
+    if target["kind"] == "job":
+        try:
+            return bool(target["job"].members())
+        except OSError:
+            return False
     if target["kind"] == "group":
         return any(pid_alive(pid) for pid in target.get("members") or [])
     if not sysops.pid_alive(target["id"]):
@@ -2702,25 +3951,30 @@ def stop_app_and_wait(app, timeout=APP_STOP_TIMEOUT_SEC, listeners=None):
     target, error = resolve_app_stop_target(app, listeners)
     if target is None:
         return False, error
-    ok, error = signal_app_stop(target)
-    if not ok:
-        return False, error
-    deadline = time.monotonic() + max(0.0, timeout)
-    # uid 只查一次：信号已在循环外发出，循环仅做存活探测，
-    # 避免 50ms 一次的 ps 子进程（PID 复用时最坏多等一个超时周期，无副作用）。
-    expected_uid = (process_uid(target["id"]) if target["kind"] == "pid"
-                    else None)
-    while stop_target_alive(target, expected_uid):
-        if time.monotonic() >= deadline:
-            if target["kind"] == "pid":
-                remaining = target["members"]
-            else:
-                remaining = [pid for pid in target.get("members") or []
-                             if pid_alive(pid)]
-            suffix = "（PID %s）" % "、".join(str(p) for p in remaining) if remaining else ""
-            return False, "应用未在 %.1f 秒内退出%s，仍保留管理状态" % (timeout, suffix)
-        time.sleep(0.05)
-    return True, None
+    try:
+        ok, error = signal_app_stop(target)
+        if not ok:
+            return False, error
+        deadline = time.monotonic() + max(0.0, timeout)
+        # uid 只查一次：信号已在循环外发出，循环仅做存活探测。
+        expected_uid = (process_uid(target["id"])
+                        if target["kind"] == "pid" else None)
+        while stop_target_alive(target, expected_uid):
+            if time.monotonic() >= deadline:
+                if target["kind"] == "pid":
+                    remaining = target["members"]
+                else:
+                    remaining = [pid for pid in target.get("members") or []
+                                 if pid_alive(pid)]
+                suffix = ("（PID %s）" % "、".join(str(p) for p in remaining)
+                          if remaining else "")
+                return False, "应用未在 %.1f 秒内退出%s，仍保留管理状态" % (
+                    timeout, suffix)
+            time.sleep(0.05)
+        return True, None
+    finally:
+        if target.get("kind") == "job":
+            target["job"].close()
 
 
 def stop_app_and_clear(cfg, app, timeout=APP_STOP_TIMEOUT_SEC, listeners=None):
@@ -2728,9 +3982,22 @@ def stop_app_and_clear(cfg, app, timeout=APP_STOP_TIMEOUT_SEC, listeners=None):
     marker = (app.get("id"), app.get("runToken"))
     with MANUAL_STOP_LOCK:
         MANUAL_STOP_TOKENS.add(marker)
+
+    def set_process_state(state):
+        def op(data):
+            target = find_app(data, app.get("id"))
+            instance = target.get("runInstance") if target else None
+            if (target and target.get("runToken") == app.get("runToken")
+                    and isinstance(instance, dict)
+                    and instance.get("runId") == (app.get("runInstance") or {}).get("runId")):
+                instance["processState"] = state
+        cfg.update(op)
+
     try:
+        set_process_state("stopping")
         ok, error = stop_app_and_wait(app, timeout, listeners)
         if not ok:
+            set_process_state("alive" if app_alive_sign(app, listeners) else "exited")
             return False, error
         last_exit = None
         if (app.get("kind") or "service") == "task":
@@ -2771,7 +4038,7 @@ def inspect_attach_process(cfg, app, pid):
         return False, "该进程不属于当前用户，不能认领", {"status": 403}
     cfg_now = cfg.snapshot()
     owners = listener_app_owners(cfg_now.get("apps") or [], listeners, snap, None)
-    if pid in owners:
+    if pid in owners and owners[pid].get("id") != app.get("id"):
         return False, "该进程已由卡片「%s」管理" % owners[pid].get("name", ""), {"status": 409}
     actual_cwd = lsof_cwds({pid}).get(pid)
     if not actual_cwd:
@@ -2780,62 +4047,88 @@ def inspect_attach_process(cfg, app, pid):
     return True, None, {
         "status": 200, "cwd": actual_cwd,
         "ctime": snap.get(pid, {}).get("ctime"),
+        "sid": snap.get(pid, {}).get("uid"),
     }
 
 
-def attach_app_process(cfg, app_id, app, pid):
-    """把已在监听配置端口的当前用户进程认领为本卡片受管进程。
+def observation_from_identity(pid, port, identity):
+    return {
+        "pid": pid,
+        "createTime": identity.get("ctime"),
+        "sid": identity.get("sid") or SELF_UID,
+        "cwd": identity.get("cwd"),
+        "ports": [port] if isinstance(port, int) else [],
+        "observedAt": int(time.time()),
+    }
 
-    认领走旧版身份通道（lastPid + 监听端口 + 当前 UID + 真实 cwd 四重校验），
-    与卡片 cwd 不一致时原子同步卡片 cwd。认领后卡片显示运行中，可正常
-    停止/重启（重启后转为 token 受管）。返回 (ok, error, info)。"""
+
+def _observation_matches_identity(observation, pid, identity,
+                                 fallback_ctime=None):
+    """Return whether a saved observation still denotes this PID instance."""
+    if not isinstance(observation, dict) or observation.get("pid") != pid:
+        return False
+    saved_ctime = observation.get("createTime")
+    if saved_ctime is None:
+        saved_ctime = fallback_ctime
+    current_ctime = identity.get("ctime") if isinstance(identity, dict) else None
+    if saved_ctime is not None and current_ctime is None:
+        return False
+    if saved_ctime is not None and current_ctime is not None:
+        try:
+            if abs(float(saved_ctime) - float(current_ctime)) > 0.0001:
+                return False
+        except (TypeError, ValueError):
+            return False
+    saved_sid = observation.get("sid")
+    current_sid = identity.get("sid") if isinstance(identity, dict) else None
+    return not (saved_sid and current_sid and saved_sid != current_sid)
+
+
+def attach_app_process(cfg, app_id, app, pid):
+    """Record an observation for a listener without claiming control over it."""
     ok, error, identity = inspect_attach_process(cfg, app, pid)
     if not ok:
         return False, error, identity
-    actual_cwd = identity["cwd"]
-    normalized_command = normalize_attached_python_command(
-        app.get("command"), actual_cwd)
-    cwd_updated = False
     pid_conflict = False
 
     def op(c):
-        nonlocal cwd_updated, pid_conflict
+        nonlocal pid_conflict
         target = find_app(c, app_id)
         if not target:
             return False
         # 认领检查与写入必须同锁：inspect 用的是旧快照，并发请求可能同时
         # 通过校验。在写锁内重验 pid 是否已被其他卡片认领。
-        if any(other.get("lastPid") == pid
-               for other in c.get("apps") or [] if other.get("id") != app_id):
+        if any(
+                (_observation_matches_identity(
+                    other.get("observation"), pid, identity,
+                    other.get("lastCreateTime"))
+                 or (other.get("observation") is None
+                     and other.get("lastPid") == pid
+                     and (other.get("lastCreateTime") is None
+                          or identity.get("ctime") is None
+                          or other.get("lastCreateTime") == identity.get("ctime"))))
+                for other in c.get("apps") or [] if other.get("id") != app_id):
             pid_conflict = True
             return False
         target["lastPid"] = pid
         target["lastPgid"] = None
         target["runToken"] = None
+        target["controlMode"] = "monitor"
         target["attached"] = True
-        target["lastExit"] = None
-        # PID 创建时间锚点：身份校验时若同 PID 的 ctime 不同，判为 PID 复用。
         target["lastCreateTime"] = identity.get("ctime")
-        try:
-            same = (isinstance(target.get("cwd"), str) and target["cwd"]
-                    and os.path.realpath(target["cwd"]) == os.path.realpath(actual_cwd))
-        except OSError:
-            same = False
-        if not same:
-            target["cwd"] = actual_cwd
-            cwd_updated = True
-        target["command"] = normalized_command
+        target["runInstance"] = None
+        target["readinessState"] = "unknown"
+        target["observation"] = observation_from_identity(
+            pid, target.get("port"), identity)
         return True
 
     if not cfg.update(op):
         if pid_conflict:
             return False, "该进程已由其他卡片管理", {"status": 409}
         return False, "应用已被删除", {"status": 404}
-    info = {}
-    if cwd_updated:
-        info["cwdUpdated"] = True
-        info["cwd"] = actual_cwd
-    return True, None, info
+    return True, None, {"controlMode": "monitor",
+                        "observation": observation_from_identity(
+                            pid, app.get("port"), identity)}
 
 
 # ---------------------------------------------------------------- 日志
@@ -3610,6 +4903,9 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/project/detect":
                 self.handle_project_detect()
                 return
+            if path == "/api/launch/resolve":
+                self.handle_launch_resolve()
+                return
             if path == "/api/console/restart":
                 self.discard_body()
                 self.handle_console_restart()
@@ -3646,6 +4942,9 @@ class Handler(BaseHTTPRequestHandler):
                 if action == "attach":
                     self.handle_app_attach(app_id)
                     return
+                if action == "validate-launch":
+                    self.handle_app_validate_launch(app_id)
+                    return
                 if action == "icon":
                     self.handle_icon_upload(app_id)
                     return
@@ -3676,7 +4975,15 @@ class Handler(BaseHTTPRequestHandler):
         else:
             result = {"ok": True, "path": path}
             if what == "script":
-                result["command"] = command_for_script(path)
+                spec, reason = _launch_spec_for_script(
+                    path, data.get("cwd"), data.get("port"))
+                result["command"] = (command_from_launch_spec(spec) if spec
+                                     else command_for_script(path, data.get("cwd")))
+                result["available"] = spec is not None
+                if spec is not None:
+                    result["launchSpec"] = spec
+                else:
+                    result["unavailableReason"] = reason
             self.send_json(result)
 
     def handle_project_detect(self):
@@ -3689,6 +4996,87 @@ class Handler(BaseHTTPRequestHandler):
             self.send_err(400, err)
             return
         self.send_json(result)
+
+    def handle_launch_resolve(self):
+        """Resolve a manually entered command without running it."""
+        data, err = self.read_json_body()
+        if err:
+            self.send_err(400, err)
+            return
+        port, err = validate_port(data.get("port"))
+        if err:
+            self.send_err(400, err)
+            return
+        kind = data.get("kind", "service")
+        try:
+            spec = resolve_launch_spec(
+                data.get("command"), data.get("cwd"), port, kind)
+        except LaunchSpecError as exc:
+            self.send_err(422, str(exc))
+            return
+        command = command_from_launch_spec(spec)
+        app = {
+            "command": command, "cwd": spec.get("cwd"), "port": port,
+            "kind": kind, "launchSpec": spec,
+        }
+        health = inspect_app_health(app)
+        self.send_json({"ok": True, "launchSpec": spec,
+                        "command": command, "health": health})
+
+    def handle_app_validate_launch(self, app_id):
+        """Validate a candidate launch definition using static checks only."""
+        _, existing = self._get_app_or_404(app_id)
+        if existing is None:
+            return
+        data, err = self.read_json_body()
+        if err:
+            self.send_err(400, err)
+            return
+        fields, err = validate_app_fields(data, partial=True)
+        if err:
+            self.send_err(400, err)
+            return
+        kind = fields.get("kind", existing.get("kind") or "service")
+        port = fields.get("port", existing.get("port"))
+        if kind == "task":
+            port = None
+        cwd = fields.get("cwd", existing.get("cwd"))
+        command = fields.get("command", existing.get("command", ""))
+        try:
+            requested = data.get("launchSpec")
+            if requested is None:
+                spec = resolve_launch_spec(command, cwd, port, kind)
+            else:
+                spec_value = dict(requested) if isinstance(requested, dict) else requested
+                if isinstance(spec_value, dict):
+                    spec_value["cwd"] = cwd
+                    if kind == "task":
+                        spec_value["readiness"] = default_readiness(None)
+                    elif (isinstance(spec_value.get("readiness"), dict)
+                          and spec_value["readiness"].get("type") == "tcp"):
+                        spec_value["readiness"]["port"] = port
+                spec = normalize_launch_spec(
+                    spec_value, command=command, cwd=cwd, port=port)
+                if (spec.get("mode") == "legacy-shell"
+                        and not (isinstance(existing.get("launchSpec"), dict)
+                                 and existing["launchSpec"].get("mode") == "legacy-shell")):
+                    raise LaunchSpecError(
+                        "新启动配置不能使用 legacy-shell；请选择 Windows 可执行程序、批处理或 PowerShell 脚本")
+        except (LaunchSpecError, TypeError) as exc:
+            self.send_err(422, str(exc))
+            return
+
+        canonical_command = command_from_launch_spec(spec)
+        health_app = dict(existing)
+        health_app.update(fields)
+        health_app.update({"kind": kind, "port": port, "cwd": cwd,
+                           "command": canonical_command,
+                           "launchSpec": spec})
+        health = inspect_app_health(health_app)
+        self.send_json({"ok": True, "launchSpec": spec,
+                        "command": canonical_command,
+                        "launchConfigured": is_launch_configured(spec),
+                        "health": health})
 
     def handle_app_diagnose(self, app_id):
         cfg = self.server.cfg.snapshot()
@@ -3860,8 +5248,24 @@ class Handler(BaseHTTPRequestHandler):
                "autostart": fields.get("autostart", False),
                "icon": None, "favicon": None, "lastPid": None,
                "lastPgid": None, "runToken": None,
-               "attached": False, "lastExit": None,
+               "attached": False, "controlMode": "managed",
+               "launchSpec": None, "launchConfigured": False,
+               "observation": None, "runInstance": None,
+               "readinessState": "unknown", "lastExit": None,
                "lastCreateTime": None, "createdAt": int(time.time())}
+        try:
+            requested_spec = data.get("launchSpec")
+            if attach_pid is None:
+                app["launchSpec"] = normalize_launch_spec(
+                    requested_spec, command=fields["command"],
+                    cwd=fields["cwd"], port=fields["port"])
+                app["command"] = command_from_launch_spec(app["launchSpec"])
+                app["controlMode"] = "managed"
+                app["launchConfigured"] = is_launch_configured(
+                    app["launchSpec"])
+        except LaunchSpecError as exc:
+            self.send_err(400, str(exc))
+            return
         cwd_updated = False
         if attach_pid is not None:
             ok, error, identity = inspect_attach_process(
@@ -3872,20 +5276,20 @@ class Handler(BaseHTTPRequestHandler):
                     identity.get("status", 409),
                 )
                 return
-            actual_cwd = identity["cwd"]
             try:
-                cwd_updated = (
-                    not app.get("cwd")
-                    or os.path.realpath(app["cwd"]) != os.path.realpath(actual_cwd)
-                )
-            except OSError:
-                cwd_updated = True
-            app["cwd"] = actual_cwd
-            app["command"] = normalize_attached_python_command(
-                app.get("command"), actual_cwd)
+                cwd_updated = bool(identity.get("cwd") and
+                                   os.path.normcase(os.path.realpath(identity.get("cwd"))) !=
+                                   os.path.normcase(os.path.realpath(app.get("cwd") or "")))
+            except (OSError, TypeError, ValueError):
+                cwd_updated = bool(identity.get("cwd") and identity.get("cwd") != app.get("cwd"))
+            app["controlMode"] = "monitor"
+            app["attached"] = True
+            app["launchSpec"] = None
+            app["launchConfigured"] = False
+            app["observation"] = observation_from_identity(
+                attach_pid, app.get("port"), identity)
             app["lastPid"] = attach_pid
             app["lastCreateTime"] = identity.get("ctime")
-            app["attached"] = True
 
         attach_conflict = [False]
 
@@ -3894,7 +5298,14 @@ class Handler(BaseHTTPRequestHandler):
                 return None
             # 与 attach_app_process 同规则：写锁内重验 pid 未被其他卡片认领。
             if attach_pid is not None and any(
-                    other.get("lastPid") == attach_pid
+                    (_observation_matches_identity(
+                        other.get("observation"), attach_pid, identity,
+                        other.get("lastCreateTime"))
+                     or (other.get("observation") is None
+                         and other.get("lastPid") == attach_pid
+                         and (other.get("lastCreateTime") is None
+                              or identity.get("ctime") is None
+                              or other.get("lastCreateTime") == identity.get("ctime"))))
                     for other in c.get("apps") or []):
                 attach_conflict[0] = True
                 return None
@@ -3912,6 +5323,10 @@ class Handler(BaseHTTPRequestHandler):
         if attach_pid is not None:
             created.update({
                 "attached": True,
+                "controlMode": "monitor",
+                "processState": "alive",
+                "identityStrength": "observation",
+                "launchConfigured": False,
                 "running": True,
                 "pid": attach_pid,
                 "cwdUpdated": cwd_updated,
@@ -3989,6 +5404,13 @@ class Handler(BaseHTTPRequestHandler):
         _, app = self._get_app_or_404(app_id)
         if app is None:
             return
+        if app.get("controlMode") == "monitor":
+            self.send_json({
+                "ok": False,
+                "error": "监控卡片不能停止外部进程，请先确认启动配置",
+                "launchSpecRequired": True,
+            }, 409)
+            return
         if not app_alive_sign(app):
             self.send_json({"ok": False, "error": "应用未在运行"})
             return
@@ -4023,6 +5445,13 @@ class Handler(BaseHTTPRequestHandler):
     def handle_app_restart(self, app_id):
         _, app = self._get_app_or_404(app_id)
         if app is None:
+            return
+        if app.get("controlMode") == "monitor":
+            self.send_json({
+                "ok": False,
+                "error": "监控卡片不能重启外部进程，请先确认启动配置",
+                "launchSpecRequired": True,
+            }, 409)
             return
         if not app_alive_sign(app):
             self.send_err(409, "应用未在运行")
@@ -4124,10 +5553,84 @@ class Handler(BaseHTTPRequestHandler):
             if err:
                 self.send_err(400, err)
                 return
+            if "launchSpec" in data:
+                try:
+                    spec_value = data.get("launchSpec")
+                    if (spec_value is None
+                            and app.get("controlMode") == "monitor"):
+                        self.send_json({
+                            "ok": False,
+                            "error": "监控卡片必须保存已确认的结构化启动配置",
+                            "launchSpecRequired": True,
+                        }, 422)
+                        return
+                    if isinstance(spec_value, dict):
+                        spec_value = dict(spec_value)
+                        spec_value["cwd"] = fields.get(
+                            "cwd", spec_value.get("cwd", app.get("cwd")))
+                        selected_kind = fields.get(
+                            "kind", app.get("kind") or "service")
+                        selected_port = (None if selected_kind == "task" else
+                                         fields.get("port", app.get("port")))
+                        if selected_kind == "task":
+                            spec_value["readiness"] = default_readiness(None)
+                        elif (isinstance(spec_value.get("readiness"), dict)
+                              and spec_value["readiness"].get("type") == "tcp"):
+                            spec_value["readiness"]["port"] = selected_port
+                    else:
+                        selected_kind = fields.get(
+                            "kind", app.get("kind") or "service")
+                        selected_port = (None if selected_kind == "task" else
+                                         fields.get("port", app.get("port")))
+                    fields["launchSpec"] = normalize_launch_spec(
+                        spec_value,
+                        command=data.get("command", app.get("command", "")),
+                        cwd=fields.get("cwd", app.get("cwd")),
+                        port=selected_port)
+                except LaunchSpecError as exc:
+                    self.send_err(400, str(exc))
+                    return
+                fields["command"] = command_from_launch_spec(
+                    fields["launchSpec"])
+                fields["controlMode"] = "managed"
+                fields["attached"] = False
+                fields["observation"] = None
+                if (app.get("controlMode") == "monitor"
+                        or fields["launchSpec"] != app.get("launchSpec")):
+                    fields["lastPid"] = None
+                    fields["lastPgid"] = None
+                    fields["runToken"] = None
+                    fields["lastCreateTime"] = None
+                    fields["runInstance"] = None
+                fields["launchConfigured"] = is_launch_configured(
+                    fields["launchSpec"])
+                fields["readinessState"] = "unknown"
+            elif ("command" in fields
+                  and fields["command"] != app.get("command")
+                  and app.get("controlMode") != "monitor"):
+                # Older API clients still send a free-form command. Keep them
+                # working through the explicit legacy compatibility mode.
+                fields["launchSpec"] = normalize_launch_spec(
+                    None, command=fields["command"],
+                    cwd=fields.get("cwd", app.get("cwd")),
+                    port=fields.get("port", app.get("port")))
+                fields["launchConfigured"] = is_launch_configured(
+                    fields["launchSpec"])
+            if (app.get("controlMode") == "monitor"
+                    and any(key in fields and fields[key] != app.get(key)
+                            for key in ("command", "cwd", "port", "kind"))
+                    and "launchSpec" not in data):
+                self.send_json({
+                    "ok": False,
+                    "error": "监控卡片修改启动字段时必须同时确认 launchSpec",
+                    "launchSpecRequired": True,
+                }, 409)
+                return
             if not fields:
                 self.send_err(400, "没有可更新的字段")
                 return
-            lifecycle_fields = {"command", "cwd", "port", "kind"}
+            lifecycle_fields = {"command", "cwd", "port", "kind",
+                                "launchSpec", "controlMode"}
             lifecycle_changed = any(
                 key in fields and fields[key] != app.get(key)
                 for key in lifecycle_fields)
@@ -4153,6 +5656,9 @@ class Handler(BaseHTTPRequestHandler):
             def op(c):
                 target = find_app(c, m.group(1))
                 target.update(fields)
+                if fields.get("controlMode") == "managed":
+                    target["attached"] = False
+                    target["observation"] = None
                 return dict(target)
 
             updated = self.server.cfg.update(op)
@@ -4344,6 +5850,17 @@ def _disk_configured_app_count(path=None):
                if isinstance(item, dict) and item.get("id"))
 
 
+def _disk_app_config_signature(path=None):
+    """Return the signature of the current disk-backed launchpad cards."""
+    path = path or CONFIG_PATH
+    raw = _load_config_raw(path)
+    if raw is None:
+        raw = _load_config_raw(path + ".bak")
+    if not isinstance(raw, dict) or not isinstance(raw.get("apps"), list):
+        return app_config_signature([])
+    return app_config_signature(raw["apps"])
+
+
 def require_expected_disk_apps(path, expected_count, timeout=3.0):
     """Refuse startup until disk config is readable and meets expectations."""
     try:
@@ -4391,10 +5908,20 @@ def console_instance_status(item, disk_app_count=0):
     if not isinstance(health, dict) or not health.get("ok"):
         return "stale"
     health_config = health.get("config")
+    disk_signature = (_disk_app_config_signature()
+                      if disk_app_count > 0 else app_config_signature([]))
     if disk_app_count > 0 and isinstance(health_config, dict):
         if (health_config.get("memoryAppCount") == 0
                 or health_config.get("diskAppCount") == 0):
             return "stale"
+        live_signature = health_config.get("appSignature")
+        if (live_signature is not None
+                and live_signature != disk_signature):
+            return "stale"
+        if (isinstance(health_config.get("memoryAppCount"), int)
+                and health_config.get("memoryAppCount") > 0
+                and live_signature is not None):
+            return "healthy"
     state = _http_json_localhost(port, "/api/state", 4.0)
     if not isinstance(state, dict):
         # /api/state performs process scans and can time out transiently. The
@@ -4404,6 +5931,9 @@ def console_instance_status(item, disk_app_count=0):
     apps = state.get("apps")
     live_count = len(apps) if isinstance(apps, list) else 0
     if live_count == 0 and disk_app_count > 0:
+        return "stale"
+    if (disk_app_count > 0 and isinstance(apps, list)
+            and app_config_signature(apps) != disk_signature):
         return "stale"
     return "healthy"
 

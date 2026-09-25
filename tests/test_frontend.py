@@ -207,17 +207,57 @@ class FrontendAccessibilityContractTests(unittest.TestCase):
         self.assertIn("svc.appId ? '编辑启动台应用' : '添加到启动台'", source)
         self.assertNotIn("configuredPortClaims", source)
 
-    def test_adding_a_running_service_creates_and_attaches_in_one_flow(self):
+    def test_external_claims_are_monitor_only_until_user_confirms_configuration(self):
         services = (ROOT / "static/js/services.js").read_text(encoding="utf-8")
         overlays = (ROOT / "static/js/overlays.js").read_text(encoding="utf-8")
+        launchpad = (ROOT / "static/js/launchpad.js").read_text(encoding="utf-8")
 
         self.assertIn("attachPid: s.pid", services)
         self.assertIn("let pendingAttach = null", overlays)
-        self.assertIn("保存并认领", overlays)
-        self.assertIn("body.attachPid = attachRequest.pid", overlays)
-        self.assertIn("app.attached", overlays)
-        self.assertIn("willAttach && detectingProject", overlays)
-        self.assertIn("已加入启动台并认领正在运行的进程", overlays)
+        self.assertIn("加入监控并确认配置", overlays)
+        self.assertIn("controlMode: app.controlMode", overlays)
+        self.assertIn("此卡片仅监控外部进程", overlays)
+        self.assertIn("controlMode === 'monitor'", launchpad)
+        self.assertIn("确认启动配置", launchpad)
+        self.assertIn("r.restart.hidden = configureOnly || !app.running", launchpad)
+        self.assertIn("title: '建立监控关联'", launchpad)
+        self.assertIn("okText: '仅监控'", launchpad)
+        toggle = launchpad[
+            launchpad.index("async function toggleApp"):
+            launchpad.index("export { toggleApp }")
+        ]
+        self.assertLess(
+            toggle.index("if (needsLaunchConfiguration(app))"),
+            toggle.index("post('/api/apps/' + id + '/'")
+        )
+        self.assertIn("if (needsLaunchConfiguration(app))", launchpad[
+            launchpad.index("function confirmRestartApp"):
+            launchpad.index("function confirmReleaseAndStart")
+        ])
+        self.assertIn("readiness === 'checking'", launchpad)
+        self.assertIn("readiness === 'timeout'", launchpad)
+
+    def test_launch_candidates_and_manual_commands_persist_structured_launch_spec(self):
+        overlays = (ROOT / "static/js/overlays.js").read_text(encoding="utf-8")
+
+        self.assertIn("cloneLaunchSpec(candidate.launchSpec)", overlays)
+        self.assertIn("body.launchSpec = cloneLaunchSpec(resolved.launchSpec)", overlays)
+        self.assertIn("post('/api/launch/resolve'", overlays)
+        self.assertIn("post('/api/apps/' + appId + '/validate-launch'", overlays)
+        self.assertIn("body.launchSpec = cloneLaunchSpec(validated.launchSpec)", overlays)
+        self.assertIn("delete createBody.launchSpec", overlays)
+        self.assertIn("put('/api/apps/' + id, body)", overlays)
+        self.assertIn("body.command = resolved.command", overlays)
+        self.assertIn("body.command = validated.command", overlays)
+        self.assertIn("仍可选择脚本", overlays)
+        self.assertIn("cwd: fCwd.value.trim() || null", overlays)
+        self.assertIn("unavailableReason", overlays)
+        self.assertIn("selectedLaunchSpec = r.available === false", overlays)
+
+    def test_windows_console_recovery_copy_uses_exe_launcher(self):
+        app = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        self.assertIn("LocalOpsConsole.exe", app)
+        self.assertNotIn("总控台.app", app)
 
     def test_task_outcomes_and_health_have_distinct_ui_contracts(self):
         core = (ROOT / "static/js/core.js").read_text(encoding="utf-8")

@@ -1,5 +1,7 @@
 # [提案] Windows 平台移植支持：sysops 跨平台抽象层 + psutil 唯一依赖
 
+> **历史资料（已归档）**：本文记录早期 Windows 移植方案，不是当前运行契约。当前仓库仅支持 Windows 10/11；受控启动默认使用 `LaunchSpec`、Windows Job Object 和结构化参数，端口认领默认创建 `monitor` 监控卡。当前安装、启动、迁移和安全边界请以 [README](../README.md)、[CHANGELOG](../CHANGELOG.md) 和 [RELEASE_CHECKLIST](../RELEASE_CHECKLIST.md) 为准。
+
 > **Proposal: Windows port — a `sysops.py` cross-platform layer with psutil as the only new runtime dependency. macOS behavior unchanged, zero-dependency promise preserved on macOS.**
 
 ## 摘要 / Summary

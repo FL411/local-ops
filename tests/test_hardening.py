@@ -185,12 +185,51 @@ class LauncherCapabilityTokenTests(unittest.TestCase):
 
     def test_status_leaves_matching_instance_running(self):
         health = {"ok": True, "config": {
-            "memoryAppCount": 1, "diskAppCount": 1}}
+            "memoryAppCount": 1, "diskAppCount": 1,
+            "appSignature": "same"}}
         with mock.patch.object(launcher_check, "_read_json",
-                               return_value=health):
+                               return_value=health), \
+                mock.patch.object(launcher_check,
+                                  "_configured_app_signature",
+                                  return_value="same"):
             self.assertEqual(
                 launcher_check._console_status(9600, disk_app_count=1),
                 "RUNNING")
+
+    def test_status_replaces_same_count_instance_with_different_cards(self):
+        health = {"ok": True, "config": {
+            "memoryAppCount": 1, "diskAppCount": 1,
+            "appSignature": "old-card"}}
+        with mock.patch.object(launcher_check, "_read_json",
+                               return_value=health), \
+                mock.patch.object(launcher_check,
+                                  "_configured_app_signature",
+                                  return_value="current-card"):
+            self.assertEqual(
+                launcher_check._console_status(9600, disk_app_count=1),
+                "STALE")
+
+    def test_app_signature_ignores_runtime_identity(self):
+        app = {
+            "id": "saved-card", "name": "API", "command": "python app.py",
+            "cwd": "C:\\project", "port": 8765,
+            "lastPid": 100, "runToken": "old", "lastExit": {"code": 1},
+        }
+        changed = dict(app)
+        changed.update(lastPid=200, runToken="new",
+                       lastExit={"code": 0}, attached=True)
+        self.assertEqual(
+            launcher_check._app_config_signature([app]),
+            launcher_check._app_config_signature([changed]))
+
+    def test_app_signature_matches_server_normalization_for_legacy_cards(self):
+        raw = [{"id": "saved-card", "name": "API",
+                "command": "python app.py", "cwd": "C:\\project",
+                "port": 8765}]
+        normalized = server.Config._normalize({"apps": raw})["apps"]
+        self.assertEqual(
+            launcher_check._app_config_signature(raw),
+            server.app_config_signature(normalized))
 
     def test_old_healthy_instance_is_not_replaced_on_state_timeout(self):
         with mock.patch.object(launcher_check, "_read_json",
@@ -198,6 +237,23 @@ class LauncherCapabilityTokenTests(unittest.TestCase):
             self.assertEqual(
                 launcher_check._console_status(9600, disk_app_count=1),
                 "RUNNING")
+
+    def test_legacy_instance_with_same_count_but_different_card_is_stale(self):
+        health = {"ok": True, "config": {
+            "memoryAppCount": 1, "diskAppCount": 1}}
+        state = {"apps": [{"id": "old-card", "name": "old",
+                            "command": "python old.py"}]}
+        with mock.patch.object(launcher_check, "_read_json",
+                               side_effect=[health, state]), \
+                mock.patch.object(launcher_check,
+                                  "_configured_app_signature",
+                                  return_value="current-card"), \
+                mock.patch.object(launcher_check,
+                                  "_app_config_signature",
+                                  return_value="old-card"):
+            self.assertEqual(
+                launcher_check._console_status(9600, disk_app_count=1),
+                "STALE")
 
     def test_main_status_reports_probe_result(self):
         with mock.patch.object(launcher_check, "find_console_status",
@@ -294,6 +350,36 @@ class LauncherCapabilityTokenTests(unittest.TestCase):
             self.assertEqual(
                 launcher_check.main(["launcher_check.py", "launch"]), 0)
         self.assertEqual(stdout.getvalue().strip(), "RUNNING 9600")
+
+    def test_launch_console_rechecks_after_serializing_and_reuses_instance(self):
+        lock = object()
+        with mock.patch.object(launcher_check, "_acquire_launcher_lock",
+                               return_value=lock) as acquire, \
+                mock.patch.object(launcher_check, "_release_launcher_lock") as release, \
+                mock.patch.object(launcher_check, "find_console_status",
+                                  return_value=("RUNNING", 9600)), \
+                mock.patch.object(launcher_check, "_start_console_candidate") as start:
+            self.assertEqual(
+                launcher_check.launch_console(attempts=2, wait_sec=1), 9600)
+
+        acquire.assert_called_once_with()
+        release.assert_called_once_with(lock)
+        start.assert_not_called()
+
+    def test_launcher_lock_rejects_a_second_concurrent_transaction(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "launcher.lock")
+            with mock.patch.object(launcher_check, "_launcher_lock_path",
+                                   return_value=path):
+                first = launcher_check._try_acquire_launcher_lock()
+                self.assertIsNotNone(first)
+                try:
+                    self.assertIsNone(launcher_check._try_acquire_launcher_lock())
+                finally:
+                    launcher_check._release_launcher_lock(first)
+                third = launcher_check._try_acquire_launcher_lock()
+                self.assertIsNotNone(third)
+                launcher_check._release_launcher_lock(third)
 
 
 
@@ -523,7 +609,8 @@ class AtomicAttachCreateTests(unittest.TestCase):
         self.assertEqual(len(apps), 1)
         self.assertEqual(apps[0]["lastPid"], 4242)
         self.assertEqual(apps[0]["lastCreateTime"], 123456.0)
-        self.assertEqual(apps[0]["cwd"], "/actual")
+        self.assertEqual(apps[0]["cwd"], "/expected")
+        self.assertEqual(apps[0]["observation"]["cwd"], "/actual")
         self.assertTrue(apps[0]["attached"])
 
     def test_failed_attach_does_not_leave_a_stopped_card(self):
@@ -570,7 +657,9 @@ class AtomicAttachCreateTests(unittest.TestCase):
             tokens = server._simple_command_tokens(saved["command"])
             self.assertEqual(status, 200)
             self.assertEqual(os.path.normcase(tokens[0]),
-                             os.path.normcase(venv_python))
+                             os.path.normcase(r"C:\Tools\uv\python\python.exe"))
+            self.assertIsNone(saved["launchSpec"])
+            self.assertEqual(saved["observation"]["cwd"], td)
 
 
 class DeliveryMetadataTests(unittest.TestCase):
@@ -624,6 +713,9 @@ class DeliveryMetadataTests(unittest.TestCase):
                          server.CURRENT_SCHEMA_VERSION)
         self.assertEqual(body["config"]["memoryAppCount"], 1)
         self.assertEqual(body["config"]["diskAppCount"], 1)
+        self.assertEqual(
+            body["config"]["appSignature"],
+            server.app_config_signature(self.h.cfg.snapshot()["apps"]))
         services.assert_not_called()
 
     def test_root_favicon_serves_the_unified_brand_asset(self):
@@ -1302,7 +1394,8 @@ class StateCacheTests(unittest.TestCase):
             })
 
             def fake_build_apps(cfg_snapshot, listeners, groups=None,
-                                attached_repairs=None):
+                                attached_repairs=None, anchor_repairs=None,
+                                observation_repairs=None):
                 return [{
                     "id": app["id"],
                     "name": app.get("name"),
@@ -1504,7 +1597,10 @@ class ConsoleSelfHealTests(unittest.TestCase):
         health = {"ok": True}
         state = {"apps": [{"id": "abcd1234"}]}
         with mock.patch.object(server, "_http_json_localhost",
-                               side_effect=[health, state]):
+                               side_effect=[health, state]), \
+                mock.patch.object(server, "_disk_app_config_signature",
+                                  return_value=server.app_config_signature(
+                                      state["apps"])):
             self.assertEqual(
                 server.console_instance_status(
                     {"pid": 11, "ports": [9600]}, 1),
@@ -1557,6 +1653,36 @@ class ConsoleSelfHealTests(unittest.TestCase):
                     {"pid": 11, "ports": [9600]}, 1),
                 "stale")
         request.assert_called_once_with(9600, "/api/health", 2.0)
+
+    def test_health_signature_mismatch_is_stale_without_state_scan(self):
+        health = {"ok": True, "config": {
+            "memoryAppCount": 1, "diskAppCount": 1,
+            "appSignature": "old-card"}}
+        with mock.patch.object(server, "_http_json_localhost",
+                               return_value=health) as request, \
+                mock.patch.object(server, "_disk_app_config_signature",
+                                  return_value="current-card"):
+            self.assertEqual(
+                server.console_instance_status(
+                    {"pid": 11, "ports": [9600]}, 1),
+                "stale")
+        request.assert_called_once_with(9600, "/api/health", 2.0)
+
+    def test_legacy_health_falls_back_to_state_card_signature(self):
+        health = {"ok": True, "config": {
+            "memoryAppCount": 1, "diskAppCount": 1}}
+        state = {"apps": [{"id": "old-card", "name": "old",
+                            "command": "python old.py"}]}
+        with mock.patch.object(server, "_http_json_localhost",
+                               side_effect=[health, state]), \
+                mock.patch.object(server, "_disk_app_config_signature",
+                                  return_value="current-card"), \
+                mock.patch.object(server, "app_config_signature",
+                                  side_effect=["old-card", "current-card"]):
+            self.assertEqual(
+                server.console_instance_status(
+                    {"pid": 11, "ports": [9600]}, 1),
+                "stale")
 
     def test_health_timeout_is_stale(self):
         with mock.patch.object(server, "_http_json_localhost",

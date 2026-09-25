@@ -45,6 +45,8 @@ INCLUDE = (
     *REQUIRED_LICENSES,
     "server.py",
     "sysops.py",
+    "launch_spec.py",
+    "windows_runtime.py",
     "tray.py",
     "start.bat",
     "launcher_check.py",

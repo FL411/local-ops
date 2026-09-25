@@ -32,6 +32,8 @@ ROOT = Path(__file__).resolve().parents[1]
 STATIC = ROOT / "static"
 WINDOWS_RUNTIME_FILES = (
     "sysops.py",
+    "launch_spec.py",
+    "windows_runtime.py",
     "tray.py",
     "start.bat",
     "launcher_check.py",
@@ -222,7 +224,9 @@ def check_version() -> str:
 
 
 def check_python_syntax() -> str:
-    paths = [ROOT / name for name in ("server.py", "sysops.py", "tray.py", "launcher_check.py")]
+    paths = [ROOT / name for name in (
+        "server.py", "sysops.py", "launch_spec.py", "windows_runtime.py",
+        "tray.py", "launcher_check.py")]
     paths.extend(sorted((ROOT / "tools").glob("*.py")))
     paths.extend(sorted((ROOT / "tests").glob("test_*.py")))
     for path in paths:

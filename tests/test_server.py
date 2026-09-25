@@ -12,6 +12,16 @@ from unittest import mock
 import server
 
 
+def write_fake_pe(path):
+    """Write the minimal header needed for a fake PE executable in tests."""
+    header = bytearray(68)
+    header[:2] = b"MZ"
+    header[0x3C:0x40] = (64).to_bytes(4, "little")
+    header[64:68] = b"PE\0\0"
+    with open(path, "wb") as handle:
+        handle.write(header)
+
+
 class ParsingTests(unittest.TestCase):
     def test_parse_etime(self):
         self.assertEqual(server.parse_etime("02:03"), 123)
@@ -134,6 +144,84 @@ class WindowsScriptCommandTests(unittest.TestCase):
                 server.normalize_attached_python_command(command, td),
                 command)
 
+    def test_py_launcher_selector_is_removed_when_using_project_venv(self):
+        with tempfile.TemporaryDirectory() as td:
+            scripts = os.path.join(td, ".venv", "Scripts")
+            os.makedirs(scripts)
+            venv_python = os.path.join(scripts, "python.exe")
+            with open(venv_python, "wb") as handle:
+                handle.write(b"MZ")
+            command = "py -3.12 -m uvicorn app:app --port 8765"
+
+            normalized = server.normalize_attached_python_command(command, td)
+            tokens = server._simple_command_tokens(normalized)
+
+        self.assertEqual(os.path.normcase(tokens[0]),
+                         os.path.normcase(venv_python))
+        self.assertEqual(tokens[1:], [
+            "-m", "uvicorn", "app:app", "--port", "8765"])
+
+    def test_escaped_quotes_are_not_rebuilt_by_the_simple_parser(self):
+        with tempfile.TemporaryDirectory() as td:
+            scripts = os.path.join(td, ".venv", "Scripts")
+            os.makedirs(scripts)
+            with open(os.path.join(scripts, "python.exe"), "wb") as handle:
+                handle.write(b"MZ")
+            command = r'python -c "print(\"quoted\")"'
+
+            self.assertEqual(
+                server.normalize_attached_python_command(command, td),
+                command)
+
+    def test_legacy_uv_cache_command_is_repaired_after_attach_marker_is_cleared(self):
+        with tempfile.TemporaryDirectory() as project_dir, \
+                tempfile.TemporaryDirectory() as config_dir:
+            scripts = os.path.join(project_dir, ".venv", "Scripts")
+            os.makedirs(scripts)
+            venv_python = os.path.join(scripts, "python.exe")
+            with open(venv_python, "wb") as handle:
+                handle.write(b"MZ")
+            config_path = os.path.join(config_dir, "config.json")
+            cfg = server.Config(config_path)
+            old_command = (
+                r"C:\Users\example\AppData\Roaming\uv\python\cpython-3.12-windows-x86_64-none\python.exe "
+                r"-m uvicorn dashboard.app:app --host 127.0.0.1 --port 8765")
+            cfg.update(lambda data: data["apps"].append({
+                "id": "legacy-card", "name": "study-planner",
+                "command": old_command, "cwd": project_dir, "port": 8765,
+                "attached": False,
+            }))
+
+            self.assertTrue(server.repair_legacy_app_commands(cfg))
+            saved = server.find_app(cfg.snapshot(), "legacy-card")
+            tokens = server._simple_command_tokens(saved["command"])
+            self.assertEqual(os.path.normcase(tokens[0]),
+                             os.path.normcase(venv_python))
+            self.assertEqual(tokens[1:], [
+                "-m", "uvicorn", "dashboard.app:app", "--host", "127.0.0.1",
+                "--port", "8765"])
+
+    def test_legacy_repair_does_not_rewrite_unrelated_python_cards(self):
+        with tempfile.TemporaryDirectory() as project_dir, \
+                tempfile.TemporaryDirectory() as config_dir:
+            scripts = os.path.join(project_dir, ".venv", "Scripts")
+            os.makedirs(scripts)
+            with open(os.path.join(scripts, "python.exe"), "wb") as handle:
+                handle.write(b"MZ")
+            config_path = os.path.join(config_dir, "config.json")
+            cfg = server.Config(config_path)
+            command = r"C:\Tools\Python\python.exe -m uvicorn app:app"
+            cfg.update(lambda data: data["apps"].append({
+                "id": "manual-card", "name": "manual",
+                "command": command, "cwd": project_dir, "port": 8000,
+                "attached": False,
+            }))
+
+            self.assertFalse(server.repair_legacy_app_commands(cfg))
+            self.assertEqual(
+                server.find_app(cfg.snapshot(), "manual-card")["command"],
+                command)
+
     def test_selected_python_script_with_spaces_is_checked(self):
         with tempfile.TemporaryDirectory() as td:
             folder = os.path.join(td, "script folder")
@@ -168,6 +256,35 @@ class WindowsScriptCommandTests(unittest.TestCase):
                     target, _, relative = server._script_target(tokens, td)
                     self.assertEqual(os.path.normcase(target), os.path.normcase(path))
                     self.assertFalse(relative)
+
+    def test_plain_text_file_is_not_treated_as_windows_executable(self):
+        with tempfile.TemporaryDirectory() as td:
+            for name in ("run.txt", "fake.exe"):
+                with self.subTest(name=name):
+                    path = os.path.join(td, name)
+                    with open(path, "w", encoding="utf-8") as handle:
+                        handle.write("this is ordinary text\n")
+                    health = server.inspect_app_health(
+                        {"command": path, "cwd": td})
+                    self.assertTrue(health["blocking"])
+                    self.assertEqual(health["issues"][0]["kind"],
+                                     "script-not-executable")
+
+    def test_selected_python_script_prefers_project_venv(self):
+        with tempfile.TemporaryDirectory() as td:
+            scripts = os.path.join(td, ".venv", "Scripts")
+            os.makedirs(scripts)
+            python = os.path.join(scripts, "python.exe")
+            write_fake_pe(python)
+            path = os.path.join(td, "job.py")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("print('ok')\n")
+
+            command = server.command_for_script(path, td)
+            tokens = server._simple_command_tokens(command)
+
+        self.assertEqual(os.path.normcase(tokens[0]), os.path.normcase(python))
+        self.assertEqual(tokens[1:], [path])
 
     def test_windows_dynamic_commands_remain_unknown(self):
         self.assertIsNone(server._simple_command_tokens("python %SCRIPT%"))
@@ -373,14 +490,196 @@ class ProjectDetectionTests(unittest.TestCase):
             result, error = server.detect_project(td)
 
         self.assertIsNone(error)
-        self.assertEqual(result["candidates"], [
-            {"command": "hexo s", "label": "Hexo 本地服务",
-             "source": "Hexo 项目结构", "port": 4000,
-             "kind": "service", "detail": "等同于 hexo server"},
-            {"command": "hexo cl", "label": "Hexo 清除缓存",
-             "source": "Hexo 项目结构", "port": None,
-             "kind": "task", "detail": "清除缓存和已生成文件，不启动服务"},
-        ])
+        self.assertEqual(
+            [{key: candidate[key] for key in (
+                "command", "label", "source", "port", "kind", "detail")}
+             for candidate in result["candidates"]],
+            [
+                {"command": "hexo s", "label": "Hexo 本地服务",
+                 "source": "Hexo 项目结构", "port": 4000,
+                 "kind": "service", "detail": "等同于 hexo server"},
+                {"command": "hexo cl", "label": "Hexo 清除缓存",
+                 "source": "Hexo 项目结构", "port": None,
+                 "kind": "task", "detail": "清除缓存和已生成文件，不启动服务"},
+            ])
+        for candidate in result["candidates"]:
+            self.assertIn("available", candidate)
+            if candidate["available"]:
+                self.assertEqual(candidate["launchSpec"]["mode"], "exec")
+            else:
+                self.assertTrue(candidate["unavailableReason"])
+
+    def test_python_project_candidate_uses_local_virtualenv(self):
+        with tempfile.TemporaryDirectory() as td:
+            scripts = os.path.join(td, "venv", "Scripts")
+            os.makedirs(scripts)
+            python = os.path.join(scripts, "python.exe")
+            write_fake_pe(python)
+            with open(os.path.join(td, "manage.py"), "w", encoding="utf-8") as f:
+                f.write("# django entry point\n")
+
+            result, error = server.detect_project(td)
+
+        self.assertIsNone(error)
+        candidate = result["candidates"][0]
+        self.assertTrue(candidate["available"])
+        self.assertEqual(candidate["launchSpec"]["mode"], "exec")
+        self.assertEqual(os.path.normcase(candidate["launchSpec"]["executable"]),
+                         os.path.normcase(python))
+        self.assertEqual(candidate["launchSpec"]["args"],
+                         ["manage.py", "runserver"])
+
+    def test_missing_uv_runtime_marks_candidate_unavailable(self):
+        with tempfile.TemporaryDirectory() as td:
+            with open(os.path.join(td, "pyproject.toml"), "w", encoding="utf-8") as f:
+                f.write('[project]\nname = "demo"\n')
+            with open(os.path.join(td, "uv.lock"), "w", encoding="utf-8") as f:
+                f.write("")
+            with open(os.path.join(td, "main.py"), "w", encoding="utf-8") as f:
+                f.write("from fastapi import FastAPI\n")
+
+            with mock.patch.object(server.shutil, "which", return_value=None):
+                result, error = server.detect_project(td)
+
+        self.assertIsNone(error)
+        candidate = result["candidates"][0]
+        self.assertFalse(candidate["available"])
+        self.assertNotIn("launchSpec", candidate)
+        self.assertIn("uv", candidate["unavailableReason"].lower())
+
+    def test_missing_poetry_runtime_marks_candidate_unavailable(self):
+        with tempfile.TemporaryDirectory() as td:
+            with open(os.path.join(td, "pyproject.toml"), "w", encoding="utf-8") as f:
+                f.write('[tool.poetry]\nname = "demo"\n')
+            with open(os.path.join(td, "poetry.lock"), "w", encoding="utf-8") as f:
+                f.write("")
+            with open(os.path.join(td, "manage.py"), "w", encoding="utf-8") as f:
+                f.write("# django entry point\n")
+
+            with mock.patch.object(server.shutil, "which", return_value=None):
+                result, error = server.detect_project(td)
+
+        self.assertIsNone(error)
+        candidate = result["candidates"][0]
+        self.assertFalse(candidate["available"])
+        self.assertNotIn("launchSpec", candidate)
+        self.assertIn("poetry", candidate["unavailableReason"].lower())
+
+    def test_uv_lock_resolves_to_absolute_structured_runner(self):
+        with tempfile.TemporaryDirectory() as td:
+            with open(os.path.join(td, "pyproject.toml"), "w", encoding="utf-8") as f:
+                f.write('[project]\nname = "demo"\n')
+            with open(os.path.join(td, "uv.lock"), "w", encoding="utf-8") as f:
+                f.write("")
+            with open(os.path.join(td, "main.py"), "w", encoding="utf-8") as f:
+                f.write("from fastapi import FastAPI\n")
+            uv = os.path.join(td, "uv.exe")
+            write_fake_pe(uv)
+
+            with mock.patch.object(server.shutil, "which", return_value=uv):
+                result, error = server.detect_project(td)
+
+        self.assertIsNone(error)
+        candidate = result["candidates"][0]
+        self.assertTrue(candidate["available"])
+        self.assertEqual(candidate["launchSpec"]["mode"], "exec")
+        self.assertEqual(candidate["launchSpec"]["executable"], uv)
+        self.assertEqual(candidate["launchSpec"]["args"], [
+            "run", "uvicorn", "main:app", "--reload"])
+
+    def test_poetry_lock_resolves_cmd_runner_structurally(self):
+        with tempfile.TemporaryDirectory() as td:
+            with open(os.path.join(td, "pyproject.toml"), "w", encoding="utf-8") as f:
+                f.write('[tool.poetry]\nname = "demo"\n')
+            with open(os.path.join(td, "poetry.lock"), "w", encoding="utf-8") as f:
+                f.write("")
+            with open(os.path.join(td, "manage.py"), "w", encoding="utf-8") as f:
+                f.write("# django entry point\n")
+            poetry = os.path.join(td, "poetry.cmd")
+            with open(poetry, "w", encoding="utf-8") as f:
+                f.write("@echo off\n")
+            cmd_exe = server._resolve_runtime("cmd.exe")
+
+            def resolve(name, path=None):
+                if os.path.basename(name).casefold() == "poetry":
+                    return poetry
+                if os.path.basename(name).casefold() == "cmd.exe":
+                    return cmd_exe
+                return None
+
+            with mock.patch.object(server.shutil, "which", side_effect=resolve):
+                result, error = server.detect_project(td)
+
+        self.assertIsNone(error)
+        candidate = result["candidates"][0]
+        self.assertTrue(candidate["available"])
+        self.assertEqual(candidate["launchSpec"]["mode"], "cmd")
+        self.assertEqual(candidate["launchSpec"]["executable"], poetry)
+        self.assertEqual(candidate["launchSpec"]["args"], [
+            "run", "python", "manage.py", "runserver"])
+
+    def test_windows_batch_candidate_uses_absolute_cmd_launch_spec(self):
+        with tempfile.TemporaryDirectory() as td:
+            script = os.path.join(td, "start.bat")
+            with open(script, "w", encoding="utf-8") as f:
+                f.write("@echo off\n")
+
+            result, error = server.detect_project(td)
+
+        self.assertIsNone(error)
+        candidate = result["candidates"][0]
+        self.assertTrue(candidate["available"])
+        self.assertEqual(candidate["launchSpec"]["mode"], "cmd")
+        self.assertEqual(os.path.normcase(candidate["launchSpec"]["executable"]),
+                         os.path.normcase(script))
+        self.assertEqual(candidate["launchSpec"]["args"], [])
+        self.assertTrue(os.path.isabs(candidate["launchSpec"]["executable"]))
+
+    def test_powershell_candidate_uses_absolute_runtime(self):
+        with tempfile.TemporaryDirectory() as td:
+            script = os.path.join(td, "start.ps1")
+            with open(script, "w", encoding="utf-8") as f:
+                f.write("Write-Output ok\n")
+            powershell = os.path.join(td, "powershell.exe")
+            with mock.patch.object(server, "_powershell_executable",
+                                   return_value=powershell):
+                result, error = server.detect_project(td)
+
+        self.assertIsNone(error)
+        candidate = result["candidates"][0]
+        self.assertEqual(candidate["launchSpec"]["mode"], "powershell")
+        self.assertEqual(candidate["launchSpec"]["executable"], powershell)
+        self.assertEqual(candidate["launchSpec"]["args"], [
+            "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script])
+
+    def test_shell_script_is_hidden_without_bash_or_wsl(self):
+        with tempfile.TemporaryDirectory() as td:
+            with open(os.path.join(td, "start.sh"), "w", encoding="utf-8") as f:
+                f.write("#!/bin/sh\necho ok\n")
+            with mock.patch.object(server, "_bash_runtime",
+                                   return_value=(None, None)):
+                result, error = server.detect_project(td)
+
+        self.assertIsNone(error)
+        self.assertEqual(result["candidates"], [])
+
+    def test_shell_script_uses_wsl_when_available(self):
+        with tempfile.TemporaryDirectory() as td:
+            script = os.path.join(td, "start.sh")
+            with open(script, "w", encoding="utf-8") as f:
+                f.write("#!/bin/sh\necho ok\n")
+            wsl = r"C:\Windows\System32\wsl.exe"
+            with mock.patch.object(server, "_bash_runtime",
+                                   return_value=(wsl, "wsl")):
+                result, error = server.detect_project(td)
+
+        self.assertIsNone(error)
+        candidate = result["candidates"][0]
+        self.assertTrue(candidate["available"])
+        self.assertEqual(candidate["launchSpec"]["mode"], "exec")
+        self.assertEqual(candidate["launchSpec"]["executable"], wsl)
+        self.assertEqual(candidate["launchSpec"]["args"],
+                         ["bash", "--", script])
 
     def test_hexo_server_script_is_not_duplicated(self):
         with tempfile.TemporaryDirectory() as td:
@@ -449,7 +748,7 @@ class ConfigTests(unittest.TestCase):
                 migrated = json.load(f)
             with open(path + ".bak", "r", encoding="utf-8") as f:
                 previous = json.load(f)
-            self.assertEqual(migrated["schemaVersion"], 1)
+            self.assertEqual(migrated["schemaVersion"], 2)
             self.assertNotIn("schemaVersion", previous)
 
             # 第二次读取已是当前 schema，不再改写备份。
@@ -459,6 +758,38 @@ class ConfigTests(unittest.TestCase):
             self.assertIsNone(cfg2.health_info()["migratedFromSchema"])
             with open(path + ".bak", "rb") as f:
                 self.assertEqual(f.read(), previous_bytes)
+
+    def test_v1_migration_preserves_command_and_separates_attached_identity(self):
+        original_command = 'python "folder with spaces\\app.py" --note "a&b%"'
+        raw = {
+            "schemaVersion": 1,
+            "apps": [
+                {"id": "managed01", "command": original_command,
+                 "cwd": r"D:\work\my project", "port": 8765,
+                 "attached": False, "runToken": None, "lastPid": None},
+                {"id": "monitor01", "command": original_command,
+                 "cwd": r"D:\work\my project", "port": 8765,
+                 "attached": True, "lastPid": 4242,
+                 "lastCreateTime": 123.5},
+            ],
+        }
+
+        migrated, source = server.migrate_config(raw)
+        managed, monitor = migrated["apps"]
+
+        self.assertEqual(source, 1)
+        self.assertEqual(migrated["schemaVersion"], 2)
+        self.assertEqual(managed["controlMode"], "managed")
+        self.assertEqual(managed["launchSpec"]["mode"], "legacy-shell")
+        self.assertEqual(managed["launchSpec"]["legacyCommand"], original_command)
+        self.assertEqual(managed["command"], original_command)
+        self.assertTrue(managed["launchConfigured"])
+        self.assertEqual(monitor["controlMode"], "monitor")
+        self.assertIsNone(monitor["launchSpec"])
+        self.assertFalse(monitor["launchConfigured"])
+        self.assertEqual(monitor["observation"]["pid"], 4242)
+        self.assertEqual(monitor["observation"]["createTime"], 123.5)
+        self.assertEqual(monitor["command"], original_command)
 
     def test_future_schema_is_not_silently_overwritten(self):
         with tempfile.TemporaryDirectory() as td:
@@ -631,24 +962,39 @@ class ProcessIdentityTests(unittest.TestCase):
             app = {"id": "deadbeef", "command": command, "cwd": td}
             ok, error, proc, pgid, token = server.start_app(app)
             self.assertTrue(ok, error)
-            tracked = dict(app, lastPid=proc.pid, lastPgid=pgid, runToken=token)
+            tracked = dict(
+                app, lastPid=proc.pid, lastPgid=pgid, runToken=token,
+                controlMode="managed",
+                runInstance={
+                    "runId": proc.run_id,
+                    "jobName": proc.job_name,
+                    "rootPid": proc.pid,
+                    "rootCreateTime": proc.creation_time,
+                    "anchorPid": proc.anchor_pid,
+                    "anchorCreateTime": proc.anchor_create_time,
+                    "processState": "alive",
+                },
+            )
             try:
                 time.sleep(0.3)
                 self.assertIn(proc.pid, server.managed_pids(tracked))
+                stale_instance = dict(tracked["runInstance"], runId="wrong")
                 self.assertEqual(
-                    server.managed_pids(dict(tracked, runToken="wrong")), [])
+                    server.managed_pids(dict(tracked, runInstance=stale_instance)), [])
                 target, error = server.resolve_app_stop_target(tracked)
                 self.assertIsNone(error, error)
                 stopped, error = server.signal_app_stop(target)
                 self.assertTrue(stopped, error)
                 proc.wait(timeout=5)
+                target["job"].close()
             finally:
                 if proc.poll() is None:
                     try:
-                        server.sysops.kill_process(proc.pid, force=True)
+                        proc.terminate(force=True)
                     except Exception:
                         pass
                     proc.wait(timeout=5)
+                proc.close()
 
 
     def test_verified_legacy_process_can_be_stopped_without_port_kill(self):
@@ -728,8 +1074,9 @@ class ProcessIdentityTests(unittest.TestCase):
         self.assertIsNone(target["lastPgid"])
         self.assertIsNone(target["runToken"])
         self.assertTrue(target["attached"])
-        self.assertEqual(target["cwd"], "/new")
-        self.assertTrue(info["cwdUpdated"])
+        self.assertEqual(target["cwd"], "/old")
+        self.assertEqual(target["observation"]["cwd"], "/new")
+        self.assertNotIn("cwdUpdated", info)
 
     def test_attached_listener_survives_child_pid_rotation_by_unique_cwd(self):
         app = {"id": "a", "port": 3000, "cwd": "/project",
@@ -1067,6 +1414,50 @@ class StateTests(unittest.TestCase):
         self.assertEqual(row["portOwner"]["cwd"], "/tmp/other")
         self.assertTrue(row["portOwner"]["currentUser"])
 
+    def test_monitor_observation_tracks_listener_pid_rotation(self):
+        with tempfile.TemporaryDirectory() as td:
+            app = {**server.Config.APP_DEFAULT, "id": "monitor01",
+                   "name": "外部服务", "command": "npm run dev",
+                   "cwd": td, "port": 3000, "attached": True,
+                   "controlMode": "monitor", "launchSpec": None,
+                   "launchConfigured": False, "lastPid": 111,
+                   "lastCreateTime": 1.0,
+                   "observation": {
+                       "pid": 111, "createTime": 1.0,
+                       "sid": server.SELF_UID, "cwd": td,
+                       "ports": [3000], "observedAt": 10,
+                   }}
+            listener_info = {
+                222: {"uid": server.SELF_UID, "ctime": 2.0,
+                      "comm": "node.exe", "args": "node server.js",
+                      "etime": 15},
+            }
+            repairs = []
+            with mock.patch.object(
+                    server, "managed_process_index",
+                    return_value=({"monitor01": []}, {}, {})), \
+                    mock.patch.object(server, "ps_snapshot",
+                                      return_value=listener_info), \
+                    mock.patch.object(server, "lsof_cwds",
+                                      return_value={222: td}):
+                row = server.build_apps(
+                    {"apps": [app]}, {(222, 3000)},
+                    observation_repairs=repairs)[0]
+
+            self.assertTrue(row["running"])
+            self.assertEqual(row["pid"], 222)
+            self.assertEqual(row["observation"]["pid"], 222)
+            self.assertEqual(row["observation"]["createTime"], 2.0)
+            self.assertTrue(repairs)
+
+            cfg_path = os.path.join(td, "config.json")
+            with open(cfg_path, "w", encoding="utf-8") as handle:
+                json.dump({**server.Config.DEFAULT, "apps": [app]}, handle)
+            cfg = server.Config(cfg_path)
+            self.assertTrue(server.repair_observation_identities(cfg, repairs))
+            saved = cfg.snapshot()["apps"][0]
+            self.assertEqual(saved["lastPid"], 222)
+            self.assertEqual(saved["observation"]["createTime"], 2.0)
     def test_duplicate_configured_ports_are_allowed_until_runtime(self):
         a = {**server.Config.APP_DEFAULT, "id": "a", "name": "A",
              "command": "x", "port": 8080}

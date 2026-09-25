@@ -104,6 +104,18 @@ let selectedGlyph = null;    // 选中的 Lucide 图标名
 let removeStoredIcon = false; // 仅在保存成功后删除，取消编辑不触碰后端
 let pendingAttach = null;     // 从服务监控添加时待认领的来源进程信息
 let detectingProject = false; // 认领流程必须等项目命令识别完成后再允许保存
+let selectedLaunchSpec = null;
+let selectedLaunchValues = null;
+
+function cloneLaunchSpec(spec) {
+  return spec && typeof spec === 'object'
+    ? JSON.parse(JSON.stringify(spec)) : null;
+}
+
+function isMonitorApp(app) {
+  return !!app && (app.controlMode === 'monitor'
+    || (app.attached && app.launchConfigured !== true));
+}
 
 export function buildGlyphGrid() {
   GLYPHS.forEach(g => {
@@ -208,31 +220,42 @@ function modalLifecycleChanged() {
   return fCmd.value.trim() !== (editingAppOriginal.command || '') ||
     (fCwd.value.trim() || null) !== (editingAppOriginal.cwd || null) ||
     currentPort !== (editingAppOriginal.port == null ? null : editingAppOriginal.port) ||
-    modalKind !== (editingAppOriginal.kind || 'service');
+    modalKind !== (editingAppOriginal.kind || 'service') ||
+    JSON.stringify(selectedLaunchSpec || editingAppOriginal.launchSpec || null) !==
+      JSON.stringify(editingAppOriginal.launchSpec || null);
 }
 
 function refreshEditSaveMode() {
+  const monitor = isMonitorApp(editingAppOriginal);
   const running = !!(editingAppOriginal && editingAppOriginal.running);
-  const needsStop = running && modalLifecycleChanged();
+  const needsStop = running && !monitor && modalLifecycleChanged();
   const isTask = modalKind === 'task';
   const stopVerb = isTask ? '中止任务' : '停止服务';
-  editRunningNotice.hidden = !running;
-  if (running) {
+  const needsMonitorNotice = !!pendingAttach || monitor;
+  editRunningNotice.hidden = !running && !needsMonitorNotice;
+  if (monitor) {
+    setText(editRunningNotice,
+      '此卡片仅监控外部进程。保存并确认启动配置后会转为托管卡片；当前外部进程不会因此被停止或重启。');
+  } else if (pendingAttach) {
+    setText(editRunningNotice,
+      '此进程会先以监控方式加入。保存并确认启动配置后才会转为托管卡片；当前进程不会因此被停止或重启。');
+  } else if (running) {
     setText(editRunningNotice, needsStop
       ? '修改内容已保留。请先' + stopVerb + '，再继续保存。'
       : (isTask ? '任务' : '服务') + '正在运行。可在这里先' + stopVerb +
         '，编辑面板不会关闭，当前填写内容也不会丢失。');
   }
   setText(appStopEdit, stopVerb);
-  appStopEdit.hidden = !running;
+  appStopEdit.hidden = !running || monitor;
   appStopEdit.disabled = appSaving;
   appSave.hidden = false;
-  const willAttach = !editingAppId && pendingAttach && modalKind === 'service'
-    && readPortValue() === pendingAttach.port;
-  setText(appSave, willAttach ? '保存并认领' : '保存');
-  appSave.disabled = appSaving || needsStop || (willAttach && detectingProject);
+  const willAttach = !editingAppId && !!pendingAttach;
+  const confirmingMonitor = monitor && !editingAppOriginal.launchConfigured;
+  setText(appSave, willAttach ? '加入监控并确认配置'
+    : confirmingMonitor ? '确认启动配置' : '保存');
+  appSave.disabled = appSaving || needsStop || ((willAttach || monitor) && detectingProject);
   appSave.title = needsStop ? '请先在当前面板' + stopVerb
-    : (willAttach && detectingProject ? '正在识别可靠的项目启动命令' : '');
+    : ((willAttach || monitor) && detectingProject ? '正在识别项目启动配置' : '');
 }
 
 function setModalKind(kind) {
@@ -264,6 +287,8 @@ fAutostart.addEventListener('click', () => {
 
 export function openAppModal(app, presetKind, focusAction = '') {
   editingAppId = app ? app.id : null;
+  selectedLaunchSpec = null;
+  selectedLaunchValues = null;
   pendingAttach = !editingAppId && app && Number.isInteger(app.attachPid)
     && app.attachPid > 0 && Number.isInteger(Number(app.port))
     ? {
@@ -277,6 +302,10 @@ export function openAppModal(app, presetKind, focusAction = '') {
     command: app.command || '', cwd: app.cwd || null,
     port: app.port == null ? null : app.port,
     kind: app.kind || 'service', running: !!app.running,
+    controlMode: app.controlMode || (app.attached ? 'monitor' : 'managed'),
+    launchConfigured: app.launchConfigured !== undefined
+      ? !!app.launchConfigured : !!app.launchSpec,
+    launchSpec: cloneLaunchSpec(app.launchSpec),
   } : null;
   resetDetection();
   clearPendingIcon();
@@ -312,6 +341,8 @@ export function closeAppModal() {
   selectedGlyph = null;
   removeStoredIcon = false;
   pendingAttach = null;
+  selectedLaunchSpec = null;
+  selectedLaunchValues = null;
 }
 
 function applyDetectedCandidate(candidate, option) {
@@ -331,6 +362,13 @@ function applyDetectedCandidate(candidate, option) {
     if (previousAutoPort && currentPort === previousAutoPort) fPort.value = '';
     detectedPortValue = null;
   }
+  selectedLaunchSpec = cloneLaunchSpec(candidate.launchSpec);
+  selectedLaunchValues = {
+    command: fCmd.value.trim(),
+    cwd: fCwd.value.trim() || null,
+    port: modalKind === 'task' ? null : readPortValue(),
+    kind: modalKind,
+  };
   detectList.querySelectorAll('.detect-option').forEach(node => {
     const active = node === option;
     node.classList.toggle('selected', active);
@@ -359,6 +397,8 @@ function renderDetection(result) {
   candidates.forEach((candidate, index) => {
     const option = el('button', 'detect-option');
     option.type = 'button';
+    const unavailable = candidate.available === false;
+    option.disabled = unavailable;
     option.setAttribute('aria-pressed', 'false');
     const head = el('span', 'detect-option-head');
     const title = el('span', 'detect-option-title');
@@ -382,7 +422,10 @@ function renderDetection(result) {
     const command = el('span', 'detect-command mono');
     command.textContent = candidate.command || '';
     const source = el('span', 'detect-source');
-    source.textContent = candidate.source || '';
+    source.textContent = unavailable
+      ? (candidate.unavailableReason || candidate.reason || candidate.detail ||
+        '此候选缺少可用运行时')
+      : (candidate.source || '');
     option.append(head, command, source);
     option.addEventListener('click', () => applyDetectedCandidate(candidate, option));
     detectList.appendChild(option);
@@ -413,16 +456,6 @@ async function detectProject() {
       renderIconPreview();
     }
     renderDetection(result);
-    if (pendingAttach && !editingAppId &&
-        fCmd.value.trim() === pendingAttach.command) {
-      const candidates = Array.isArray(result.candidates) ? result.candidates : [];
-      const index = candidates.findIndex(candidate =>
-        candidate.kind !== 'task' && Number(candidate.port) === pendingAttach.port);
-      if (index >= 0) {
-        const option = detectList.querySelectorAll('.detect-option')[index];
-        applyDetectedCandidate(candidates[index], option);
-      }
-    }
   } finally {
     if (requestSeq === detectRequestSeq) {
       detectingProject = false;
@@ -446,6 +479,11 @@ function clearFieldError(input) {
 
 async function stopEditingApp() {
   if (!editingAppId || !editingAppOriginal || !editingAppOriginal.running) return;
+  const latest = findApp(editingAppId);
+  if (isMonitorApp(editingAppOriginal) || isMonitorApp(latest)) {
+    toast('此卡片仅监控外部进程，不能从这里停止');
+    return;
+  }
   appSaving = true;
   refreshEditSaveMode();
   const isTask = modalKind === 'task';
@@ -472,8 +510,61 @@ function rememberSavedApp(app, id, body) {
     port: body.port,
     kind: body.kind,
     running: !!app.running,
+    controlMode: app.controlMode || (app.attached ? 'monitor' : 'managed'),
+    launchConfigured: app.launchConfigured !== undefined
+      ? !!app.launchConfigured : !!body.launchSpec,
+    launchSpec: cloneLaunchSpec(app.launchSpec || body.launchSpec),
   };
   setModalKind(body.kind);
+}
+
+function launchValuesMatch(values, body) {
+  return !!values && values.command === body.command &&
+    values.cwd === body.cwd && values.port === body.port &&
+    values.kind === body.kind;
+}
+
+async function resolveLaunchSpec(body, appId = null) {
+  let launchSpec = launchValuesMatch(selectedLaunchValues, body)
+    ? cloneLaunchSpec(selectedLaunchSpec) : null;
+  if (!launchSpec && editingAppOriginal &&
+      body.command === editingAppOriginal.command &&
+      body.cwd === editingAppOriginal.cwd &&
+      body.port === editingAppOriginal.port &&
+      body.kind === editingAppOriginal.kind) {
+    launchSpec = cloneLaunchSpec(editingAppOriginal.launchSpec);
+  }
+
+  if (!launchSpec && !appId) {
+    const resolved = await act(post('/api/launch/resolve', {
+      command: body.command, cwd: body.cwd, port: body.port, kind: body.kind,
+    }));
+    if (!resolved || resolved.ok === false || !resolved.launchSpec) return null;
+    body.launchSpec = cloneLaunchSpec(resolved.launchSpec);
+    if (typeof resolved.command === 'string' && resolved.command) {
+      body.command = resolved.command;
+      fCmd.value = resolved.command;
+    }
+    return resolved;
+  }
+
+  if (appId) {
+    const validated = await act(post('/api/apps/' + appId + '/validate-launch', {
+      ...(launchSpec ? { launchSpec } : {}),
+      command: body.command, cwd: body.cwd, port: body.port, kind: body.kind,
+    }));
+    if (!validated || validated.ok === false || !validated.launchSpec) return null;
+    body.launchSpec = cloneLaunchSpec(validated.launchSpec);
+    if (typeof validated.command === 'string' && validated.command) {
+      body.command = validated.command;
+      fCmd.value = validated.command;
+    }
+    return validated;
+  }
+
+  if (!launchSpec) return null;
+  body.launchSpec = launchSpec;
+  return { ok: true, launchSpec };
 }
 
 async function saveApp() {
@@ -484,6 +575,12 @@ async function saveApp() {
     fCmd, modalKind === 'task' ? '请填写执行命令' : '请填写启动命令');
   const port = modalKind === 'task' ? null : readPortValue();
   if (Number.isNaN(port)) return fieldError(fPort, '端口必须是 1–65535 之间的整数');
+  if (pendingAttach && modalKind !== 'service') {
+    return fieldError(fPort, '监控认领仅支持服务卡片');
+  }
+  if (pendingAttach && port !== pendingAttach.port) {
+    return fieldError(fPort, '认领服务的端口必须与当前监听端口一致');
+  }
   const body = {
     name,
     command,
@@ -500,9 +597,53 @@ async function saveApp() {
   appSaving = true;
   refreshEditSaveMode();
   try {
-    const app = editingAppId
-      ? await act(put('/api/apps/' + editingAppId, body))
-      : await act(post('/api/apps', body));
+    let resolved = null;
+    if (editingAppId) {
+      resolved = await resolveLaunchSpec(body, editingAppId);
+      if (!resolved) return;
+    } else {
+      resolved = await resolveLaunchSpec(body);
+      if (!resolved) return;
+    }
+
+    let app;
+    if (editingAppId) {
+      app = await act(put('/api/apps/' + editingAppId, body));
+    } else if (attachRequest) {
+      // /api/apps with attachPid establishes observation only. The explicit
+      // save action then validates and persists the user's confirmed spec.
+      const createBody = { ...body };
+      delete createBody.launchSpec;
+      app = await act(post('/api/apps', createBody));
+      if (app && app.ok !== false && app.id) {
+        const id = app.id;
+        pendingAttach = null;
+        rememberSavedApp({ ...app, controlMode: 'monitor', launchConfigured: false }, id,
+          { ...body, launchSpec: null });
+        const validated = await act(post('/api/apps/' + id + '/validate-launch', {
+          launchSpec: body.launchSpec,
+          command: body.command, cwd: body.cwd, port: body.port, kind: body.kind,
+        }));
+        if (!validated || validated.ok === false || !validated.launchSpec) {
+          toast('监控卡片已加入；启动配置未确认，可在此继续编辑后重试');
+          await window.__poll();
+          return;
+        }
+        body.launchSpec = cloneLaunchSpec(validated.launchSpec);
+        if (typeof validated.command === 'string' && validated.command) {
+          body.command = validated.command;
+          fCmd.value = validated.command;
+        }
+        app = await act(put('/api/apps/' + id, body));
+        if (!app || app.ok === false) {
+          toast('监控卡片已加入；启动配置尚未托管，可在此继续编辑后重试');
+          await window.__poll();
+          return;
+        }
+      }
+    } else {
+      app = await act(post('/api/apps', body));
+    }
     if (!app || app.ok === false) {
       if (app && app.requiresStop && editingAppOriginal) {
         editingAppOriginal.running = true;
@@ -511,16 +652,16 @@ async function saveApp() {
       return;
     }
     const id = app.id || editingAppId;
-    const attachSucceeded = !!(attachRequest && app.attached);
-    if (attachSucceeded && app.cwd) {
+    const monitorAdded = !!(attachRequest && id);
+    if (typeof app.command === 'string' && app.command) {
+      body.command = app.command;
+      fCmd.value = app.command;
+    }
+    if (typeof app.cwd === 'string' && app.cwd) {
       body.cwd = app.cwd;
       fCwd.value = app.cwd;
     }
-    rememberSavedApp(
-      attachSucceeded ? { ...app, running: true } : app,
-      id,
-      body,
-    );
+    rememberSavedApp(app, id, body);
     if (pendingIcon && id) {
       if (!controlTokenAvailable()) {
         toast(CONTROL_READONLY_TEXT);
@@ -558,7 +699,7 @@ async function saveApp() {
     }
     closeAppModal();
     await window.__poll();
-    if (attachSucceeded) toast('已加入启动台并认领正在运行的进程');
+    if (monitorAdded) toast('已加入启动台并确认启动配置；当前外部进程仍为观察对象');
   } finally {
     appSaving = false;
     refreshEditSaveMode();
@@ -573,17 +714,28 @@ export function initAppModal({ onAddService, onAddTask }) {
   appStopEdit.addEventListener('click', stopEditingApp);
   appModalMask.addEventListener('mousedown', e => { if (e.target === appModalMask) closeAppModal(); });
 
-  /* 选择批处理脚本：自动填命令 / 工作目录 / 名称 */
+  /* 选择脚本：由后端按 Windows 运行时解析结构化启动配置。 */
   btnPickScript.addEventListener('click', async () => {
     btnPickScript.disabled = true;
     try {
-      const r = await act(post('/api/pick', { what: 'script' }));
+      const r = await act(post('/api/pick', {
+        what: 'script', cwd: fCwd.value.trim() || null,
+        port: modalKind === 'task' ? null : readPortValue(),
+      }));
       if (!r || r.canceled || !r.path) return;  // 取消或失败均静默
       const p = r.path;
       fCmd.value = r.command || fallbackScriptCommand(p);
       const lastSep = Math.max(p.lastIndexOf('/'), p.lastIndexOf('\\'));
       const dir = lastSep >= 0 ? p.slice(0, lastSep) : '';
       if (dir && !fCwd.value.trim()) fCwd.value = dir;
+      selectedLaunchSpec = r.available === false
+        ? null : cloneLaunchSpec(r.launchSpec);
+      selectedLaunchValues = selectedLaunchSpec ? {
+        command: fCmd.value.trim(),
+        cwd: fCwd.value.trim() || null,
+        port: modalKind === 'task' ? null : readPortValue(),
+        kind: modalKind,
+      } : null;
       if (!fName.value.trim()) {
         const base = p.split(/[\\/]/).pop().replace(/\.(command|sh|bash|zsh|py)$/i, '');
         if (base) fName.value = base;
@@ -594,7 +746,9 @@ export function initAppModal({ onAddService, onAddTask }) {
         node.classList.remove('selected');
         node.setAttribute('aria-pressed', 'false');
       });
-      toast('已按脚本类型生成执行命令');
+      toast(r.available === false
+        ? (r.unavailableReason || '所需运行时不可用，请修改命令或安装运行时')
+        : '已按脚本类型生成启动配置');
     } finally {
       btnPickScript.disabled = false;
     }

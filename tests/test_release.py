@@ -195,6 +195,8 @@ class ProjectReleaseManifestTests(unittest.TestCase):
         }
         required = {
             "sysops.py",
+            "launch_spec.py",
+            "windows_runtime.py",
             "tray.py",
             "start.bat",
             "launcher_check.py",
