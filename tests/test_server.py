@@ -1096,9 +1096,110 @@ class StartAppCompensationTests(unittest.TestCase):
         self.assertIn("无法确认进程已终止", result["error"])
         proc.close.assert_called_once_with()
         app = server.find_app(cfg.snapshot(), "start-test")
-        # No token was persisted by the mock, so this scenario verifies the
-        # failure is surfaced; real persistence failures are covered above.
-        self.assertIsNone(app["runToken"])
+        self.assertEqual(app["runToken"], "run-test")
+        self.assertEqual(app["lastPid"], 4321)
+        # The test wrapper has no Job name; real Windows launches always
+        # provide one, while the token/PID remain the legacy recovery anchor.
+
+    def test_failed_persist_and_termination_retains_in_memory_recovery_identity(self):
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._config(td)
+            proc = mock.Mock(pid=4321, run_id="run-test",
+                             job_name="Local\\run-test", creation_time=12.5,
+                             anchor_pid=4322, anchor_create_time=12.6)
+            proc.poll.return_value = None
+            proc.members.return_value = [4321]
+            proc.terminate.return_value = (False, "access denied")
+            with mock.patch.object(server, "app_alive_sign", return_value=False), \
+                    mock.patch.object(server, "inspect_app_health",
+                                      return_value={"blocking": False}), \
+                    mock.patch.object(server, "scan_listeners", return_value=set()), \
+                    mock.patch.object(server, "start_app",
+                                      return_value=(True, None, proc, 4321,
+                                                    "run-test")), \
+                    mock.patch.object(server, "persist_started_app",
+                                      side_effect=OSError("disk full")), \
+                    mock.patch.object(server, "watch_app_exit") as watcher, \
+                    mock.patch.object(cfg, "update",
+                                      side_effect=OSError("read only")):
+                result = server.start_app_transaction(cfg, "start-test")
+
+            self.assertFalse(result["ok"])
+            self.assertIn("无法确认进程已终止", result["error"])
+            watcher.assert_called_once()
+            app = server.find_app(cfg.snapshot(), "start-test")
+            self.assertIsNone(app.get("runToken"))
+            self.assertEqual(server.app_identity_state(app), "alive")
+            recovery = server.UNPERSISTED_RUNS["start-test"]
+            self.assertEqual(recovery["identity"]["runToken"], "run-test")
+            self.assertEqual(
+                recovery["identity"]["runInstance"]["jobName"],
+                "Local\\run-test")
+            self.assertFalse(proc.close.called)
+            server._forget_unpersisted_run("start-test", "run-test", proc)
+
+    def test_failed_compensation_after_card_deletion_keeps_recovery_watcher(self):
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._config(td)
+            proc = mock.Mock(pid=4321, run_id="run-test",
+                             job_name="Local\\run-test", creation_time=12.5,
+                             anchor_pid=4322, anchor_create_time=12.6)
+            proc.poll.return_value = None
+            proc.members.return_value = [4321]
+            proc.terminate.return_value = (False, "access denied")
+
+            def delete_card_before_persist(_app):
+                cfg.update(lambda data: data["apps"].clear())
+                return True, None, proc, 4321, "run-test"
+
+            try:
+                with mock.patch.object(server, "app_alive_sign",
+                                       return_value=False), \
+                        mock.patch.object(server, "inspect_app_health",
+                                          return_value={"blocking": False}), \
+                        mock.patch.object(server, "scan_listeners",
+                                          return_value=set()), \
+                        mock.patch.object(server, "start_app",
+                                          side_effect=delete_card_before_persist), \
+                        mock.patch.object(server, "watch_app_exit") as watcher:
+                    result = server.start_app_transaction(cfg, "start-test")
+
+                self.assertFalse(result["ok"])
+                self.assertEqual(result["status"], 409)
+                watcher.assert_called_once()
+                recovery = server.UNPERSISTED_RUNS["start-test"]
+                self.assertEqual(recovery["token"], "run-test")
+                self.assertEqual(
+                    recovery["identity"]["runInstance"]["jobName"],
+                    "Local\\run-test")
+                self.assertFalse(proc.close.called)
+            finally:
+                server._forget_unpersisted_run("start-test", "run-test", proc)
+
+    def test_compensation_leaves_handles_to_active_exit_watcher(self):
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._config(td)
+            proc = mock.Mock(pid=4321, run_id="run-test")
+            proc.poll.return_value = None
+            proc.members.return_value = [4321]
+            proc.terminate.return_value = (False, "access denied")
+            watcher_key = ("start-test", "run-test")
+            with server.WATCHER_LOCK:
+                server.ACTIVE_EXIT_WATCHERS.add(watcher_key)
+            try:
+                with mock.patch.object(server.time, "monotonic",
+                                       side_effect=[0.0, 0.0, 10.0]), \
+                        mock.patch.object(server.time, "sleep"):
+                    result = server.abort_started_app(
+                        cfg, "start-test", proc, "run-test", "watcher failure")
+            finally:
+                with server.WATCHER_LOCK:
+                    server.ACTIVE_EXIT_WATCHERS.discard(watcher_key)
+
+        self.assertFalse(result["ok"])
+        self.assertIn("无法确认进程已终止", result["error"])
+        proc.terminate.assert_called_once_with(force=True)
+        proc.close.assert_not_called()
 
 
 class JobStopFailureTests(unittest.TestCase):
@@ -1433,6 +1534,27 @@ class ProcessLifecycleAndLaunchCanonicalizationTests(unittest.TestCase):
         # POSIX 语义：不校验 ctime（无该字段语义），正常命中
         self.assertEqual(server.legacy_managed_pid(app, **common), 4242)
 
+    def test_confirmed_attached_card_keeps_observation_boundary_when_spec_changes(self):
+        # Confirming a restart definition must not make an already-running
+        # externally claimed process disappear merely because the user chose a
+        # new project cwd or port for future managed launches.
+        app = {
+            "id": "a", "port": 9000, "cwd": "/new-project",
+            "kind": "service", "lastPid": 4242, "attached": True,
+            "controlMode": "managed", "runToken": None,
+            "observation": {
+                "pid": 4242, "createTime": 12.5, "sid": server.SELF_UID,
+                "cwd": "/old-project", "ports": [3000],
+            },
+            "launchConfigured": True,
+        }
+        common = {
+            "listeners": {(4242, 3000)},
+            "snap": {4242: {"uid": server.SELF_UID, "ctime": 12.5}},
+            "cwds": {4242: "/old-project"},
+        }
+        self.assertEqual(server.legacy_managed_pid(app, **common), 4242)
+
     def test_attached_replacement_pid_uses_unique_sid_cwd_match(self):
         app = {"id": "a", "port": 3000, "cwd": "/project",
                "kind": "service", "lastPid": 4242, "attached": True,
@@ -1577,6 +1699,156 @@ class ProcessLifecycleAndLaunchCanonicalizationTests(unittest.TestCase):
         self.assertIsNone(apps["feedface"]["lastExit"])
 
 
+class StaleRecoveryIdentityTests(unittest.TestCase):
+    def _config(self, directory):
+        path = os.path.join(directory, "config.json")
+        app = {
+            **server.Config.APP_DEFAULT,
+            "id": "stale-test",
+            "name": "stale recovery",
+            "command": "python -m http.server 8765",
+            "cwd": directory,
+            "port": 8765,
+            "controlMode": "managed",
+            "launchSpec": None,
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({**server.Config.DEFAULT, "apps": [app]}, f)
+        return server.Config(path)
+
+    def test_stale_recovery_token_cannot_clear_a_newer_persisted_run(self):
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._config(td)
+            def save_new_run(data):
+                app = server.find_app(data, "stale-test")
+                app["runToken"] = "run-new"
+                app["lastPid"] = 9876
+                app["runInstance"] = {
+                    "runId": "run-new", "jobName": "Local\\run-new",
+                    "processState": "alive",
+                }
+                return True
+            cfg.update(save_new_run)
+            old_proc = mock.Mock()
+            with server.RETAINED_RUN_JOBS_LOCK:
+                server.UNPERSISTED_RUNS["stale-test"] = {
+                    "token": "run-old", "proc": old_proc,
+                    "identity": {"runToken": "run-old"},
+                }
+            try:
+                self.assertFalse(server.clear_app_runtime(
+                    cfg, "stale-test", expected_token="run-old"))
+                current = server.find_app(cfg.snapshot(), "stale-test")
+                self.assertEqual(current["runToken"], "run-new")
+                self.assertEqual(current["lastPid"], 9876)
+            finally:
+                with server.RETAINED_RUN_JOBS_LOCK:
+                    server.UNPERSISTED_RUNS.pop("stale-test", None)
+
+    def test_stale_recovery_token_cannot_clear_tokenless_newer_instance(self):
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._config(td)
+
+            def save_partial_new_run(data):
+                app = server.find_app(data, "stale-test")
+                app["runToken"] = None
+                app["lastPid"] = 9876
+                app["runInstance"] = {
+                    "runId": "run-new",
+                    "jobName": "Local\\run-new",
+                    "processState": "alive",
+                }
+                return True
+
+            cfg.update(save_partial_new_run)
+            old_proc = mock.Mock()
+            with server.RETAINED_RUN_JOBS_LOCK:
+                server.UNPERSISTED_RUNS["stale-test"] = {
+                    "token": "run-old", "proc": old_proc,
+                    "identity": {"runToken": "run-old"},
+                }
+            try:
+                self.assertFalse(server.clear_app_runtime(
+                    cfg, "stale-test", expected_token="run-old"))
+                current = server.find_app(cfg.snapshot(), "stale-test")
+                self.assertIsNone(current["runToken"])
+                self.assertEqual(current["runInstance"]["runId"], "run-new")
+                self.assertEqual(current["lastPid"], 9876)
+            finally:
+                with server.RETAINED_RUN_JOBS_LOCK:
+                    server.UNPERSISTED_RUNS.pop("stale-test", None)
+
+    def test_stale_recovery_token_cannot_hydrate_tokenless_newer_instance(self):
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._config(td)
+
+            def save_partial_new_run(data):
+                app = server.find_app(data, "stale-test")
+                app["runToken"] = None
+                app["runInstance"] = {
+                    "runId": "run-new",
+                    "jobName": "Local\\run-new",
+                    "processState": "alive",
+                }
+                return True
+
+            cfg.update(save_partial_new_run)
+            old_proc = mock.Mock()
+            old_identity = {
+                "runToken": "run-old",
+                "lastPid": 1111,
+                "runInstance": {
+                    "runId": "run-old", "jobName": "Local\\run-old",
+                },
+            }
+            with server.RETAINED_RUN_JOBS_LOCK:
+                server.UNPERSISTED_RUNS["stale-test"] = {
+                    "token": "run-old", "proc": old_proc,
+                    "identity": old_identity,
+                }
+            try:
+                current = server.find_app(cfg.snapshot(), "stale-test")
+                self.assertIsNone(server._hydrate_unpersisted_run(current))
+                self.assertIsNone(current["runToken"])
+                self.assertEqual(current["runInstance"]["runId"], "run-new")
+            finally:
+                with server.RETAINED_RUN_JOBS_LOCK:
+                    server.UNPERSISTED_RUNS.pop("stale-test", None)
+
+    def test_persisted_new_run_retires_empty_old_recovery_record(self):
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._config(td)
+            old_proc = mock.Mock()
+            old_proc.members.return_value = []
+            old_proc.run_id = "run-old"
+            old_proc.job_name = "Local\\run-old"
+            old_proc.pid = 4321
+            old_proc.creation_time = 1.0
+            old_proc.anchor_pid = 4321
+            old_proc.anchor_create_time = 1.0
+            server._remember_unpersisted_run(
+                "stale-test", "run-old", old_proc,
+                {"runToken": "run-old",
+                 "runInstance": {"runId": "run-old",
+                                 "jobName": "Local\\run-old"}})
+            new_proc = mock.Mock(pid=9876, run_id="run-new",
+                                 job_name="Local\\run-new",
+                                 creation_time=2.0, anchor_pid=9876,
+                                 anchor_create_time=2.0)
+            try:
+                with mock.patch.object(server, "watch_app_exit"):
+                    self.assertTrue(server.persist_started_app(
+                        cfg, "stale-test", new_proc, 9876, "run-new"))
+                with server.RETAINED_RUN_JOBS_LOCK:
+                    self.assertNotIn("stale-test", server.UNPERSISTED_RUNS)
+                self.assertTrue(old_proc.close.called)
+                current = server.find_app(cfg.snapshot(), "stale-test")
+                self.assertEqual(current["runToken"], "run-new")
+            finally:
+                server._forget_unpersisted_run("stale-test", "run-old",
+                                               old_proc)
+
+
 class RunWatcherRecoveryTests(unittest.TestCase):
     class ReopenedProcess:
         def __init__(self, pid, result=0, gate=None):
@@ -1594,6 +1866,9 @@ class RunWatcherRecoveryTests(unittest.TestCase):
 
         def wait_for_empty(self):
             return None
+
+        def members(self):
+            return []
 
         def close(self):
             self.closed = True
@@ -1669,6 +1944,56 @@ class RunWatcherRecoveryTests(unittest.TestCase):
             self.assertEqual(cfg.snapshot()["apps"][0]["readinessState"], "ready")
         finally:
             gate.set()
+            td.cleanup()
+
+    def test_duplicate_exit_watcher_keeps_retained_replacement_open(self):
+        """A rejected watcher must not close a replacement keeper it owns."""
+        td, cfg, _ = self._config()
+        old = self.ReopenedProcess(4321)
+        replacement = self.ReopenedProcess(4321)
+        app = server.find_app(cfg.snapshot(), "recovery")
+        key = ("recovery", "restore-run")
+        try:
+            with server.WATCHER_LOCK:
+                server.ACTIVE_EXIT_WATCHERS.add(key)
+                server.ACTIVE_EXIT_PROCS[key] = old
+            server._remember_run_job(app, replacement, "repair")
+
+            self.assertIsNone(server.watch_app_exit(
+                cfg, "recovery", replacement, "restore-run"))
+            self.assertFalse(replacement.closed)
+            self.assertIs(server.RETAINED_RUN_JOBS[key][1], replacement)
+        finally:
+            server._forget_run_job(app, replacement)
+            with server.WATCHER_LOCK:
+                server.ACTIVE_EXIT_WATCHERS.discard(key)
+                server.ACTIVE_EXIT_PROCS.pop(key, None)
+            td.cleanup()
+
+    def test_retained_owner_is_returned_for_future_watcher_registration(self):
+        td, cfg, _ = self._config()
+        gate = threading.Event()
+        canonical = self.ReopenedProcess(4321, gate=gate)
+        incoming = self.ReopenedProcess(4321, gate=gate)
+        app = server.find_app(cfg.snapshot(), "recovery")
+        try:
+            server._remember_run_job(app, canonical, "repair")
+            owner = server._remember_run_job(app, incoming, "repair")
+            self.assertIs(owner, canonical)
+            self.assertTrue(incoming.closed)
+
+            thread = server.watch_app_exit(
+                cfg, "recovery", owner, "restore-run")
+            self.assertTrue(self._wait_for(lambda: canonical.wait_calls == 1))
+            self.assertEqual(incoming.wait_calls, 0)
+            gate.set()
+            thread.join(timeout=2)
+            self.assertFalse(thread.is_alive())
+            self.assertTrue(canonical.closed)
+        finally:
+            gate.set()
+            server._forget_run_job(app, canonical)
+            server._forget_run_job(app, incoming)
             td.cleanup()
 
     def test_restarted_task_exit_is_recorded_with_persisted_start_time(self):

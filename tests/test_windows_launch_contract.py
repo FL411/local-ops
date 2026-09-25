@@ -224,6 +224,37 @@ class WindowsLaunchContractTests(unittest.TestCase):
         saved = server.find_app(self.h.cfg.snapshot(), "a1b2c3d4")
         self.assertEqual(saved["controlMode"], "monitor")
 
+    def test_confirming_monitor_keeps_external_identity_when_launch_fields_change(self):
+        with tempfile.TemporaryDirectory() as new_cwd:
+            app = monitor_app()
+            old_observation = dict(app["observation"])
+            self._store(app)
+            candidate = structured_spec(cwd=new_cwd, port=9000)
+            status, body = self.h.request(
+                "PUT", "/api/apps/a1b2c3d4", {
+                    "name": app["name"],
+                    "command": command_from_launch_spec(candidate),
+                    "cwd": new_cwd,
+                    "port": 9000,
+                    "kind": "service",
+                    "launchSpec": candidate,
+                })
+
+            self.assertEqual(status, 200, body)
+            saved = server.find_app(self.h.cfg.snapshot(), "a1b2c3d4")
+            self.assertEqual(saved["controlMode"], "managed")
+            self.assertTrue(saved["attached"])
+            self.assertEqual(saved["observation"], old_observation)
+            self.assertEqual(saved["lastPid"], old_observation["pid"])
+            self.assertEqual(saved["port"], 9000)
+
+            self.assertEqual(server.legacy_managed_pid(
+                saved,
+                listeners={(4242, 8765)},
+                snap={4242: {"uid": server.SELF_UID,
+                             "ctime": old_observation["createTime"]}},
+                cwds={4242: old_observation["cwd"]}), 4242)
+
     def test_health_checks_structured_executable_not_compatibility_text(self):
         with tempfile.TemporaryDirectory() as cwd:
             missing = os.path.join(cwd, "missing", "python.exe")

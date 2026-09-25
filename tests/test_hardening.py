@@ -144,6 +144,13 @@ class HttpSecurityTests(unittest.TestCase):
 
 
 class LauncherCapabilityTokenTests(unittest.TestCase):
+    def test_launcher_lock_wait_covers_default_retry_window(self):
+        required = (launcher_check.LAUNCH_ATTEMPTS *
+                    (launcher_check.LAUNCH_WAIT_SEC +
+                     launcher_check.CONFIG_WAIT_SEC))
+        self.assertGreaterEqual(launcher_check.LAUNCH_LOCK_WAIT_SEC,
+                                required)
+
     def test_open_uses_fragment_token_and_restart_uses_header(self):
         token = "a" * 43
         with mock.patch.object(launcher_check, "_read_control_token",

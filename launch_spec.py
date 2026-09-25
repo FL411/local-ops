@@ -125,7 +125,12 @@ def _normalize_readiness(value, port):
     if not isinstance(probe_type, str) or probe_type not in READINESS_TYPES:
         raise LaunchSpecError("readiness.type 必须是 tcp、http 或 none")
     host = value.get("host", "localhost")
-    if not isinstance(host, str) or "\x00" in host or not host.strip():
+    # Validate UTF-16 representability before the value can reach JSON
+    # persistence or socket/URL APIs.  In particular this catches lone
+    # surrogates even for ``type: none`` and absolute HTTP URLs where the
+    # normal loopback check may otherwise be skipped by an earlier failure.
+    host = _string(host, "readiness.host")
+    if not host.strip():
         raise LaunchSpecError("readiness.host 必须是有效字符串")
     host = host.strip()
     if host.startswith("[") and host.endswith("]"):

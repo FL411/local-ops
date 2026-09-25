@@ -37,7 +37,14 @@ STATE_TIMEOUT = 5.0
 LAUNCH_ATTEMPTS = 2
 LAUNCH_WAIT_SEC = 15.0
 CONFIG_WAIT_SEC = 5.0
-LAUNCH_LOCK_WAIT_SEC = 20.0
+# The launcher lock covers the complete check/start/retry transaction.  A
+# candidate can consume one readiness window plus one config read per retry;
+# leave additional room for the final health probe before a concurrent
+# double-click gives up and reports a false launch failure.
+LAUNCH_LOCK_WAIT_SEC = max(
+    60.0,
+    LAUNCH_ATTEMPTS * (LAUNCH_WAIT_SEC + CONFIG_WAIT_SEC) + 5.0,
+)
 CONTROL_TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{32,128}\Z")
 
 

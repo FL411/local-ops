@@ -142,10 +142,12 @@ MANUAL_STOP_LOCK = threading.RLock()
 MANUAL_STOP_TOKENS = set()
 WATCHER_LOCK = threading.RLock()
 ACTIVE_EXIT_WATCHERS = set()
+ACTIVE_EXIT_PROCS = {}
 ACTIVE_READINESS_WATCHERS = set()
 RUN_JOB_REOPEN_FAILED = object()
 RETAINED_RUN_JOBS_LOCK = threading.RLock()
 RETAINED_RUN_JOBS = {}
+UNPERSISTED_RUNS = {}
 RUN_JOB_ACCESS_LOCK = threading.RLock()
 
 
@@ -691,10 +693,17 @@ class Config:
                 if key in item:
                     app[key] = item[key]
             try:
+                saved_mode = item.get("controlMode")
                 app["controlMode"] = (
-                    "monitor" if item.get("controlMode") == "monitor"
-                    or item.get("attached") else "managed")
-                app["attached"] = app["controlMode"] == "monitor"
+                    saved_mode if saved_mode in ("managed", "monitor")
+                    else "monitor" if item.get("attached") else "managed")
+                # A card may have a confirmed LaunchSpec while retaining the
+                # identity of the external process it originally claimed.
+                # Explicit controlMode therefore outranks the legacy attached
+                # inference, and attached itself remains independent metadata.
+                app["attached"] = (
+                    True if app["controlMode"] == "monitor"
+                    else bool(item.get("attached")))
                 if app["controlMode"] == "monitor":
                     if isinstance(app.get("launchSpec"), dict):
                         app["launchSpec"] = normalize_launch_spec(
@@ -727,7 +736,11 @@ class Config:
                     app["command"] = command_from_launch_spec(app["launchSpec"])
                     app["launchConfigured"] = is_launch_configured(
                         app["launchSpec"])
-                    app["observation"] = None
+                    if app.get("attached"):
+                        if not isinstance(app.get("observation"), dict):
+                            app["observation"] = None
+                    else:
+                        app["observation"] = None
                     if not isinstance(app["runInstance"], dict):
                         app["runInstance"] = None
                 if app.get("readinessState") not in (
@@ -1414,16 +1427,36 @@ def _run_job_key(app):
 def _remember_run_job(app, proc, mode="repair"):
     key = _run_job_key(app)
     if key is None or proc is None:
-        return
+        return None
+    discard = None
+    owner = proc
     with RETAINED_RUN_JOBS_LOCK:
         previous = RETAINED_RUN_JOBS.get(key)
         if previous and previous[1] is not proc:
+            # Keep one canonical owner.  The incoming handle is not silently
+            # leaked: close it unless it is the process currently owned by the
+            # exit watcher (which will close it in its own finally block).
+            LOG.warning("应用 %s 出现重复的保留 Job Object，沿用现有句柄",
+                        app.get("id"))
+            discard = proc
+            owner = previous[1]
+        else:
+            RETAINED_RUN_JOBS[key] = (mode, proc)
+    if discard is not None:
+        with WATCHER_LOCK:
+            watcher_proc = ACTIVE_EXIT_PROCS.get(key)
+        if watcher_proc is discard:
+            # The caller may immediately register this same process as the
+            # exit watcher. Return it as the owner even though an older
+            # retained handle remains as a cleanup fallback.
+            owner = discard
+        else:
             try:
-                previous[1].close()
+                discard.close()
             except Exception:
-                LOG.exception("关闭重复保留的 Job Object 句柄失败（应用 %s）",
+                LOG.exception("关闭重复的 Job Object 句柄失败（应用 %s）",
                               app.get("id"))
-        RETAINED_RUN_JOBS[key] = (mode, proc)
+    return owner
 
 
 def _forget_run_job(app, proc=None, *, close=True):
@@ -1436,6 +1469,13 @@ def _forget_run_job(app, proc=None, *, close=True):
         if current and (proc is None or current[1] is proc):
             retained = RETAINED_RUN_JOBS.pop(key)[1]
     if close and retained is not None:
+        with WATCHER_LOCK:
+            watcher_proc = ACTIVE_EXIT_PROCS.get(key)
+        if watcher_proc is retained:
+            # The exit watcher owns this handle and will close it after its
+            # wait and config update. Never block a state/HTTP caller on that
+            # wait while holding RUN_JOB_ACCESS_LOCK.
+            return
         try:
             retained.close()
         except Exception:
@@ -1464,6 +1504,91 @@ def _run_job_is_retained(app, proc):
     return bool(current and current[1] is proc)
 
 
+def _remember_unpersisted_run(app_id, token, proc, identity):
+    """Keep a started Job controllable if config persistence is unavailable.
+
+    The normal recovery path is still the schema v2 runInstance on disk. This
+    in-memory record is the last safety net for transient disk/write failures;
+    it lets this console process report and stop the exact Job until the exit
+    watcher drains it.
+    """
+    if not app_id or not token or proc is None:
+        return None
+    owner = proc
+    instance = identity.get("runInstance")
+    if isinstance(instance, dict):
+        owner = _remember_run_job(
+            {"id": app_id, "runInstance": instance}, proc, "unpersisted")
+        owner = owner or proc
+    with RETAINED_RUN_JOBS_LOCK:
+        UNPERSISTED_RUNS[app_id] = {
+            "token": token,
+            "proc": owner,
+            "identity": dict(identity),
+        }
+    return owner
+
+
+def _recovery_can_fill_identity(app, token):
+    """Allow recovery to fill missing identity without replacing a newer run."""
+    if not isinstance(app, dict) or app.get("runToken") not in (None, token):
+        return False
+    instance = app.get("runInstance")
+    if not isinstance(instance, dict):
+        return True
+    return instance.get("runId") in (None, token)
+
+
+def _durable_identity_matches(app, token):
+    """Return whether both persisted run identity fields describe ``token``."""
+    if not isinstance(app, dict) or app.get("runToken") != token:
+        return False
+    instance = app.get("runInstance")
+    return (not isinstance(instance, dict)
+            or not instance.get("runId")
+            or instance.get("runId") == token)
+
+
+def _hydrate_unpersisted_run(app):
+    """Overlay an unpersisted live run onto a config snapshot, if still current."""
+    if not isinstance(app, dict):
+        return None
+    app_id = app.get("id")
+    with RETAINED_RUN_JOBS_LOCK:
+        recovery = UNPERSISTED_RUNS.get(app_id)
+        if recovery:
+            recovery = dict(recovery)
+            recovery["identity"] = dict(recovery.get("identity") or {})
+    if not recovery:
+        return None
+    if not _recovery_can_fill_identity(app, recovery.get("token")):
+        return None
+    app.update(recovery["identity"])
+    return recovery.get("proc")
+
+
+def _is_unpersisted_run(app, proc):
+    instance = app.get("runInstance") if isinstance(app, dict) else None
+    run_id = instance.get("runId") if isinstance(instance, dict) else None
+    if not run_id:
+        return False
+    with RETAINED_RUN_JOBS_LOCK:
+        recovery = UNPERSISTED_RUNS.get(app.get("id"))
+    return bool(recovery and recovery.get("token") == run_id
+                and recovery.get("proc") is proc)
+
+
+def _forget_unpersisted_run(app_id, token, proc=None):
+    with RETAINED_RUN_JOBS_LOCK:
+        recovery = UNPERSISTED_RUNS.get(app_id)
+        if (not recovery or recovery.get("token") != token
+                or (proc is not None and recovery.get("proc") is not proc)):
+            return
+        UNPERSISTED_RUNS.pop(app_id, None)
+    _forget_run_job(
+        {"id": app_id, "runInstance": {"runId": token}}, proc)
+
+
 def _sweep_retained_run_jobs():
     """Release retained Job handles and keepers once their process trees drain.
 
@@ -1475,12 +1600,20 @@ def _sweep_retained_run_jobs():
     with RUN_JOB_ACCESS_LOCK:
         with RETAINED_RUN_JOBS_LOCK:
             retained = list(RETAINED_RUN_JOBS.items())
-        for (app_id, run_id), (_, proc) in retained:
+        for (app_id, run_id), (mode, proc) in retained:
+            if mode == "unpersisted":
+                with WATCHER_LOCK:
+                    watcher_active = (app_id, run_id) in ACTIVE_EXIT_WATCHERS
+                if watcher_active:
+                    continue
             try:
                 if proc.members():
                     continue
             except Exception as exc:
                 LOG.debug("应用 %s 的保留 Job 仍待清理: %s", app_id, exc)
+                continue
+            if mode == "unpersisted":
+                _forget_unpersisted_run(app_id, run_id, proc)
                 continue
             _forget_run_job(
                 {"id": app_id, "runInstance": {"runId": run_id}}, proc)
@@ -1514,6 +1647,14 @@ def _is_anchor_cleanup_failure(exc):
 
 def _open_run_job_unlocked(app):
     """Reopen this user's named Job Object for a structured run instance."""
+    recovered = _hydrate_unpersisted_run(app)
+    if recovered is not None:
+        if getattr(recovered, "_closed", False):
+            _forget_unpersisted_run(
+                app.get("id"), (app.get("runInstance") or {}).get("runId"),
+                recovered)
+            return None
+        return recovered
     key = _run_job_key(app)
     # A retained cleanup handle must be retried even after the watcher has
     # marked the run exited. Otherwise the exit-state guard would strand the
@@ -1564,8 +1705,17 @@ def _open_run_job_unlocked(app):
             root_create_time=instance.get("rootCreateTime"), sid=SELF_UID,
             anchor_pid=instance.get("anchorPid"),
             anchor_create_time=instance.get("anchorCreateTime"))
-        if key is not None and 'retained' in locals() and retained:
-            _forget_run_job(app, retained[1])
+        previous_proc = (retained[1]
+                         if key is not None and 'retained' in locals()
+                         and retained else None)
+        if previous_proc is not None and previous_proc is not proc:
+            # Access is serialized by RUN_JOB_ACCESS_LOCK. Close the stale
+            # keeper first, then retain the replacement before any caller can
+            # release it (notably start_app_transaction's duplicate-start
+            # cleanup path).
+            _forget_run_job(app, previous_proc)
+        if proc is not None and proc is not previous_proc:
+            proc = _remember_run_job(app, proc, "repair") or proc
         return proc
     except windows_runtime.JobAnchorCleanupError as exc:
         cleanup = getattr(exc, "managed_process", None)
@@ -1591,7 +1741,7 @@ def observed_process_pid(app, listeners=None, snap=None, cwds=None):
     if app.get("controlMode") != "monitor":
         return None
     observation = app.get("observation")
-    port = app.get("port")
+    port = observation_port(observation) or app.get("port")
     cwd = (observation.get("cwd") if isinstance(observation, dict) else None)
     if not isinstance(port, int) or port <= 0 or not cwd:
         return None
@@ -1612,6 +1762,10 @@ def observed_process_pid(app, listeners=None, snap=None, cwds=None):
     for pid in sorted(pids):
         info = snap.get(pid, {})
         if not is_current_user(info.get("uid")):
+            continue
+        expected_sid = (observation.get("sid")
+                        if isinstance(observation, dict) else None)
+        if expected_sid and info.get("uid") != expected_sid:
             continue
         if pid == expected_pid and expected_ctime is not None:
             current_ctime = info.get("ctime")
@@ -1747,9 +1901,19 @@ def legacy_managed_pid(app, listeners=None, snap=None, cwds=None):
     """
     if app.get("controlMode") == "monitor" or app.get("runToken"):
         return None
-    recorded_pid = app.get("lastPid")
-    port = app.get("port")
-    expected_cwd = app.get("cwd")
+    # A claimed external process keeps its observation identity when the user
+    # later confirms a LaunchSpec. The launch definition may intentionally be
+    # edited to a different cwd/port, but that must not rewrite the boundary
+    # used to recognize the already-running process.
+    observation = attached_observation(app)
+    recorded_pid = (observation.get("pid") if observation else
+                    app.get("lastPid"))
+    port = (observation_port(observation) if observation else None) or app.get("port")
+    expected_cwd = ((observation.get("cwd") if observation else None)
+                    or app.get("cwd"))
+    expected_sid = observation.get("sid") if observation else None
+    expected_ctime = (observation.get("createTime")
+                      if observation else app.get("lastCreateTime"))
     if (not isinstance(port, int) or port <= 0
             or not isinstance(expected_cwd, str) or not expected_cwd):
         return None
@@ -1771,9 +1935,14 @@ def legacy_managed_pid(app, listeners=None, snap=None, cwds=None):
     # PID 创建时间锚点（仅 Windows 记录）：只有仍在验证原 PID 时才比较。
     # 已认领服务允许监听子进程换 PID，新 PID 只要端口、SID、cwd 唯一匹配
     # 就应重新关联；把它拿去和旧 PID 的 ctime 比较会错误地全部排除。
-    expected_ctime = app.get("lastCreateTime")
     for pid in sorted(port_pids):
-        if not is_current_user(snap.get(pid, {}).get("uid")):
+        current_uid = snap.get(pid, {}).get("uid")
+        if not is_current_user(current_uid):
+            continue
+        # An observation is a complete external identity boundary.  Do not
+        # let a later listener under the same user (or a stale PID reuse)
+        # become the managed process after a LaunchSpec edit.
+        if expected_sid and current_uid != expected_sid:
             continue
         if (expected_ctime is not None
                 and pid == recorded_pid
@@ -2577,12 +2746,99 @@ def stop_pid_tree(pid, sig=signal.SIGTERM):
 def app_running(app, listeners=None):
     if app.get("controlMode") == "monitor":
         return False
-    return bool(managed_pids(app) or legacy_managed_pid(app, listeners))
+    return app_identity_state(app, listeners) == "alive"
+
+
+_DEFAULT_APP_RUNNING = app_running
+
+
+def app_identity_state(app, listeners=None):
+    """Return ``alive``, ``absent`` or conservative ``unknown``.
+
+    A failed Job reopen/member query is deliberately distinct from an empty
+    Job. Callers changing or deleting a card must reject ``unknown`` so an
+    active service cannot lose its only recovery identity.
+    """
+    if not isinstance(app, dict) or app.get("controlMode") == "monitor":
+        return "absent"
+    recovered = _hydrate_unpersisted_run(app)
+    if recovered is not None:
+        try:
+            members = recovered.members()
+        except Exception as exc:
+            LOG.warning("无法读取应用 %s 的保留 Job 状态: %s", app.get("id"), exc)
+            return "unknown"
+        return "alive" if members else "absent"
+    instance = app.get("runInstance")
+    if (isinstance(instance, dict) and instance.get("jobName")
+            and instance.get("processState") != "exited"):
+        with RUN_JOB_ACCESS_LOCK:
+            job = _open_run_job_unlocked(app)
+            if job is RUN_JOB_REOPEN_FAILED:
+                return "unknown"
+            if job is not None:
+                try:
+                    members = job.members()
+                except Exception as exc:
+                    if _is_anchor_cleanup_failure(exc):
+                        _remember_run_job(app, job, "empty-cleanup")
+                    else:
+                        _release_run_job_handle(app, job)
+                    LOG.warning("读取应用 %s 的 Job Object 状态失败: %s",
+                                app.get("id"), exc)
+                    return "unknown"
+                if members:
+                    if not _run_job_is_retained(app, job):
+                        _release_run_job_handle(app, job)
+                    return "alive"
+                if not _run_job_is_retained(app, job):
+                    _release_run_job_handle(app, job)
+                return "absent"
+            # A named Job that is not reopenable is not proof of an active
+            # process only when the persisted state is already exited.
+            return "absent"
+    try:
+        if managed_pids(app):
+            return "alive"
+        if legacy_managed_pid(app, listeners):
+            return "alive"
+    except Exception as exc:
+        LOG.warning("无法验证应用 %s 的旧版进程身份: %s", app.get("id"), exc)
+        return "unknown"
+    return "absent"
+
+
+def lifecycle_identity_state(app, listeners=None):
+    """Resolve a lifecycle state while retaining the legacy app_running seam.
+
+    Older integrations and tests override ``app_running`` to supply a verified
+    legacy identity.  Keep that override usable, but never let it override an
+    explicit ``unknown`` Job state, which must remain fail-closed.
+    """
+    state = app_identity_state(app, listeners)
+    # Preserve the historical injectable app_running seam used by API clients
+    # and tests without recursing through the production implementation.
+    if state == "absent" and app_running is not _DEFAULT_APP_RUNNING:
+        try:
+            if app_running(app, listeners):
+                return "alive"
+        except Exception:
+            return "unknown"
+    if state == "absent" and app_alive_sign is not _DEFAULT_APP_ALIVE_SIGN:
+        try:
+            if app_alive_sign(app, listeners):
+                return "alive"
+        except Exception:
+            return "unknown"
+    return state
 
 
 def app_alive_sign(app, listeners=None):
     """start/stop 的存活判断：新版 token 或严格校验通过的旧版身份。"""
     return app_running(app, listeners)
+
+
+_DEFAULT_APP_ALIVE_SIGN = app_alive_sign
 
 
 def build_launch_env(token, environ=None):
@@ -2708,11 +2964,23 @@ def watch_app_exit(cfg, app_id, proc, token, started_at=None):
     watcher_key = (app_id, token)
     with WATCHER_LOCK:
         if watcher_key in ACTIVE_EXIT_WATCHERS:
-            close = getattr(proc, "close", None)
-            if close:
-                close()
+            # A duplicate registration owns a different handle and can be
+            # closed immediately. The active watcher keeps its own handle
+            # until its finally block; never close that same object here. A
+            # reopened replacement may already be the retained handle for
+            # this run; closing it here would leave RETAINED_RUN_JOBS pointing
+            # at a closed object and lose the only recovery boundary.
+            active_proc = ACTIVE_EXIT_PROCS.get(watcher_key)
+            with RETAINED_RUN_JOBS_LOCK:
+                retained = RETAINED_RUN_JOBS.get(watcher_key)
+            retained_proc = retained[1] if retained else None
+            if active_proc is not proc and retained_proc is not proc:
+                close = getattr(proc, "close", None)
+                if close:
+                    close()
             return None
         ACTIVE_EXIT_WATCHERS.add(watcher_key)
+        ACTIVE_EXIT_PROCS[watcher_key] = proc
 
     def _wait():
         try:
@@ -2745,9 +3013,22 @@ def watch_app_exit(cfg, app_id, proc, token, started_at=None):
             def op(c):
                 target = find_app(c, app_id)
                 instance = target.get("runInstance") if target else None
+                if target and target.get("runToken") != token:
+                    with RETAINED_RUN_JOBS_LOCK:
+                        recovery = UNPERSISTED_RUNS.get(app_id)
+                        recovery = (dict(recovery) if recovery else None)
+                    # A retained identity may fill in a config write that
+                    # failed for this same run, but it must never overwrite a
+                    # newer run that has since been persisted for the card.
+                    # Without the ``is None`` guard, a stale exit watcher for
+                    # run T could replace run T2's identity and clear it.
+                    if (recovery and recovery.get("token") == token
+                            and _recovery_can_fill_identity(target, token)):
+                        target.update(recovery.get("identity") or {})
+                        instance = target.get("runInstance")
                 if (not manually_stopped and target
                         and target.get("lastPid") == proc.pid
-                        and target.get("runToken") == token):
+                        and _durable_identity_matches(target, token)):
                     last_exit = {
                         "code": code,
                         "at": int(ended_at),
@@ -2772,14 +3053,17 @@ def watch_app_exit(cfg, app_id, proc, token, started_at=None):
             close = getattr(proc, "close", None)
             if close:
                 close()
+            _forget_unpersisted_run(app_id, token, proc)
             with WATCHER_LOCK:
                 ACTIVE_EXIT_WATCHERS.discard(watcher_key)
+                ACTIVE_EXIT_PROCS.pop(watcher_key, None)
     thread = threading.Thread(target=_wait, daemon=True)
     try:
         thread.start()
     except Exception:
         with WATCHER_LOCK:
             ACTIVE_EXIT_WATCHERS.discard(watcher_key)
+            ACTIVE_EXIT_PROCS.pop(watcher_key, None)
         raise
     return thread
 
@@ -2787,6 +3071,32 @@ def watch_app_exit(cfg, app_id, proc, token, started_at=None):
 def persist_started_app(cfg, app_id, proc, pgid, token):
     """保存新的受控身份并启动退出监视线程。"""
     started_at = time.time()
+
+    # A previous start may have been kept only in UNPERSISTED_RUNS after a
+    # transient config-write failure.  Do not replace a still-live recovery
+    # record with a new run: that would make the old process uncontrollable.
+    # An already-empty/closed record is safe to retire once this run is saved.
+    stale_recovery = None
+    with RETAINED_RUN_JOBS_LOCK:
+        previous = UNPERSISTED_RUNS.get(app_id)
+        if previous and previous.get("token") != token:
+            stale_recovery = dict(previous)
+    if stale_recovery:
+        previous_proc = stale_recovery.get("proc")
+        try:
+            members = (previous_proc.members()
+                       if callable(getattr(previous_proc, "members", None))
+                       else [])
+            if members:
+                LOG.warning("应用 %s 仍有未落盘运行实例，拒绝覆盖其恢复身份",
+                            app_id)
+                return False
+        except Exception as exc:
+            # A failed membership query is not proof that the old process is
+            # gone. Keep the old recovery entry and fail closed.
+            LOG.warning("无法确认应用 %s 的旧恢复实例是否已退出: %s",
+                        app_id, exc)
+            return False
 
     def scalar(value, types):
         return value if isinstance(value, types) and not isinstance(value, bool) else None
@@ -2833,11 +3143,151 @@ def persist_started_app(cfg, app_id, proc, pgid, token):
         return False
     saved = cfg.update(op)
     if saved:
+        if stale_recovery:
+            # The old process is already empty/closed, so release its retained
+            # handle and remove the stale token before registering this run.
+            _forget_unpersisted_run(
+                app_id, stale_recovery.get("token"),
+                stale_recovery.get("proc"))
         watch_app_exit(cfg, app_id, proc, token, started_at)
     return saved
 
 
-def abort_started_app(cfg, app_id, proc, token, reason):
+def started_app_identity(app, proc, pgid, token, started_at=None):
+    """Build the schema v2 runtime identity without mutating config."""
+    started_at = time.time() if started_at is None else started_at
+
+    def scalar(value, types):
+        return value if isinstance(value, types) and not isinstance(value, bool) else None
+
+    pid = scalar(getattr(proc, "pid", None), (int,))
+    creation_time = scalar(getattr(proc, "creation_time", None), (int, float))
+    job_name = scalar(getattr(proc, "job_name", None), (str,))
+    run_id = scalar(getattr(proc, "run_id", token), (str,)) or token
+    anchor_pid = scalar(getattr(proc, "anchor_pid", None), (int,))
+    anchor_create_time = scalar(
+        getattr(proc, "anchor_create_time", None), (int, float))
+    result = {
+        "lastPid": pid,
+        "lastPgid": scalar(pgid, (int,)),
+        "runToken": token,
+        "attached": False,
+        "controlMode": "managed",
+        "observation": None,
+        "lastCreateTime": creation_time,
+        "runInstance": ({
+            "runId": run_id,
+            "jobName": job_name,
+            "rootPid": pid,
+            "rootCreateTime": creation_time,
+            "anchorPid": anchor_pid,
+            "anchorCreateTime": anchor_create_time,
+            "startedAt": int(started_at * 1000),
+            "processState": "starting",
+            "exitResult": None,
+        } if job_name and pid else None),
+        "launchConfigured": is_launch_configured(app.get("launchSpec")),
+        "readinessState": (
+            "checking" if (app.get("kind") or "service") == "service"
+            and (app.get("launchSpec") or {}).get("readiness", {}).get("type")
+            in ("tcp", "http") else "unknown"),
+    }
+    if (app.get("kind") or "service") != "task":
+        result["lastExit"] = None
+    return result
+
+
+def _saved_started_identity(cfg, app_id, token):
+    try:
+        app = find_app(cfg.snapshot(), app_id)
+    except Exception:
+        return None
+    instance = app.get("runInstance") if app else None
+    if (app and app.get("runToken") == token
+            and isinstance(instance, dict)
+            and instance.get("runId") == token):
+        return app
+    return None
+
+
+def _ensure_started_run_recovery(cfg, app_id, proc, pgid, token):
+    """Persist or retain identity after compensation could not stop a run."""
+    saved = _saved_started_identity(cfg, app_id, token)
+    started_at = time.time()
+    # Build a fallback identity before consulting config. The app can be
+    # deleted (or the config can become temporarily unreadable) between
+    # spawn and compensation; a live Job still needs an in-memory recovery
+    # record and exit watcher in that case.
+    identity = started_app_identity({}, proc, pgid, token, started_at)
+    if saved:
+        started_at = ((saved.get("runInstance") or {}).get("startedAt") or 0) / 1000
+        if not started_at:
+            started_at = time.time()
+    else:
+        try:
+            snapshot = cfg.snapshot()
+            current = find_app(snapshot, app_id)
+            if current is not None:
+                identity = started_app_identity(current, proc, pgid, token,
+                                                started_at)
+
+                def op(data):
+                    target = find_app(data, app_id)
+                    if target:
+                        target.update(identity)
+                        return True
+                    return False
+
+                saved_identity = bool(cfg.update(op))
+                if saved_identity:
+                    saved = _saved_started_identity(cfg, app_id, token)
+        except Exception:
+            LOG.exception("启动补偿失败后无法写入运行身份（应用 %s）", app_id)
+
+    if saved:
+        instance = saved.get("runInstance") or {}
+        watch_proc = proc
+        if instance.get("jobName"):
+            watch_proc = _remember_run_job(saved, proc, "repair") or proc
+        else:
+            # Test doubles and legacy wrappers may expose no Job name. Keep
+            # the exact process in the in-memory recovery table until the
+            # watcher observes its exit; this still prevents a duplicate
+            # start and gives stop/DELETE a conservative identity.
+            watch_proc = _remember_unpersisted_run(app_id, token, proc, {
+                key: saved.get(key) for key in (
+                    "lastPid", "lastPgid", "runToken", "attached",
+                    "controlMode", "observation", "lastCreateTime",
+                    "runInstance", "launchConfigured", "readinessState",
+                    "lastExit")})
+        watcher_key = (app_id, token)
+        with WATCHER_LOCK:
+            watcher_active = watcher_key in ACTIVE_EXIT_WATCHERS
+        if not watcher_active:
+            try:
+                watch_app_exit(cfg, app_id, watch_proc, token, started_at)
+            except Exception:
+                # Durable Job/run identity is still sufficient for state poll
+                # recovery even if an in-process exit watcher cannot start.
+                LOG.exception("启动补偿后无法启动退出监视线程（应用 %s）", app_id)
+        return True
+
+    if identity is None:
+        return False
+    watch_proc = _remember_unpersisted_run(app_id, token, proc, identity)
+    watch_proc = watch_proc or proc
+    with WATCHER_LOCK:
+        watcher_active = (app_id, token) in ACTIVE_EXIT_WATCHERS
+    if not watcher_active:
+        try:
+            watch_app_exit(cfg, app_id, watch_proc, token, started_at)
+        except Exception:
+            # The retained record remains available to state, stop, PUT and DELETE.
+            LOG.exception("未落盘的运行身份无法启动退出监视线程（应用 %s）", app_id)
+    return True
+
+
+def abort_started_app(cfg, app_id, proc, token, reason, pgid=None):
     """Compensate a failed post-spawn start before returning an API error.
 
     A failed config or watcher step must not leave an untracked Job Object.
@@ -2889,10 +3339,12 @@ def abort_started_app(cfg, app_id, proc, token, reason):
             "启动失败后无法确认应用进程已停止；保留可用身份（应用 %s, PID %s, runId %s）：%s",
             app_id, getattr(proc, "pid", None),
             getattr(proc, "run_id", token), cleanup_error or "未知清理错误")
+        _ensure_started_run_recovery(cfg, app_id, proc, pgid, token)
 
     # When persist_started_app registered its exit watcher, let that watcher
     # finish its wait and release handles before the compensation closes them.
     watcher_key = (app_id, token)
+    watcher_active = False
     watcher_deadline = time.monotonic() + 5.0
     while time.monotonic() < watcher_deadline:
         with WATCHER_LOCK:
@@ -2901,12 +3353,20 @@ def abort_started_app(cfg, app_id, proc, token, reason):
             break
         time.sleep(0.02)
 
-    close = getattr(proc, "close", None)
-    if callable(close):
-        try:
-            close()
-        except Exception:
-            LOG.exception("启动失败后的进程句柄关闭失败（应用 %s）", app_id)
+    # A watcher owns the same native handles while it waits.  Closing them
+    # here would race WaitForSingleObject; let the watcher close them in its
+    # finally block.  This also preserves the exact job identity if the
+    # process is still alive after compensation failed.
+    if watcher_active:
+        LOG.warning("退出 watcher 仍在等待，保留进程句柄由 watcher 清理（应用 %s）",
+                    app_id)
+    else:
+        close = getattr(proc, "close", None)
+        if stopped and callable(close):
+            try:
+                close()
+            except Exception:
+                LOG.exception("启动失败后的进程句柄关闭失败（应用 %s）", app_id)
 
     if stopped:
         return {"ok": False, "status": 500,
@@ -3116,6 +3576,10 @@ def start_app_transaction(cfg, app_id, require_autostart=False):
         current = find_app(cfg.snapshot(), app_id)
         if current is None:
             return {"ok": False, "status": 404, "error": "应用不存在"}
+        # A transient write failure may leave the live Job only in this
+        # console's recovery registry. Rehydrate it before duplicate-start and
+        # launch-config checks so a retry cannot spawn a second service.
+        _hydrate_unpersisted_run(current)
         if (current.get("controlMode") == "monitor"
                 or ("launchSpec" in current
                     and (not current.get("launchConfigured")
@@ -3187,7 +3651,7 @@ def start_app_transaction(cfg, app_id, require_autostart=False):
             if not persisted:
                 return abort_started_app(
                     cfg, app_id, proc, token,
-                    "应用已被删除，已取消启动") | {"status": 409}
+                    "应用已被删除，已取消启动", pgid) | {"status": 409}
             mark_app_alive(cfg, app_id, token)
             watch_app_readiness(cfg, app_id, token, current)
             # 一次性任务的正常形态就是快速退出，不能把成功任务误判成启动失败。
@@ -3212,25 +3676,41 @@ def start_app_transaction(cfg, app_id, require_autostart=False):
             LOG.exception("启动后的状态保存或初始化失败（应用 %s）", app_id)
             reason = "启动后的应用状态保存或初始化失败（%s）" % (
                 str(exc) or type(exc).__name__)
-            return abort_started_app(cfg, app_id, proc, token, reason)
+            return abort_started_app(cfg, app_id, proc, token, reason, pgid)
     finally:
         lock.release()
 
 
 def clear_app_runtime(cfg, app_id, expected_token=None, last_exit=None):
     """清除受控身份；可用 token 防竞态，并可原子写入本次退出结果。"""
+    recovery_token = None
+    if expected_token is not None:
+        with RETAINED_RUN_JOBS_LOCK:
+            recovery = UNPERSISTED_RUNS.get(app_id)
+            if recovery:
+                recovery_token = recovery.get("token")
+
     def op(c):
         target = find_app(c, app_id)
         if not target:
             return False
-        if expected_token is not None and target.get("runToken") != expected_token:
+        instance = target.get("runInstance")
+        durable_identity_matches = _durable_identity_matches(
+            target, expected_token)
+        if (expected_token is not None
+                and not durable_identity_matches
+                # The in-memory recovery exception is only valid when the
+                # durable card has no newer identity.  A stale recovery token
+                # must never authorize clearing a subsequently started run.
+                and not (target.get("runToken") is None
+                         and _recovery_can_fill_identity(target, expected_token)
+                         and recovery_token == expected_token)):
             return False
         target["lastPid"] = None
         target["lastPgid"] = None
         target["runToken"] = None
         target["attached"] = False
         target["lastCreateTime"] = None
-        instance = target.get("runInstance")
         if isinstance(instance, dict):
             instance["processState"] = "exited"
             if last_exit is not None:
@@ -3239,7 +3719,10 @@ def clear_app_runtime(cfg, app_id, expected_token=None, last_exit=None):
         if last_exit is not None:
             target["lastExit"] = last_exit
         return True
-    return cfg.update(op)
+    cleared = cfg.update(op)
+    if cleared and recovery_token == expected_token:
+        _forget_unpersisted_run(app_id, expected_token)
+    return cleared
 
 
 def stop_app_for_update(cfg, app, timeout=5.0):
@@ -4628,6 +5111,77 @@ def observation_from_identity(pid, port, identity):
     }
 
 
+def attach_identity_still_matches(pid, port, identity):
+    """Revalidate an attach target immediately before the config commit.
+
+    The initial inspection happens before the new card exists. A process can
+    exit or its PID can be reused during candidate parsing, so the commit path
+    repeats the listener, SID, creation-time and cwd checks while Config's
+    write lock is held.
+    """
+    if not isinstance(pid, int) or not isinstance(port, int):
+        return False
+    listeners = scan_listeners()
+    if (pid, port) not in listeners:
+        return False
+    snap = ps_snapshot({pid}, with_uid=True)
+    current = snap.get(pid) or {}
+    if not is_current_user(current.get("uid")):
+        return False
+    expected_sid = identity.get("sid") if isinstance(identity, dict) else None
+    if expected_sid and current.get("uid") != expected_sid:
+        return False
+    expected_ctime = identity.get("ctime") if isinstance(identity, dict) else None
+    current_ctime = current.get("ctime")
+    if expected_ctime is not None and current_ctime != expected_ctime:
+        return False
+    expected_cwd = identity.get("cwd") if isinstance(identity, dict) else None
+    actual_cwd = lsof_cwds({pid}).get(pid)
+    if not expected_cwd or not actual_cwd:
+        return False
+    try:
+        return (os.path.normcase(os.path.realpath(actual_cwd)) ==
+                os.path.normcase(os.path.realpath(expected_cwd)))
+    except (OSError, TypeError, ValueError):
+        return actual_cwd == expected_cwd
+
+
+def observation_port(observation):
+    """Return the port recorded with an external process observation.
+
+    A claimed process is allowed to keep running while the user edits the
+    future LaunchSpec.  In that case ``app.port`` describes the next launch,
+    while this value remains the port on which the already running process
+    was observed.  Older v2 records only have ``ports``; accept both forms so
+    migrations and hand-written test fixtures remain compatible.
+    """
+    if not isinstance(observation, dict):
+        return None
+    value = observation.get("port")
+    if type(value) is int and value > 0:
+        return value
+    ports = observation.get("ports")
+    if isinstance(ports, (list, tuple)):
+        for value in ports:
+            if type(value) is int and value > 0:
+                return value
+    return None
+
+
+def attached_observation(app):
+    """Return the immutable external identity for an attached card.
+
+    ``attached`` intentionally stays independent from ``controlMode``.  A
+    monitor card promoted to managed still controls the old external process
+    through this observation until it is stopped; changing cwd/port in the
+    LaunchSpec must not silently retarget that process.
+    """
+    if not isinstance(app, dict) or not app.get("attached"):
+        return None
+    observation = app.get("observation")
+    return observation if isinstance(observation, dict) else None
+
+
 def _observation_matches_identity(observation, pid, identity,
                                  fallback_ctime=None):
     """Return whether a saved observation still denotes this PID instance."""
@@ -5941,20 +6495,47 @@ class Handler(BaseHTTPRequestHandler):
                                    os.path.normcase(os.path.realpath(app.get("cwd") or "")))
             except (OSError, TypeError, ValueError):
                 cwd_updated = bool(identity.get("cwd") and identity.get("cwd") != app.get("cwd"))
-            app["controlMode"] = "monitor"
+            attached_cwd = identity.get("cwd") or app.get("cwd")
+            app["cwd"] = attached_cwd
             app["attached"] = True
-            app["launchSpec"] = None
-            app["launchConfigured"] = False
-            app["cwd"] = identity.get("cwd") or app.get("cwd")
+            requested_launch = data.get("launchSpec")
+            if requested_launch is not None:
+                if not isinstance(requested_launch, dict):
+                    self.send_err(400, "launchSpec 必须是对象")
+                    return
+                try:
+                    spec, canonical_command = canonicalize_app_launch_spec(
+                        requested_launch, command=fields["command"],
+                        cwd=attached_cwd, port=fields["port"],
+                        kind=fields["kind"])
+                except (LaunchSpecError, TypeError) as exc:
+                    self.send_err(400, str(exc))
+                    return
+                app["launchSpec"] = spec
+                app["command"] = canonical_command
+                app["controlMode"] = "managed"
+                app["launchConfigured"] = is_launch_configured(spec)
+            else:
+                # Legacy service-monitor claims remain observation-only unless
+                # this same atomic create confirms a structured launch spec.
+                app["controlMode"] = "monitor"
+                app["launchSpec"] = None
+                app["launchConfigured"] = False
             app["observation"] = observation_from_identity(
                 attach_pid, app.get("port"), identity)
             app["lastPid"] = attach_pid
             app["lastCreateTime"] = identity.get("ctime")
 
         attach_conflict = [False]
+        attach_identity_stale = [False]
 
         def op(c):
             if find_app(c, new_id):
+                return None
+            if (attach_pid is not None
+                    and not attach_identity_still_matches(
+                        attach_pid, fields["port"], identity)):
+                attach_identity_stale[0] = True
                 return None
             # 与 attach_app_process 同规则：写锁内重验 pid 未被其他卡片认领。
             if attach_pid is not None and any(
@@ -5974,7 +6555,12 @@ class Handler(BaseHTTPRequestHandler):
 
         created = self.server.cfg.update(op)
         if created is None:
-            if attach_conflict[0]:
+            if attach_identity_stale[0]:
+                self.send_json({
+                    "ok": False,
+                    "error": "认领进程在保存前已退出或身份发生变化，请刷新后重试",
+                }, 409)
+            elif attach_conflict[0]:
                 self.send_json(
                     {"ok": False, "error": "该进程已由其他卡片管理"}, 409)
             else:
@@ -5983,10 +6569,10 @@ class Handler(BaseHTTPRequestHandler):
         if attach_pid is not None:
             created.update({
                 "attached": True,
-                "controlMode": "monitor",
+                "controlMode": app["controlMode"],
                 "processState": "alive",
                 "identityStrength": "observation",
-                "launchConfigured": False,
+                "launchConfigured": app["launchConfigured"],
                 "running": True,
                 "pid": attach_pid,
                 "cwdUpdated": cwd_updated,
@@ -6075,7 +6661,15 @@ class Handler(BaseHTTPRequestHandler):
                 "launchSpecRequired": True,
             }, 409)
             return
-        if not app_alive_sign(app):
+        identity_state = lifecycle_identity_state(app)
+        if identity_state == "unknown":
+            self.send_json({
+                "ok": False,
+                "error": "无法验证当前 Job Object 状态；未执行停止，请稍后重试",
+                "identityUnavailable": True,
+            }, 409)
+            return
+        if identity_state != "alive":
             self.send_json({"ok": False, "error": "应用未在运行"})
             return
         ok, error = stop_app_and_clear(self.server.cfg, app)
@@ -6117,7 +6711,15 @@ class Handler(BaseHTTPRequestHandler):
                 "launchSpecRequired": True,
             }, 409)
             return
-        if not app_alive_sign(app):
+        identity_state = lifecycle_identity_state(app)
+        if identity_state == "unknown":
+            self.send_json({
+                "ok": False,
+                "error": "无法验证当前 Job Object 状态；未执行重启，请稍后重试",
+                "identityUnavailable": True,
+            }, 409)
+            return
+        if identity_state != "alive":
             self.send_err(409, "应用未在运行")
             return
         # 必须在停止旧服务前预检；配置已失效时保留仍在工作的旧进程。
@@ -6260,10 +6862,18 @@ class Handler(BaseHTTPRequestHandler):
                 fields["cwd"] = selected_cwd
                 fields["port"] = selected_port
                 fields["controlMode"] = "managed"
-                fields["attached"] = False
-                fields["observation"] = None
-                if (app.get("controlMode") == "monitor"
-                        or spec != app.get("launchSpec")):
+                promoted_observation = (dict(app.get("observation"))
+                                        if isinstance(app.get("observation"), dict)
+                                        else None)
+                promoted_attached = bool(
+                    app.get("controlMode") == "monitor" and
+                    app.get("attached") and promoted_observation)
+                fields["attached"] = promoted_attached
+                fields["observation"] = (promoted_observation
+                                          if promoted_attached else None)
+                if (not promoted_attached and
+                        (app.get("controlMode") == "monitor"
+                         or spec != app.get("launchSpec"))):
                     fields["lastPid"] = None
                     fields["lastPgid"] = None
                     fields["runToken"] = None
@@ -6279,8 +6889,18 @@ class Handler(BaseHTTPRequestHandler):
             lifecycle_changed = any(
                 key in fields and fields[key] != app.get(key)
                 for key in lifecycle_fields)
+            identity_state = "absent"
+            if lifecycle_changed:
+                identity_state = lifecycle_identity_state(app)
+                if identity_state == "unknown":
+                    self.send_json({
+                        "ok": False,
+                        "error": "无法验证当前 Job Object 状态；为保留运行身份，已拒绝修改",
+                        "identityUnavailable": True,
+                    }, 409)
+                    return
             stopped_for_update = False
-            if lifecycle_changed and app_alive_sign(app):
+            if lifecycle_changed and identity_state == "alive":
                 if not stop_before_update:
                     stop_label = ("中止任务"
                                   if (app.get("kind") or "service") == "task"
@@ -6301,8 +6921,7 @@ class Handler(BaseHTTPRequestHandler):
             def op(c):
                 target = find_app(c, m.group(1))
                 target.update(fields)
-                if fields.get("controlMode") == "managed":
-                    target["attached"] = False
+                if fields.get("controlMode") == "managed" and not fields.get("attached"):
                     target["observation"] = None
                 return dict(target)
 
@@ -6353,7 +6972,15 @@ class Handler(BaseHTTPRequestHandler):
         _, app = self._get_app_or_404(app_id)
         if app is None:
             return
-        if app_running(app):
+        identity_state = lifecycle_identity_state(app)
+        if identity_state == "unknown":
+            self.send_json({
+                "ok": False,
+                "error": "删除已取消：无法验证当前 Job Object 状态，运行身份已保留",
+                "identityUnavailable": True,
+            }, 409)
+            return
+        if identity_state == "alive":
             stopped, error = stop_app_and_clear(self.server.cfg, app)
             if not stopped:
                 self.send_err(409, "删除已取消：%s" %

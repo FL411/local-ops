@@ -6,6 +6,7 @@ import { $, el, setText, setChildren, icon, escapeHtml,
   post, put, del, act, toast, openLayer, closeLayer,
   GLYPHS, findApp, bumpMutationEpoch, controlRequestHeaders,
   controlTokenAvailable, CONTROL_READONLY_TEXT } from './core.js';
+import { detectionMatchesCurrentCwd } from './launch-confirmation.js';
 
 /* ---------------- DOM 引用 ---------------- */
 const appModalMask = $('#appModalMask'), appModal = $('#appModal'), appModalTitle = $('#appModalTitle');
@@ -104,6 +105,8 @@ let selectedGlyph = null;    // 选中的 Lucide 图标名
 let removeStoredIcon = false; // 仅在保存成功后删除，取消编辑不触碰后端
 let pendingAttach = null;     // 从服务监控添加时待认领的来源进程信息
 let detectingProject = false; // 认领流程必须等项目命令识别完成后再允许保存
+let detectedCwd = null;       // Last successfully inspected working directory.
+let detectionSucceeded = false;
 let selectedLaunchSpec = null;
 let selectedLaunchValues = null;
 
@@ -202,6 +205,8 @@ function readPortValue() {
 function resetDetection(clearAutoPort = false) {
   detectRequestSeq += 1;
   detectingProject = false;
+  detectedCwd = null;
+  detectionSucceeded = false;
   if (clearAutoPort && detectedPortValue != null &&
       fPort.value.trim() === String(detectedPortValue)) fPort.value = '';
   detectedPortValue = null;
@@ -211,6 +216,24 @@ function resetDetection(clearAutoPort = false) {
   detectList.replaceChildren();
   detectSummary.textContent = '';
   detectFiles.textContent = '';
+}
+
+function projectDetectionRequired() {
+  const monitor = isMonitorApp(editingAppOriginal);
+  const willAttach = !editingAppId && !!pendingAttach;
+  if (willAttach) return true;
+  if (!monitor) return false;
+  if (!editingAppOriginal || !editingAppOriginal.launchConfigured) return true;
+  const currentPort = modalKind === 'task' ? null : readPortValue();
+  return fCmd.value.trim() !== (editingAppOriginal.command || '') ||
+    (fCwd.value.trim() || null) !== (editingAppOriginal.cwd || null) ||
+    currentPort !== (editingAppOriginal.port == null ? null : editingAppOriginal.port) ||
+    modalKind !== (editingAppOriginal.kind || 'service');
+}
+
+function projectDetectionReady() {
+  return detectionMatchesCurrentCwd(
+    fCwd.value, detectedCwd, detectionSucceeded);
 }
 
 function modalLifecycleChanged() {
@@ -251,11 +274,18 @@ function refreshEditSaveMode() {
   appSave.hidden = false;
   const willAttach = !editingAppId && !!pendingAttach;
   const confirmingMonitor = monitor && !editingAppOriginal.launchConfigured;
+  const needsDetection = projectDetectionRequired();
+  const detectionBlocked = needsDetection &&
+    (!projectDetectionReady() || detectingProject);
   setText(appSave, willAttach ? '加入监控并确认配置'
     : confirmingMonitor ? '确认启动配置' : '保存');
-  appSave.disabled = appSaving || needsStop || ((willAttach || monitor) && detectingProject);
+  appSave.disabled = appSaving || needsStop || detectionBlocked;
   appSave.title = needsStop ? '请先在当前面板' + stopVerb
-    : ((willAttach || monitor) && detectingProject ? '正在识别项目启动配置' : '');
+    : (detectionBlocked
+      ? (detectingProject
+        ? '\u6b63\u5728\u8bc6\u522b\u9879\u76ee\u542f\u52a8\u914d\u7f6e'
+        : '\u8bf7\u5148\u9009\u62e9\u5f53\u524d\u9879\u76ee\u6587\u4ef6\u5939\u5e76\u5b8c\u6210\u8bc6\u522b')
+      : '');
 }
 
 function setModalKind(kind) {
@@ -331,6 +361,8 @@ export function openAppModal(app, presetKind, focusAction = '') {
   /* 监听进程的 argv 往往只是框架子进程（如 next-server），不一定适合作为
      下次启动命令。打开认领表单时同时读取项目配置，让用户选择可靠命令。 */
   if (pendingAttach && fCwd.value.trim()) detectProject();
+  else if (isMonitorApp(editingAppOriginal) &&
+      !editingAppOriginal.launchConfigured && fCwd.value.trim()) detectProject();
 }
 export function closeAppModal() {
   closeLayer(appModalMask);
@@ -436,6 +468,8 @@ async function detectProject() {
   const cwd = fCwd.value.trim();
   if (!cwd) return fieldError(fCwd, '请先选择项目文件夹');
   const requestSeq = ++detectRequestSeq;
+  detectedCwd = null;
+  detectionSucceeded = false;
   detectPanel.hidden = false;
   detectSummary.textContent = '正在读取项目配置…';
   detectFiles.textContent = '';
@@ -451,6 +485,8 @@ async function detectProject() {
       detectSummary.textContent = '识别失败，请检查文件夹后重试';
       return;
     }
+    detectedCwd = cwd;
+    detectionSucceeded = true;
     if (!fName.value.trim() && result.name) {
       fName.value = result.name;
       renderIconPreview();
@@ -598,6 +634,13 @@ async function saveApp() {
   const attachRequest = wasCreating && pendingAttach && modalKind === 'service'
     && port === pendingAttach.port ? { ...pendingAttach } : null;
   if (attachRequest) body.attachPid = attachRequest.pid;
+  if (projectDetectionRequired() && !projectDetectionReady()) {
+    if (!fCwd.value.trim()) return fieldError(fCwd, '请先选择项目文件夹');
+    toast(detectingProject ? '正在识别项目启动配置，请稍候' :
+      '请先完成当前项目文件夹的启动配置识别');
+    if (!detectingProject) await detectProject();
+    return;
+  }
   appSaving = true;
   refreshEditSaveMode();
   try {
@@ -614,37 +657,11 @@ async function saveApp() {
     if (editingAppId) {
       app = await act(put('/api/apps/' + editingAppId, body));
     } else if (attachRequest) {
-      // /api/apps with attachPid establishes observation only. The explicit
-      // save action then validates and persists the user's confirmed spec.
-      const createBody = { ...body };
-      delete createBody.launchSpec;
-      app = await act(post('/api/apps', createBody));
-      if (app && app.ok !== false && app.id) {
-        const id = app.id;
-        pendingAttach = null;
-        rememberSavedApp({ ...app, controlMode: 'monitor', launchConfigured: false }, id,
-          { ...body, launchSpec: null });
-        const validated = await act(post('/api/apps/' + id + '/validate-launch', {
-          launchSpec: body.launchSpec,
-          command: body.command, cwd: body.cwd, port: body.port, kind: body.kind,
-        }));
-        if (!validated || validated.ok === false || !validated.launchSpec) {
-          toast('监控卡片已加入；启动配置未确认，可在此继续编辑后重试');
-          await window.__poll();
-          return;
-        }
-        body.launchSpec = cloneLaunchSpec(validated.launchSpec);
-        if (typeof validated.command === 'string' && validated.command) {
-          body.command = validated.command;
-          fCmd.value = validated.command;
-        }
-        app = await act(put('/api/apps/' + id, body));
-        if (!app || app.ok === false) {
-          toast('监控卡片已加入；启动配置尚未托管，可在此继续编辑后重试');
-          await window.__poll();
-          return;
-        }
-      }
+      // The backend validates and persists the observation identity and the
+      // confirmed LaunchSpec in one config transaction. This avoids leaving
+      // a monitor-only half-card when validation or the follow-up update fails.
+      app = await act(post('/api/apps', body));
+      if (app && app.ok !== false) pendingAttach = null;
     } else {
       app = await act(post('/api/apps', body));
     }
@@ -703,7 +720,7 @@ async function saveApp() {
     }
     closeAppModal();
     await window.__poll();
-    if (monitorAdded) toast('已加入启动台并确认启动配置；当前外部进程仍为观察对象');
+    if (monitorAdded) toast('已加入启动台并确认启动配置；当前外部进程保持运行并由总控台托管');
   } finally {
     appSaving = false;
     refreshEditSaveMode();

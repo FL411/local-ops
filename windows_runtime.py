@@ -663,6 +663,8 @@ class ManagedProcess:
         self._root_exit_code = root_exit_code
         self._closed = False
         self._lock = threading.RLock()
+        self._wait_done = threading.Condition(self._lock)
+        self._active_waits = 0
 
     def poll(self):
         if self._process_handle:
@@ -680,17 +682,35 @@ class ManagedProcess:
         exit code, so this waits until the remaining job processes exit and
         returns ``None``.
         """
-        if self._process_handle:
-            code = self._api.wait_process(self._process_handle, timeout)
-            if code is not None:
-                self._root_exit_code = code
-            return code
-        deadline = None if timeout is None else time.monotonic() + max(0, timeout)
-        while self.members():
-            if deadline is not None and time.monotonic() >= deadline:
-                raise subprocess.TimeoutExpired("managed job", timeout)
-            time.sleep(0.05)
-        return self._root_exit_code
+        # ``close()`` must not invalidate a native process/job handle while
+        # WaitForSingleObject is using it.  Register the wait while holding
+        # the instance lock, then release it so terminate() can still stop a
+        # blocked process.  close() waits for this reference to finish.
+        with self._lock:
+            if self._closed:
+                raise OSError("Managed process handle is closed")
+            self._active_waits += 1
+            process_handle = self._process_handle
+        try:
+            if process_handle:
+                code = self._api.wait_process(process_handle, timeout)
+                if code is not None:
+                    with self._lock:
+                        self._root_exit_code = code
+                return code
+            deadline = (None if timeout is None else
+                        time.monotonic() + max(0, timeout))
+            while self.members():
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise subprocess.TimeoutExpired("managed job", timeout)
+                time.sleep(0.05)
+            with self._lock:
+                return self._root_exit_code
+        finally:
+            with self._lock:
+                self._active_waits -= 1
+                if not self._active_waits:
+                    self._wait_done.notify_all()
 
     def members(self):
         with self._lock:
@@ -786,6 +806,8 @@ class ManagedProcess:
         with self._lock:
             if self._closed:
                 return
+            while self._active_waits:
+                self._wait_done.wait()
             self._closed = True
             if self._thread_handle:
                 self._api.close_handle(self._thread_handle)

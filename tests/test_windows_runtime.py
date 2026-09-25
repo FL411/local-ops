@@ -58,6 +58,52 @@ class WindowsRuntimePureTests(unittest.TestCase):
         self.assertEqual(probe_errors, [])
         self.assertEqual(api.close_handle.call_args_list, [mock.call(10)])
 
+    def test_close_waits_for_process_wait_without_blocking_termination(self):
+        api = mock.Mock()
+        entered = threading.Event()
+        release = threading.Event()
+
+        def wait_process(_handle, _timeout):
+            entered.set()
+            if not release.wait(2):
+                raise TimeoutError("test wait was not released")
+            return 0
+
+        api.wait_process.side_effect = wait_process
+        instance = windows_runtime.ManagedProcess(
+            api, 10, "run-01", "Local\\job", 123, process_handle=20)
+        wait_errors = []
+
+        def wait():
+            try:
+                instance.wait(timeout=5)
+            except Exception as exc:
+                wait_errors.append(exc)
+
+        wait_thread = threading.Thread(target=wait)
+        wait_thread.start()
+        self.assertTrue(entered.wait(1))
+
+        # A waiter must not hold the instance lock across the native wait;
+        # stop/terminate needs to remain available for a live service.
+        api.terminate_job.return_value = None
+        ok, error = instance.terminate(force=True)
+        self.assertTrue(ok, error)
+
+        close_thread = threading.Thread(target=instance.close)
+        close_thread.start()
+        time.sleep(0.05)
+        api.close_handle.assert_not_called()
+
+        release.set()
+        wait_thread.join(1)
+        close_thread.join(1)
+        self.assertFalse(wait_thread.is_alive())
+        self.assertFalse(close_thread.is_alive())
+        self.assertEqual(wait_errors, [])
+        self.assertIn(mock.call(20), api.close_handle.call_args_list)
+        self.assertIn(mock.call(10), api.close_handle.call_args_list)
+
     def test_job_name_is_sid_scoped_and_validated(self):
         left = windows_runtime.job_name_for("run-01", "S-1-5-21-10")
         right = windows_runtime.job_name_for("run-01", "S-1-5-21-11")

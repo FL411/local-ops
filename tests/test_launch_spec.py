@@ -107,6 +107,18 @@ class LaunchSpecTests(unittest.TestCase):
                     LaunchSpecError, "无法编码的 Unicode"):
                 normalize_launch_spec(spec)
 
+    def test_readiness_host_rejects_unpaired_surrogates_for_all_probe_types(self):
+        invalid_host = "\ud800"
+        base = {"mode": "exec", "executable": r"C:\Python\python.exe",
+                "args": []}
+        for probe_type, extra in (("none", {}), ("tcp", {"port": 8080}),
+                                  ("http", {"port": 8080, "url": "/health"})):
+            with self.subTest(probe_type=probe_type), self.assertRaisesRegex(
+                    LaunchSpecError, "无法编码的 Unicode"):
+                normalize_launch_spec({
+                    **base, "readiness": {"type": probe_type,
+                                            "host": invalid_host, **extra}})
+
 
 if __name__ == "__main__":
     unittest.main()

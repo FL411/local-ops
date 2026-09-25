@@ -245,14 +245,35 @@ class FrontendAccessibilityContractTests(unittest.TestCase):
         self.assertIn("post('/api/launch/resolve'", overlays)
         self.assertIn("post('/api/apps/' + appId + '/validate-launch'", overlays)
         self.assertIn("body.launchSpec = cloneLaunchSpec(validated.launchSpec)", overlays)
-        self.assertIn("delete createBody.launchSpec", overlays)
-        self.assertIn("put('/api/apps/' + id, body)", overlays)
+        self.assertNotIn("delete createBody.launchSpec", overlays)
+        self.assertIn("put('/api/apps/' + editingAppId, body)", overlays)
         self.assertIn("body.command = resolved.command", overlays)
         self.assertIn("body.command = validated.command", overlays)
         self.assertIn("仍可选择脚本", overlays)
         self.assertIn("cwd: fCwd.value.trim() || null", overlays)
         self.assertIn("unavailableReason", overlays)
         self.assertIn("selectedLaunchSpec = r.available === false", overlays)
+
+    def test_external_claims_require_current_project_detection_and_atomic_create(self):
+        overlays = (ROOT / "static/js/overlays.js").read_text(encoding="utf-8")
+
+        # A claim must be tied to the directory that was actually inspected;
+        # changing or omitting cwd cannot bypass the confirmation gate.
+        self.assertIn("let detectedCwd = null", overlays)
+        self.assertIn("let detectionSucceeded = false", overlays)
+        self.assertIn("detectionMatchesCurrentCwd(", overlays)
+        self.assertIn("const detectionBlocked = needsDetection", overlays)
+        self.assertIn("if (projectDetectionRequired() && !projectDetectionReady())", overlays)
+
+        # attachPid and launchSpec are submitted together. The old
+        # create-monitor, validate, then PUT sequence left half-created cards.
+        attach_branch = overlays[
+            overlays.index("} else if (attachRequest) {"):
+            overlays.index("} else {", overlays.index("} else if (attachRequest) {"))
+        ]
+        self.assertIn("post('/api/apps', body)", attach_branch)
+        self.assertNotIn("delete createBody.launchSpec", attach_branch)
+        self.assertNotIn("/validate-launch", attach_branch)
 
     def test_windows_console_recovery_copy_uses_exe_launcher(self):
         app = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
