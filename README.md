@@ -11,7 +11,7 @@
 
 [下载与发行](https://github.com/FL411/local-ops/releases) · [查看界面](#界面预览) · [快速开始](#下载与快速开始) · [使用指南](#使用) · [报告问题](https://github.com/FL411/local-ops/issues) · [变更记录](CHANGELOG.md)
 
-> 当前版本以源码预览形式提供；独立 Windows ZIP 发行包发布后会放在 [Releases](https://github.com/FL411/local-ops/releases)。
+> 当前版本为预览发行；Windows ZIP 发行包与 SHA-256 校验文件见 [Releases](https://github.com/FL411/local-ops/releases)。
 
 ## 界面预览
 
@@ -42,7 +42,7 @@
 ## 下载与快速开始
 
 1. 安装 [Python 3.12+](https://www.python.org/downloads/)，安装时勾选 **Add python.exe to PATH**。
-2. 从 [Releases](https://github.com/FL411/local-ops/releases) 下载发行包；如果尚未发布发行包，可下载仓库 ZIP 或运行 `git clone https://github.com/FL411/local-ops.git`。
+2. 从 [Releases](https://github.com/FL411/local-ops/releases) 下载发行包；需要开发版时可下载仓库 ZIP 或运行 `git clone https://github.com/FL411/local-ops.git`。
 3. 双击项目根目录中的 `LocalOpsConsole.exe`，首次运行会安装 `psutil` 并打开本地控制台。
 
 更完整的环境要求、备用启动方式和升级说明见下方 [安装](#安装) 与 [运行](#运行)。
