@@ -1,19 +1,27 @@
-# 总控台 for Windows
+# Local Ops Console for Windows
 
 [![CI](https://github.com/FL411/local-ops/actions/workflows/ci.yml/badge.svg)](https://github.com/FL411/local-ops/actions/workflows/ci.yml)
 [![Windows 10/11](https://img.shields.io/badge/Windows-10%20%2F%2011-0078D4?logo=windows)](#系统要求)
 [![Python 3.12+](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white)](#系统要求)
 [![MIT License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-**把散落在终端里的本地服务、脚本、端口和日志，收进一个可视化控制台。**
+**总控台** · 面向 Windows 10/11 的本地服务、脚本与端口控制台。
 
-总控台面向 Windows 10/11 开发者，可以在一个本地页面中启动、停止和重启项目，查看端口占用、进程来源与资源状态，运行批处理任务，并把常用服务设置为开机自启。后端只绑定 `127.0.0.1`，数据保存在当前电脑，不需要账号或云服务。
+把散落在终端里的服务、脚本、端口和日志收进一个本地页面：启动、停止、重启、监控和诊断都在当前 Windows 用户权限内完成。后端只绑定 `127.0.0.1`，不需要账号或云服务。
 
-[查看界面](#界面预览) · [立即安装](#安装) · [使用指南](#使用) · [报告问题](https://github.com/FL411/local-ops/issues) · [查看更新](CHANGELOG.md)
+[下载与发行](https://github.com/FL411/local-ops/releases) · [查看界面](#界面预览) · [快速开始](#下载与快速开始) · [使用指南](#使用) · [报告问题](https://github.com/FL411/local-ops/issues) · [变更记录](CHANGELOG.md)
 
-> 如果它帮你减少了终端窗口、端口冲突和重复启动工作，欢迎为仓库点一个 Star，让更多 Windows 开发者找到它。
+> 当前版本以源码预览形式提供；独立 Windows ZIP 发行包发布后会放在 [Releases](https://github.com/FL411/local-ops/releases)。
 
-## 它能解决什么
+## 界面预览
+
+以下截图使用脱敏演示数据，不包含真实用户名、目录、命令或服务信息。
+
+| 启动台 | 服务监控 |
+| --- | --- |
+| ![Ops 指挥台 · 启动台](docs/screenshots/ops-launchpad.jpg) | ![Ops 指挥台 · 服务监控](docs/screenshots/ops-services.jpg) |
+
+## 核心能力
 
 - **项目太多，启动容易遗漏**：把前端、API、博客、本地工具和常用脚本保存成卡片，一键启动或批量停止。
 - **不知道哪个进程占了端口**：集中查看当前用户的监听端口、PID、命令、工作目录、CPU、内存和运行时长。
@@ -21,7 +29,7 @@
 - **终端窗口长期堆积**：双击 `LocalOpsConsole.exe` 无窗口启动，通过系统托盘打开、重启或停止总控台。
 - **重启后配置或服务难恢复**：启动时自检残留进程，从磁盘恢复启动台卡片，并可自动拉起标记为开机自启的服务。
 
-## Windows 版亮点
+## Windows 原生设计
 
 - **开箱即用的桌面入口**：安装 Python 后，双击 `LocalOpsConsole.exe` 即可后台启动并自动打开页面。
 - **系统托盘常驻**：左键打开，右键可打开、重启、停止或退出，tooltip 实时显示运行状态。
@@ -31,25 +39,25 @@
 - **外部服务先监控**：从端口列表认领的进程先作为监控卡片保存，确认启动配置后才切换为可启停的托管卡片。
 - **Windows 专项可靠性**：覆盖单实例锁、无窗口日志、控制令牌、私有 DACL、残留进程清理和启动台磁盘恢复。
 
-## 30 秒开始
+## 下载与快速开始
 
 1. 安装 [Python 3.12+](https://www.python.org/downloads/)，安装时勾选 **Add python.exe to PATH**。
-2. 下载仓库源码，或运行 `git clone https://github.com/FL411/local-ops.git`。
+2. 从 [Releases](https://github.com/FL411/local-ops/releases) 下载发行包；如果尚未发布发行包，可下载仓库 ZIP 或运行 `git clone https://github.com/FL411/local-ops.git`。
 3. 双击项目根目录中的 `LocalOpsConsole.exe`，首次运行会安装 `psutil` 并打开本地控制台。
 
 更完整的环境要求、备用启动方式和升级说明见下方 [安装](#安装) 与 [运行](#运行)。
 
-> **Preview / Alpha**：当前以源码预览形式提供，接口、配置格式和安装方式仍可能调整。核心功能已经过 Windows 自动化测试，但升级前仍建议备份 `%APPDATA%\总控台\`。
+> **Preview / Alpha**：接口、配置格式和安装方式仍可能调整。核心功能已经过 Windows 自动化测试，升级前仍建议备份 `%APPDATA%\总控台\`。
 
-本仓库是 [laogou717/local-ops](https://github.com/laogou717/local-ops) 的 Windows 专用衍生版。感谢原项目提供的产品基础；macOS 用户请使用上游仓库，本仓库只维护 Windows 10/11。
+这是一个独立维护的 Windows 版本，最初基于 [laogou717/local-ops](https://github.com/laogou717/local-ops) 的产品基础。当前代码、平台目标、发布节奏和维护决策均独立；macOS 用户请使用上游仓库。
 
 总控台只服务当前电脑和当前用户，不是远程运维、多人协作或公网管理面板。它能够以当前用户权限启动保存的项目配置；不要通过监听地址修改、反向代理、SSH 隧道或端口映射将它暴露到不受信任的网络。
 
 ## 维护与参与
 
-项目目前由 FL411 主要维护，优先解决 Windows 日常开发中的真实问题。欢迎通过 [Issues](https://github.com/FL411/local-ops/issues) 报告缺陷、提出需求，或提交范围清晰且带验证结果的 Pull Request。为保持实现和安全边界清晰，本仓库不接受恢复 macOS/Linux 运行路径的改动。
+项目由 FL411 独立维护，优先解决 Windows 日常开发中的真实问题。欢迎通过 [Issues](https://github.com/FL411/local-ops/issues) 报告缺陷、提出需求，或提交范围清晰且带验证结果的 Pull Request。新功能会按 Windows 的进程、权限和启动语义重新设计，不直接同步上游代码。
 
-## 功能
+## 使用功能
 
 - 每 2 秒查看当前用户的本地监听服务、CPU、内存和运行时长。
 - 保存常用服务或批处理任务，集中启动、停止、重启、查日志和诊断。
@@ -59,14 +67,6 @@
 - 通过运行 token、进程树和当前用户 TokenUser SID 联合识别受控进程，不会因端口相同就杀死外部进程。
 - Ops 指挥台单一主题：深空蓝黑/雾灰双色，左侧导航轨、KPI 概览卡、实时动态侧栏，浅色、深色和跟随系统。
 - 全局命令面板可直接添加服务或批处理任务；启动台卡片支持鼠标拖拽和键盘排序。
-
-## 界面预览
-
-以下截图使用脱敏演示数据，不包含真实用户名、目录、命令或服务信息。
-
-| 启动台 | 服务监控 |
-| --- | --- |
-| ![Ops 指挥台 · 启动台](docs/screenshots/ops-launchpad.jpg) | ![Ops 指挥台 · 服务监控](docs/screenshots/ops-services.jpg) |
 
 ## 系统要求
 
@@ -377,9 +377,11 @@ python tools\check_project.py
 - 不含任何项目内旧 `data/`、用户数据、日志、绝对路径、token 或缓存的发行包。
 - Windows 发行包（zip）解压后可直接运行：`LocalOpsConsole.exe` 无窗口启动、`start.bat` 备用；按 `RELEASE_CHECKLIST.md` 完成 Windows 全新安装与回退验证（含控制令牌只读/可写切换、ACL 冒烟检查）。
 
+正式版本和预览版本统一发布在 [GitHub Releases](https://github.com/FL411/local-ops/releases)，源码仓库用于开发、问题追踪和文档维护。普通用户应优先下载 Release ZIP，而不是直接运行仓库中的开发文件。
+
 ## 项目关系与致谢
 
-本项目基于 [laogou717/local-ops](https://github.com/laogou717/local-ops) 持续开发，并专注于 Windows 10/11 的运行体验、安全边界和长期维护。上游功能同步与 Windows 适配取舍记录在 [`docs/upstream-pr-map.md`](docs/upstream-pr-map.md)。感谢上游作者及所有参与讨论、测试和贡献代码的开发者。
+本项目是独立维护的 Windows 版本，最初基于 [laogou717/local-ops](https://github.com/laogou717/local-ops) 的产品基础。上游项目继续面向 macOS；本项目不自动同步上游代码，只有经过 Windows 语义、安全边界和测试评估的功能才会手动移植。历史适配记录见 [`docs/upstream-pr-map.md`](docs/upstream-pr-map.md)。感谢上游作者及所有参与讨论、测试和贡献代码的开发者。
 
 ## 参与贡献与安全
 
