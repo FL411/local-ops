@@ -1645,6 +1645,21 @@ def _is_anchor_cleanup_failure(exc):
     return isinstance(exc, OSError) and "Job Object 保活进程" in str(exc)
 
 
+def _is_missing_run_job_error(exc):
+    """Return whether opening a persisted Job Object proved it no longer exists.
+
+    ``OpenJobObjectW`` reports ``ERROR_FILE_NOT_FOUND`` when the named Job was
+    destroyed after its last handle was released.  That is different from an
+    access or query failure: there is no remaining Job boundary to protect.
+    Treating this case as an unavailable identity leaves an already exited
+    card permanently stuck in "无法验证运行状态" and blocks a new start.
+    """
+    if not isinstance(exc, OSError):
+        return False
+    return (getattr(exc, "winerror", None) == 2
+            or getattr(exc, "errno", None) == errno.ENOENT)
+
+
 def _open_run_job_unlocked(app):
     """Reopen this user's named Job Object for a structured run instance."""
     recovered = _hydrate_unpersisted_run(app)
@@ -1724,7 +1739,16 @@ def _open_run_job_unlocked(app):
         LOG.debug("无法清理应用 %s 的空 Job keeper: %s",
                   app.get("id"), exc)
         return RUN_JOB_REOPEN_FAILED
-    except (OSError, ValueError, TypeError) as exc:
+    except OSError as exc:
+        if _is_missing_run_job_error(exc):
+            LOG.debug("应用 %s 的 Job Object 已不存在，按已退出处理",
+                      app.get("id"))
+            return None
+        if key is not None and 'retained' in locals() and retained:
+            return retained[1]
+        LOG.debug("无法重连应用 %s 的 Job Object: %s", app.get("id"), exc)
+        return RUN_JOB_REOPEN_FAILED
+    except (ValueError, TypeError) as exc:
         if key is not None and 'retained' in locals() and retained:
             return retained[1]
         LOG.debug("无法重连应用 %s 的 Job Object: %s", app.get("id"), exc)
@@ -3662,7 +3686,12 @@ def start_app_transaction(cfg, app_id, require_autostart=False):
                     cfg, app_id, proc, token,
                     "应用已被删除，已取消启动", pgid) | {"status": 409}
             mark_app_alive(cfg, app_id, token)
-            watch_app_readiness(cfg, app_id, token, current)
+            # ``current`` is the pre-start snapshot.  Readiness timing must
+            # use the run instance just persisted above; otherwise a stale
+            # ``startedAt`` from the previous run can make the new probe
+            # expire immediately even while the service is coming up.
+            readiness_app = find_app(cfg.snapshot(), app_id) or current
+            watch_app_readiness(cfg, app_id, token, readiness_app)
             # 一次性任务的正常形态就是快速退出，不能把成功任务误判成启动失败。
             if (current.get("kind") or "service") == "task":
                 return {"ok": True, "status": 200, "pid": proc.pid}

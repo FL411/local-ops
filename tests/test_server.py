@@ -1,3 +1,4 @@
+import errno
 import json
 import os
 import signal
@@ -1084,6 +1085,34 @@ class StartAppCompensationTests(unittest.TestCase):
                     except RuntimeError:
                         pass
 
+    def test_readiness_watcher_uses_new_run_start_time(self):
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._config(td)
+            proc = mock.Mock(pid=4321, run_id="run-new", job_name="Local\\run-new",
+                             creation_time=12.5, anchor_pid=4322,
+                             anchor_create_time=12.6)
+            proc.poll.return_value = None
+            proc.members.return_value = [4321]
+            readiness = mock.Mock()
+            with mock.patch.object(server, "app_alive_sign", return_value=False), \
+                    mock.patch.object(server, "inspect_app_health",
+                                      return_value={"blocking": False}), \
+                    mock.patch.object(server, "scan_listeners", return_value=set()), \
+                    mock.patch.object(server, "start_app",
+                                      return_value=(True, None, proc, 4321, "run-new")), \
+                    mock.patch.object(server, "watch_app_exit"), \
+                    mock.patch.object(server, "watch_app_readiness", readiness):
+                result = server.start_app_transaction(cfg, "start-test")
+
+            self.assertTrue(result["ok"], result)
+            saved = server.find_app(cfg.snapshot(), "start-test")
+            watched = readiness.call_args.args[3]
+            self.assertEqual(watched["runInstance"]["runId"], "run-new")
+            self.assertEqual(
+                watched["runInstance"]["startedAt"],
+                saved["runInstance"]["startedAt"],
+            )
+
     def test_post_spawn_failures_terminate_and_close_the_process(self):
         for stage in ("persist", "alive", "readiness", "poll", "members"):
             with self.subTest(stage=stage):
@@ -2022,6 +2051,22 @@ class RunWatcherRecoveryTests(unittest.TestCase):
             self.assertEqual(app["runInstance"]["processState"], "exited")
             self.assertEqual(app["lastExit"]["status"], "unknown")
             self.assertIsNone(app["lastExit"]["code"])
+        finally:
+            td.cleanup()
+
+    def test_missing_named_job_is_recorded_as_exited_after_restart(self):
+        td, cfg, _ = self._config("service", "checking")
+        try:
+            # ERROR_FILE_NOT_FOUND from OpenJobObjectW means the named Job was
+            # destroyed with its last handle; it is not an access failure.
+            with mock.patch.object(
+                    server.windows_runtime, "reopen",
+                    side_effect=OSError(errno.ENOENT, "missing job")):
+                server.restore_run_watchers(cfg)
+            app = cfg.snapshot()["apps"][0]
+            self.assertEqual(app["runInstance"]["processState"], "exited")
+            self.assertFalse(server._is_missing_run_job_error(
+                PermissionError(5, "access denied")))
         finally:
             td.cleanup()
 
