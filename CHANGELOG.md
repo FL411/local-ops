@@ -8,6 +8,8 @@
 
 ## [Unreleased]
 
+## [1.0.0-preview.1] - 2026-09-26
+
 ### Changed
 
 - **Windows 服务启动改为结构化配置**：新增 schema v2 `LaunchSpec` 与 Job Object 运行时；新启动默认使用 `CreateProcessW` 和参数数组，服务在加入 Job Object 后才恢复运行。控制台重启后可重连原进程组，停止和重启按 Job Object 边界控制；仅明确的批处理/PowerShell 候选使用对应 Shell，旧卡片保留 `legacy-shell` 兼容。
