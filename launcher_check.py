@@ -14,6 +14,7 @@
 探测不只检查端口连通，还请求 /api/health 确认是总控台实例，
 避免把占用 9600-9609 的无关程序误判为控制台。
 """
+import hashlib
 import json
 import os
 import socket
@@ -26,6 +27,8 @@ import time
 import urllib.parse
 import urllib.request
 
+from launch_spec import launch_signature_fields
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PORT_START = 9600
 PORT_TRIES = 10
@@ -34,6 +37,14 @@ STATE_TIMEOUT = 5.0
 LAUNCH_ATTEMPTS = 2
 LAUNCH_WAIT_SEC = 15.0
 CONFIG_WAIT_SEC = 5.0
+# The launcher lock covers the complete check/start/retry transaction.  A
+# candidate can consume one readiness window plus one config read per retry;
+# leave additional room for the final health probe before a concurrent
+# double-click gives up and reports a false launch failure.
+LAUNCH_LOCK_WAIT_SEC = max(
+    60.0,
+    LAUNCH_ATTEMPTS * (LAUNCH_WAIT_SEC + CONFIG_WAIT_SEC) + 5.0,
+)
 CONTROL_TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{32,128}\Z")
 
 
@@ -48,6 +59,71 @@ def _control_token_path():
 
 def _config_path():
     return os.path.join(os.path.dirname(_control_token_path()), "config.json")
+
+
+def _launcher_lock_path():
+    """Return the lock shared by concurrent EXE/start.bat launch requests."""
+    return os.path.join(os.path.dirname(_control_token_path()),
+                        "launcher.lock")
+
+
+def _try_acquire_launcher_lock():
+    """Try to serialize the check-then-start section of the launcher.
+
+    The console's own lock cannot be used here: it is held by the running
+    server. This separate lock only lives for the short launcher transaction,
+    so a second double-click can wait for the first one and then reuse it.
+    """
+    path = _launcher_lock_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        lock_file = os.fdopen(fd, "r+", encoding="ascii")
+    except OSError:
+        return None
+    try:
+        lock_file.seek(0)
+        import msvcrt
+        msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+        lock_file.seek(0)
+        lock_file.truncate()
+        lock_file.write("%d\n" % os.getpid())
+        lock_file.flush()
+        return lock_file
+    except (OSError, ImportError):
+        try:
+            lock_file.close()
+        except OSError:
+            pass
+        return None
+
+
+def _release_launcher_lock(lock_file):
+    if lock_file is None:
+        return
+    try:
+        import msvcrt
+        lock_file.seek(0)
+        msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+    except (OSError, ImportError):
+        pass
+    finally:
+        try:
+            lock_file.close()
+        except OSError:
+            pass
+
+
+def _acquire_launcher_lock(timeout=LAUNCH_LOCK_WAIT_SEC):
+    """Wait briefly for another launcher transaction, then take the lock."""
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    while True:
+        lock_file = _try_acquire_launcher_lock()
+        if lock_file is not None:
+            return lock_file
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(0.1)
 
 
 def _read_control_token():
@@ -118,6 +194,48 @@ def _configured_app_count():
     return None if os.path.lexists(_control_token_path()) else 0
 
 
+def _app_config_signature(apps):
+    """Match server.py's signature while ignoring runtime-only fields."""
+    stable_defaults = {
+        "id": None, "name": "", "command": "", "cwd": None,
+        "port": None, "emoji": None, "glyph": None, "icon": None,
+        "favicon": None, "kind": "service",
+    }
+    stable_apps = []
+    for app in apps or []:
+        if not isinstance(app, dict) or not app.get("id"):
+            continue
+        stable_apps.append({key: app.get(key, default)
+                            for key, default in stable_defaults.items()})
+        stable_apps[-1].update(launch_signature_fields(app))
+    payload = json.dumps(
+        stable_apps, ensure_ascii=False, sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _configured_app_signature():
+    """Read the same disk-backed card definition used for startup count."""
+    paths = (_config_path(), _config_path() + ".bak")
+    for path in paths:
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                raw = json.load(fh)
+        except FileNotFoundError:
+            continue
+        except (OSError, UnicodeError, json.JSONDecodeError, TypeError,
+                ValueError):
+            continue
+        if not isinstance(raw, dict):
+            continue
+        apps = raw.get("apps")
+        if not isinstance(apps, list):
+            apps = []
+        return _app_config_signature(apps)
+    return None
+
+
 def _wait_for_configured_app_count(timeout=CONFIG_WAIT_SEC):
     """Wait briefly for an established roaming profile to become readable."""
     deadline = time.monotonic() + max(0.0, float(timeout))
@@ -148,7 +266,23 @@ def _console_status(port, disk_app_count=None):
         reported_disk_count = config.get("diskAppCount")
         if memory_count == 0 or reported_disk_count == 0:
             return "STALE"
+        disk_signature = _configured_app_signature()
+        live_signature = config.get("appSignature")
+        if (disk_signature is not None and live_signature is not None
+                and disk_signature != live_signature):
+            return "STALE"
         if isinstance(memory_count, int) and memory_count > 0:
+            # Backends from before appSignature can still hold a different
+            # one-card definition in memory. Verify their state before
+            # treating the instance as reusable.
+            if live_signature is None:
+                state = _read_json(port, "/api/state", STATE_TIMEOUT)
+                if isinstance(state, dict) and isinstance(
+                        state.get("apps"), list):
+                    if (disk_signature is not None
+                            and _app_config_signature(state["apps"])
+                            != disk_signature):
+                        return "STALE"
             return "RUNNING"
 
     # Older backends do not expose config counts in /api/health. Confirm an
@@ -205,8 +339,8 @@ def _start_console_candidate(expected_app_count, preferred_port=None):
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
 
 
-def launch_console(preferred_port=None, attempts=LAUNCH_ATTEMPTS,
-                   wait_sec=LAUNCH_WAIT_SEC):
+def _launch_console_unlocked(preferred_port=None, attempts=LAUNCH_ATTEMPTS,
+                             wait_sec=LAUNCH_WAIT_SEC):
     """Start and verify a non-empty console, retrying one stale candidate."""
     for _ in range(max(1, int(attempts))):
         status, port = find_console_status()
@@ -233,6 +367,25 @@ def launch_console(preferred_port=None, attempts=LAUNCH_ATTEMPTS,
             time.sleep(0.25)
     status, port = find_console_status()
     return port if status == "RUNNING" else None
+
+
+def launch_console(preferred_port=None, attempts=LAUNCH_ATTEMPTS,
+                   wait_sec=LAUNCH_WAIT_SEC):
+    """Reuse an existing console and serialize concurrent startup attempts.
+
+    The initial status probe happens before this function in the EXE and in
+    ``start.bat``. Two launchers can therefore both observe STOPPED. The
+    short-lived launcher lock makes the second one wait, then repeat the
+    status probe inside ``_launch_console_unlocked`` instead of starting a
+    second server process.
+    """
+    lock_file = _acquire_launcher_lock()
+    if lock_file is None:
+        return None
+    try:
+        return _launch_console_unlocked(preferred_port, attempts, wait_sec)
+    finally:
+        _release_launcher_lock(lock_file)
 
 
 PSUTIL_SPEC = "psutil>=7.2"

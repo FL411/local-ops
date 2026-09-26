@@ -25,7 +25,7 @@
 - **进程归属与本地控制**：使用 TokenUser SID；身份未知的进程不视为当前用户。所有写接口还要求 `X-Console-Token`，令牌存于私有 `control.token`，启动器仅通过浏览器 URL fragment 传入（不进入 HTTP 请求或 Referer）。
 - **CPU 口径**：按「占全部逻辑核百分比」归一化，`/api/state` 带 `coreCount`。
 - **优雅停止**：先走 WM_CLOSE 软通道（带窗口进程可清理），宽限后对仍存活的进程执行强制结束。
-- **Shell 包装**：`cmd /c "echo <marker> & <command>"`，`service` 需前台命令，命令内**不要用单引号**（cmd 不识别）。
+- **结构化启动**：新配置用 LaunchSpec 的 executable + argv 通过 `shell=False` 启动，并纳入命名 Job Object；旧卡片保留 `legacy-shell` 兼容。未加引号的 `& | < > ^` 不作为普通 argv 静默保存，需改用 `.bat/.cmd` 或 `.ps1` 脚本。批处理参数需满足 CMD 安全表示限制。
 - **快捷键提示**：前端 `MOD_KEY` 为 Ctrl；触发逻辑兼容 `metaKey || ctrlKey`。
 - 测试：在 Windows 上跑全套；提交前 `python tools/check_project.py` 与 `python tools/check_platform_leaks.py`。
 
@@ -62,13 +62,16 @@
   }],
   "watchedKeywords": ["ffmpeg"],
   "consolePort": 9600, "consolePid": 123, "consoleCwd": "D:\\apps\\local-ops",
-  "version": "1.0.0", "schemaVersion": 1,
+  "version": "1.0.0", "schemaVersion": 2,
   "degraded": false, "degradedReasons": []
 }
 ```
 - `GET /api/health` — 不运行进程/端口扫描的轻量健康检查，返回 `status/version/schemaVersion/degraded/issues/config`
 - `group`: `"mine"` | `"background"`；`icon`/`emoji`/`port`/`cwd`/`project`/`appId`/`appName`/`lastExit` 可为 `null`
-- `lastExit`：最近一次退出结果。任务状态为 `succeeded`（exit 0）/`canceled`（脚本主动 exit 130）/`failed`（其他自然退出）/`stopped`（总控台中止，code=null）；旧数据可能只有 `code/at`，API 输出时会兼容推导但不改写磁盘。批处理启动时保留上一次完成历史，自然退出或中止后覆盖
+- `lastExit`：最近一次退出结果。任务状态为 `succeeded`（exit 0）/`canceled`（脚本主动 exit 130）/`failed`（其他自然退出）/`stopped`（总控台中止，code=null）/`unknown`（总控台重启后 Job 已空，Windows 不再提供原进程退出码）；旧数据可能只有 `code/at`，API 输出时会兼容推导但不改写磁盘。批处理启动时保留上一次完成历史，自然退出或中止后覆盖
+- `controlMode`：`managed` 表示总控台管理的 LaunchSpec；`monitor` 只观测外部进程，不允许 start/stop/restart。`runInstance` 保存 `runId/jobName/rootPid/rootCreateTime/anchorPid/anchorCreateTime/startedAt/processState/exitResult`；控制台重启后恢复 Job Object 的退出 watcher 与 readiness watcher
+- `identityUnavailable`：命名 Job Object 暂时无法验证时为 `true`；此时卡片显示状态未知并禁用启动，避免重复创建服务
+- `readiness`：`unknown|checking|ready|timeout|failed`。HTTP readiness 只允许 loopback 和卡片配置端口，禁用系统代理并拒绝跨主机/端口重定向；TCP/HTTP 支持 IPv4/IPv6 loopback
 - `health`：每次状态读取时只读检查配置，返回 `status: ok|error|unknown`、`blocking` 与 `issues[{kind,severity,title,detail,fix,action}]`。明确缺失的 cwd、脚本或运行时会阻止启动；复杂 Shell 命令无法静态判断时为 unknown，不阻止运行
 - `kind`：`"service"`（长期服务，有端口语义）| `"task"`（批处理任务，强制 port=null，主按钮为「运行」）；旧数据缺省视为 `service`。启动台按 kind 分两个区渲染
 - `running`：仅表示存在通过本次启动 token、根 PID 进程树与当前用户 SID 三重校验的受控进程；不再以“配置端口有任意监听者”作为运行依据
@@ -118,8 +121,8 @@
 - **etime 解析**：`[[dd-]hh:]mm:ss` → 秒。
 - **分组逻辑**（按优先级）：用户 `promoted` → `mine`；进程名含开发关键词（python、node、ollama、docker 等）→ `mine`；Windows 系统进程名单或 System32/SysWOW64/WinSxS 路径 → `background`；其余默认 `mine`。`hidden` 仅是标记，照常返回。
 - **关键词扫描**：`psutil` 进程快照，args 小写后按关键词计数；只含当前用户，排除控制台自身。
-- **应用状态**：每次启动生成随机 `runToken`，外层 cmd 进程在 argv 中持有标记并等待内层命令。新版进程只有同时命中根 PID 进程树、当前用户 SID 和 token 才算 running；`lastPgid` 是为配置兼容保留的字段，在 Windows 存根 PID。升级前缺少 token 的旧进程，只有配置 `lastPid`、监听端口、当前用户 SID 与真实 cwd 全部一致时才兼容认领。`ports` 来自受控进程树成员实际监听的端口。
-- **应用启停**：多张卡片可保存相同端口（例如多个默认使用 3000 的项目）；启动前只拒绝失效配置和当时真实被占用的端口。重启先做健康预检，失败时不会先停掉仍工作的旧服务。停止时先校验 token，再冻结进程树成员并由叶到根执行 WM_CLOSE/强制结束，**绝不按端口杀其他监听者**。服务手动 stop 不记录退出历史；任务自然结束记录四态结果，总控台中止记录 `stopped`。批处理不做“长期服务存活探测”，避免把快速成功误判成失败
+- **应用状态**：每次启动生成随机 `runToken` 和命名 Job Object。应用进程在恢复的 Job Object 成员、当前用户 SID 边界内才算 running；不再以“配置端口有任意监听者”作为运行依据。控制台重启后恢复退出/readiness watcher，Job 已空但退出码不可恢复时 task 记为 `unknown`。`lastPgid` 是兼容字段，在 Windows 存根 PID。升级前缺少 Job Object 的旧进程，只有配置 `lastPid`、监听端口、当前用户 SID 与真实 cwd 全部一致时才兼容识别。`ports` 来自受控进程树成员实际监听的端口。
+- **应用启停**：多张卡片可保存相同端口（例如多个默认使用 3000 的项目）；启动前只拒绝失效配置和当时真实被占用的端口。重启先做健康预检，失败时不会先停掉仍工作的旧服务。停止与重启以命名 Job Object 为边界，**绝不按端口杀其他监听者**。服务手动 stop 不记录退出历史；任务自然结束记录状态，无法恢复退出码时为 `unknown`。批处理不做“长期服务存活探测”，避免把快速成功误判成失败
 - **任务取消协议**：一次性任务内部的“用户主动取消”以退出码 **130** 通知总控台；0 表示成功，其余表示失败。不要通过日志文字猜测状态
 - **配置健康**：`inspect_app_health` 只解析确定无歧义的简单命令并执行 stat/权限/PATH 检查，不执行命令、不展开变量/通配符。相对脚本按配置 cwd（空值时用户主目录）解析；复杂或动态命令返回 unknown
 - **运行中编辑**：编辑面板打开时立即显示“停止服务”。点击只调用 stop，面板保持打开且当前草稿不变；停止成功后用户继续编辑并普通保存。名称/图标仍可在运行中直接保存。`stopBeforeUpdate:true` 保留为 API 客户端的原子停止更新能力，但不是默认前端流程。
@@ -134,8 +137,8 @@
 ## 配置 schema
 ```json
 {
-  "schemaVersion": 1,
-  "apps": [{"id": "8位hex", "name": "", "command": "", "cwd": null, "port": null, "emoji": null, "icon": null, "favicon": null, "kind": "service", "lastPid": null, "lastPgid": null, "runToken": null, "attached": false, "lastExit": null, "createdAt": 0}],
+  "schemaVersion": 2,
+  "apps": [{"id": "8位hex", "name": "", "command": "", "cwd": null, "port": null, "emoji": null, "icon": null, "favicon": null, "kind": "service", "lastPid": null, "lastPgid": null, "runToken": null, "attached": false, "controlMode": "managed", "launchSpec": {}, "observation": null, "runInstance": null, "readinessState": "unknown", "lastExit": null, "createdAt": 0}],
   "hidden": ["name:port"], "pinned": ["name:port"], "promoted": ["name:port"],
   "watchedKeywords": [],
   "uiTheme": "ops"

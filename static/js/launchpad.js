@@ -12,6 +12,15 @@ import { configuredPort, actualPorts, hasPortMismatch,
 
 const svcGrid = $('#svcGrid'), taskGrid = $('#taskGrid');
 const reorderStatus = $('#reorderStatus');
+
+function isMonitorApp(app) {
+  return !!app && (app.controlMode === 'monitor'
+    || (app.attached && app.launchConfigured !== true));
+}
+
+function needsLaunchConfiguration(app) {
+  return isMonitorApp(app) || !!(app && app.launchConfigured === false);
+}
 /* ---------------- 图标取色光晕 ---------------- */
 function hueFromString(s) {
   let h = 0;
@@ -217,16 +226,17 @@ function createAppCard() {
 }
 
 /* 主按钮：服务 = 启动/停止；批处理 = 运行/中止。 */
-function setPrimary(btn, running, kind) {
-  const sig = running + '|' + kind;
+function setPrimary(btn, running, kind, monitor = false) {
+  const sig = running + '|' + kind + '|' + monitor;
   if (btn._sig === sig) return;
   btn._sig = sig;
-  const label = running ? (kind === 'task' ? '中止' : '停止')
+  const label = monitor ? '确认启动配置'
+    : running ? (kind === 'task' ? '中止' : '停止')
     : (kind === 'task' ? '运行' : '启动');
-  setChildren(btn, icon(running ? 'square' : 'play', 13));
+  setChildren(btn, icon(monitor ? 'pencil' : running ? 'square' : 'play', 13));
   btn.appendChild(document.createTextNode(label));
-  btn.classList.toggle('btn-stop', running);
-  btn.classList.toggle('btn-accent', !running);
+  btn.classList.toggle('btn-stop', running && !monitor);
+  btn.classList.toggle('btn-accent', !running || monitor);
 }
 
 function updateAppCard(card, app) {
@@ -278,6 +288,12 @@ function updateAppCard(card, app) {
   /* 状态副行：运行态、端口冲突，以及服务/任务上次退出结果。 */
   const kind = app.kind || 'service';
   const isTask = kind === 'task';
+  const monitor = isMonitorApp(app);
+  const identityUnavailable = !monitor && !!app.identityUnavailable;
+  const configureOnly = needsLaunchConfiguration(app);
+  const monitorState = app.processState || (app.running ? 'alive' : 'absent');
+  const monitorAlive = monitor && monitorState === 'alive';
+  const readiness = app.readiness || app.readinessState || 'unknown';
   const taskStatus = isTask && app.lastExit ? taskExitStatus(app.lastExit) : '';
   const taskFinished = isTask && !app.running && !!app.lastExit;
   const taskFailed = taskFinished && taskStatus === 'failed';
@@ -287,13 +303,23 @@ function updateAppCard(card, app) {
   const healthIssue = app.health && app.health.blocking && healthIssues.length
     ? healthIssues[0] : null;
   const portMismatch = hasPortMismatch(app);
-  r.dot.classList.toggle('running', !!app.running);
+  r.dot.classList.toggle('running', !!app.running || monitorAlive);
   r.dot.classList.toggle('success', taskSucceeded);
   r.dot.classList.toggle('danger', taskFailed);
-  let stTxt = app.running ? '运行中' : (app.port ? '已停止' : '未运行');
+  const observedPid = app.pid || (app.observation && app.observation.pid);
+  let stTxt = monitor
+    ? (monitorAlive ? '仅监控 · PID ' + (observedPid || app.pid || '在线')
+      : '仅监控 · ' + (monitorState === 'exited' ? '进程已退出' : '等待进程'))
+    : (configureOnly ? '启动配置未确认'
+      : app.running ? '运行中' : (app.port ? '已停止' : '未运行'));
   let stFail = false;
   let taskHistoryText = '';
-  if (app.portConflict) {
+  if (identityUnavailable) {
+    stTxt = '无法验证运行状态';
+    stFail = true;
+  } else if (monitor) {
+    stFail = false;
+  } else if (app.portConflict) {
     stTxt = '配置冲突';
     stFail = true;
   } else if (app.portOccupied) {
@@ -302,11 +328,27 @@ function updateAppCard(card, app) {
   } else if (portMismatch) {
     stTxt = '端口配置不一致';
     stFail = true;
+  } else if (!monitor && readiness === 'checking') {
+    stTxt = '启动中 · 就绪检查';
+  } else if (!monitor && app.running && readiness === 'timeout') {
+    stTxt = '就绪超时';
+    stFail = true;
+  } else if (!monitor && app.running && readiness === 'failed') {
+    stTxt = '就绪检查失败';
+    stFail = true;
   } else if (app.running && app.port && app.listening === false) {
     stTxt = '等待端口';
   } else if (!app.running && healthIssue) {
     stTxt = healthIssue.title || '配置不可用';
     stFail = true;
+  } else if (taskFinished && taskStatus === 'unknown') {
+    stTxt = '重启期间结束 · 退出码未知';
+    const endedAt = Number(app.lastExit.at);
+    const ago = Number.isFinite(endedAt) && endedAt > 0
+      ? fmtUptime(Date.now() / 1000 - endedAt) : '';
+    const duration = fmtDuration(app.lastExit.durationSec);
+    taskHistoryText = [ago, duration ? '用时 ' + duration : '']
+      .filter(Boolean).join(' · ');
   } else if (taskFinished && (taskStatus === 'canceled' || taskStatus === 'stopped')) {
     stTxt = taskStatus === 'canceled' ? '已取消' : '已中止';
     const endedAt = Number(app.lastExit.at);
@@ -406,9 +448,10 @@ function updateAppCard(card, app) {
     r.stUp.hidden = true;
     setText(r.stUp, '');
   }
-  setPrimary(r.primary, !!app.running, kind);
+  setPrimary(r.primary, !!app.running, kind, configureOnly);
   const appName = app.name || (isTask ? '任务' : '应用');
-  const primaryVerb = app.running ? (isTask ? '中止' : '停止')
+  const primaryVerb = configureOnly ? '确认启动配置'
+    : app.running ? (isTask ? '中止' : '停止')
     : (isTask ? '运行' : '启动');
   r.primary.setAttribute('aria-label', primaryVerb + ' ' + appName);
   r.open.setAttribute('aria-label', '打开 ' + appName + ' 的页面');
@@ -418,22 +461,29 @@ function updateAppCard(card, app) {
   r.diag.setAttribute('aria-label',
     (isTask ? '配置与运行诊断：' : '配置与启动诊断：') + appName);
   r.restart.setAttribute('aria-label', '重启 ' + appName);
+  r.edit.title = configureOnly ? '编辑并确认启动配置' : '编辑';
   r.edit.setAttribute('aria-label', '编辑 ' + appName);
   r.del.setAttribute('aria-label', '删除 ' + appName);
   card.setAttribute('aria-label', appName + '，' + stTxt);
-  r.restart.hidden = !app.running || kind !== 'service';
-  const blocked = !app.running &&
-    (!!app.portConflict || !!healthIssue);
+  r.restart.hidden = configureOnly || !app.running || kind !== 'service';
+  const blocked = !configureOnly && !app.running &&
+    (identityUnavailable || !!app.portConflict || !!healthIssue);
   // 注意：portOccupied 不在此禁用——按钮保持可点，点击时走「释放端口并启动」确认流。
   r.primary.disabled = blocked;
-  r.primary.title = app.portConflict
+  r.primary.title = identityUnavailable
+    ? 'Job Object 暂时无法验证；为避免重复启动，验证恢复前不能启动'
+    : monitor
+    ? '此卡片仅监控外部进程；点击后确认启动配置，保存后才可托管启停'
+    : configureOnly ? '启动配置未确认；点击编辑并保存后才可托管启停'
+    : app.portConflict
     ? '端口配置重复，请先编辑其中一项'
     : app.portOccupied ? '端口已被占用；点击可释放该进程后启动'
       : healthIssue ? healthIssue.detail || healthIssue.title : '';
   const launchFailed = !app.running && !!app.lastExit
     && (isTask ? taskStatus === 'failed' : app.lastExit.code !== 0);
   card.classList.toggle('running', !!app.running);
-  card.classList.toggle('has-error', !!app.portConflict || !!app.portOccupied
+  card.classList.toggle('monitor-only', monitor);
+  card.classList.toggle('has-error', identityUnavailable || !!app.portConflict || !!app.portOccupied
     || portMismatch || launchFailed || !!healthIssue);
   r.diag.hidden = !launchFailed && !healthIssue;
   updateCardGlow(card, app);
@@ -445,6 +495,10 @@ function updateAppCard(card, app) {
 async function toggleApp(id, button) {
   const app = findApp(id);
   if (!app) return;
+  if (needsLaunchConfiguration(app)) {
+    openAppModal(app);
+    return;
+  }
   const isTask = (app.kind || 'service') === 'task';
   if (button && button.dataset.busy === 'true') return;
   if (!app.running && app.portConflict) {
@@ -494,12 +548,21 @@ async function toggleApp(id, button) {
 export { toggleApp };
 
 function confirmRestartApp(app) {
+  if (needsLaunchConfiguration(app)) {
+    openAppModal(app);
+    return;
+  }
   openConfirm({
     title: '重启应用',
     bodyHtml: '确定要重启 <b>' + escapeHtml(app.name || '') + '</b> 吗？' +
       '<div class="confirm-detail">总控台会等待旧进程完全退出，然后使用当前配置重新启动。</div>',
     okText: '重新启动',
     onOk: async () => {
+      const latest = findApp(app.id);
+      if (needsLaunchConfiguration(latest)) {
+        if (latest) openAppModal(latest);
+        return;
+      }
       const r = await act(post('/api/apps/' + app.id + '/restart'));
       if (r && r.ok !== false) toast('已重启 ' + (app.name || '应用'));
       window.__poll();
@@ -532,11 +595,21 @@ function confirmReleaseAndStart(app) {
       escapeHtml(app.name || '') + '」。</div>',
     okText: '释放并启动',
     onOk: async () => {
+      const latest = findApp(app.id);
+      if (needsLaunchConfiguration(latest)) {
+        if (latest) openAppModal(latest);
+        return;
+      }
       const kill = await act(post('/api/kill', { pid }));
       if (kill && kill.ok !== false) {
         // 进程终止是异步的，稍等端口释放后再启动，避免再次撞上占用
         await new Promise(r => setTimeout(r, 900));
         await window.__poll();
+        const current = findApp(app.id);
+        if (needsLaunchConfiguration(current)) {
+          if (current) openAppModal(current);
+          return;
+        }
         const start = await act(post('/api/apps/' + app.id + '/start'));
         if (start && start.ok !== false) {
           toast('已启动 ' + (app.name || '应用'));
@@ -551,7 +624,9 @@ function confirmDeleteApp(app) {
   openConfirm({
     title: '删除应用',
     bodyHtml: '确定要删除 <b>' + escapeHtml(app.name || '') + '</b> 吗？' +
-      '<div class="confirm-detail">将先停止该应用，并删除其图标与日志。</div>',
+      (isMonitorApp(app)
+        ? '<div class="confirm-detail">将删除监控卡片、图标与日志；外部进程会继续运行。</div>'
+        : '<div class="confirm-detail">将先停止该应用，并删除其图标与日志。</div>'),
     okText: '删除',
     onOk: async () => {
       await act(del('/api/apps/' + app.id));
@@ -614,9 +689,8 @@ function openPortDiagnostic(app) {
         '”使用。两张卡片可以保存相同端口；若要现在启动当前项目，请等待它停止、' +
         '修改当前项目端口，或确认后停止占用应用。'
       : '当前监听者“' + ownerLabel + '”并不是由这张卡片启动的。' +
-        '它仍会作为独立服务显示，两张卡片也可以保存相同端口。如果它正是本项目的服务，' +
-        '可以认领为本卡片；若要现在启动当前项目，' +
-        '请等待它停止、修改当前项目端口，或确认后结束该进程。';
+        '可以建立仅监控关联；该操作不会取得停止或重启它的权限。两张卡片也可以保存相同端口。' +
+        '若要托管后续启动，请编辑卡片并确认启动配置。';
   } else if (owner) {
     diagNote.textContent = '该进程不属于当前用户。你可以打开它或修改当前卡片端口，总控台不会结束它。';
   } else {
@@ -625,6 +699,7 @@ function openPortDiagnostic(app) {
   diagOpen.hidden = !(occupied && owner && app.port);
   diagAttach.hidden = !(occupied && owner && owner.currentUser && !owner.appId
     && owner.pid !== (state.data && state.data.consolePid));
+  diagAttach.textContent = '仅监控此进程';
   diagEdit.hidden = !(conflict || occupied);
   diagKill.hidden = !(occupied && owner && owner.currentUser
     && owner.pid !== (state.data && state.data.consolePid));
@@ -659,16 +734,16 @@ diagAttach.addEventListener('click', () => {
   if (!app || !owner) return;
   closePortDiagnostic();
   openConfirm({
-    title: '认领为本卡片',
+    title: '建立监控关联',
     bodyHtml: '把 PID ' + escapeHtml(owner.pid) +
-      '（' + escapeHtml(owner.name || '') + '）认领为「' + escapeHtml(app.name) +
-      '」的受管进程？<div class="confirm-detail">认领后卡片显示运行中，可正常停止/重启；' +
-      '若卡片目录与进程实际目录不一致，会自动同步为实际目录。</div>',
-    okText: '认领',
+      '（' + escapeHtml(owner.name || '') + '）关联到「' + escapeHtml(app.name) +
+      '」？<div class="confirm-detail">卡片只记录该外部进程的观测信息，不会停止或重启它。' +
+      '之后可编辑卡片并确认启动配置，以托管后续启动。</div>',
+    okText: '仅监控',
     onOk: async () => {
       const r = await act(post('/api/apps/' + app.id + '/attach', { pid: owner.pid }));
       if (r && r.ok) {
-        toast(r.cwdUpdated ? '已认领，卡片目录已同步为进程实际目录' : '已认领为本卡片');
+        toast('已建立监控关联；该进程仍由原启动者管理');
       }
       window.__poll();
     },
@@ -1120,7 +1195,8 @@ function loadLevel(pct) {
 const SVC_FILTERS = [['all', '全部'], ['running', '运行中'],
   ['stopped', '已停止'], ['error', '异常']];
 const TASK_FILTERS = [['all', '全部'], ['running', '运行中'],
-  ['succeeded', '成功'], ['failed', '失败'], ['canceled', '已取消']];
+  ['succeeded', '成功'], ['failed', '失败'], ['canceled', '已取消'],
+  ['unknown', '结果未知']];
 let svcFilter = 'all', taskFilter = 'all';
 /* 芯片按钮只创建一次，点击时必须读取当轮数据而不是首次渲染的闭包快照 */
 let latestSvcs = [], latestTasks = [];

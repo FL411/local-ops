@@ -1,15 +1,27 @@
 import json
 import os
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest import mock
 
 import server
+
+
+def write_fake_pe(path):
+    """Write the minimal header needed for a fake PE executable in tests."""
+    header = bytearray(68)
+    header[:2] = b"MZ"
+    header[0x3C:0x40] = (64).to_bytes(4, "little")
+    header[64:68] = b"PE\0\0"
+    with open(path, "wb") as handle:
+        handle.write(header)
 
 
 class ParsingTests(unittest.TestCase):
@@ -134,6 +146,84 @@ class WindowsScriptCommandTests(unittest.TestCase):
                 server.normalize_attached_python_command(command, td),
                 command)
 
+    def test_py_launcher_selector_is_removed_when_using_project_venv(self):
+        with tempfile.TemporaryDirectory() as td:
+            scripts = os.path.join(td, ".venv", "Scripts")
+            os.makedirs(scripts)
+            venv_python = os.path.join(scripts, "python.exe")
+            with open(venv_python, "wb") as handle:
+                handle.write(b"MZ")
+            command = "py -3.12 -m uvicorn app:app --port 8765"
+
+            normalized = server.normalize_attached_python_command(command, td)
+            tokens = server._simple_command_tokens(normalized)
+
+        self.assertEqual(os.path.normcase(tokens[0]),
+                         os.path.normcase(venv_python))
+        self.assertEqual(tokens[1:], [
+            "-m", "uvicorn", "app:app", "--port", "8765"])
+
+    def test_escaped_quotes_are_not_rebuilt_by_the_simple_parser(self):
+        with tempfile.TemporaryDirectory() as td:
+            scripts = os.path.join(td, ".venv", "Scripts")
+            os.makedirs(scripts)
+            with open(os.path.join(scripts, "python.exe"), "wb") as handle:
+                handle.write(b"MZ")
+            command = r'python -c "print(\"quoted\")"'
+
+            self.assertEqual(
+                server.normalize_attached_python_command(command, td),
+                command)
+
+    def test_legacy_uv_cache_command_is_repaired_after_attach_marker_is_cleared(self):
+        with tempfile.TemporaryDirectory() as project_dir, \
+                tempfile.TemporaryDirectory() as config_dir:
+            scripts = os.path.join(project_dir, ".venv", "Scripts")
+            os.makedirs(scripts)
+            venv_python = os.path.join(scripts, "python.exe")
+            with open(venv_python, "wb") as handle:
+                handle.write(b"MZ")
+            config_path = os.path.join(config_dir, "config.json")
+            cfg = server.Config(config_path)
+            old_command = (
+                r"C:\Users\example\AppData\Roaming\uv\python\cpython-3.12-windows-x86_64-none\python.exe "
+                r"-m uvicorn dashboard.app:app --host 127.0.0.1 --port 8765")
+            cfg.update(lambda data: data["apps"].append({
+                "id": "legacy-card", "name": "study-planner",
+                "command": old_command, "cwd": project_dir, "port": 8765,
+                "attached": False,
+            }))
+
+            self.assertTrue(server.repair_legacy_app_commands(cfg))
+            saved = server.find_app(cfg.snapshot(), "legacy-card")
+            tokens = server._simple_command_tokens(saved["command"])
+            self.assertEqual(os.path.normcase(tokens[0]),
+                             os.path.normcase(venv_python))
+            self.assertEqual(tokens[1:], [
+                "-m", "uvicorn", "dashboard.app:app", "--host", "127.0.0.1",
+                "--port", "8765"])
+
+    def test_legacy_repair_does_not_rewrite_unrelated_python_cards(self):
+        with tempfile.TemporaryDirectory() as project_dir, \
+                tempfile.TemporaryDirectory() as config_dir:
+            scripts = os.path.join(project_dir, ".venv", "Scripts")
+            os.makedirs(scripts)
+            with open(os.path.join(scripts, "python.exe"), "wb") as handle:
+                handle.write(b"MZ")
+            config_path = os.path.join(config_dir, "config.json")
+            cfg = server.Config(config_path)
+            command = r"C:\Tools\Python\python.exe -m uvicorn app:app"
+            cfg.update(lambda data: data["apps"].append({
+                "id": "manual-card", "name": "manual",
+                "command": command, "cwd": project_dir, "port": 8000,
+                "attached": False,
+            }))
+
+            self.assertFalse(server.repair_legacy_app_commands(cfg))
+            self.assertEqual(
+                server.find_app(cfg.snapshot(), "manual-card")["command"],
+                command)
+
     def test_selected_python_script_with_spaces_is_checked(self):
         with tempfile.TemporaryDirectory() as td:
             folder = os.path.join(td, "script folder")
@@ -168,6 +258,35 @@ class WindowsScriptCommandTests(unittest.TestCase):
                     target, _, relative = server._script_target(tokens, td)
                     self.assertEqual(os.path.normcase(target), os.path.normcase(path))
                     self.assertFalse(relative)
+
+    def test_plain_text_file_is_not_treated_as_windows_executable(self):
+        with tempfile.TemporaryDirectory() as td:
+            for name in ("run.txt", "fake.exe"):
+                with self.subTest(name=name):
+                    path = os.path.join(td, name)
+                    with open(path, "w", encoding="utf-8") as handle:
+                        handle.write("this is ordinary text\n")
+                    health = server.inspect_app_health(
+                        {"command": path, "cwd": td})
+                    self.assertTrue(health["blocking"])
+                    self.assertEqual(health["issues"][0]["kind"],
+                                     "script-not-executable")
+
+    def test_selected_python_script_prefers_project_venv(self):
+        with tempfile.TemporaryDirectory() as td:
+            scripts = os.path.join(td, ".venv", "Scripts")
+            os.makedirs(scripts)
+            python = os.path.join(scripts, "python.exe")
+            write_fake_pe(python)
+            path = os.path.join(td, "job.py")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("print('ok')\n")
+
+            command = server.command_for_script(path, td)
+            tokens = server._simple_command_tokens(command)
+
+        self.assertEqual(os.path.normcase(tokens[0]), os.path.normcase(python))
+        self.assertEqual(tokens[1:], [path])
 
     def test_windows_dynamic_commands_remain_unknown(self):
         self.assertIsNone(server._simple_command_tokens("python %SCRIPT%"))
@@ -373,14 +492,196 @@ class ProjectDetectionTests(unittest.TestCase):
             result, error = server.detect_project(td)
 
         self.assertIsNone(error)
-        self.assertEqual(result["candidates"], [
-            {"command": "hexo s", "label": "Hexo 本地服务",
-             "source": "Hexo 项目结构", "port": 4000,
-             "kind": "service", "detail": "等同于 hexo server"},
-            {"command": "hexo cl", "label": "Hexo 清除缓存",
-             "source": "Hexo 项目结构", "port": None,
-             "kind": "task", "detail": "清除缓存和已生成文件，不启动服务"},
-        ])
+        self.assertEqual(
+            [{key: candidate[key] for key in (
+                "command", "label", "source", "port", "kind", "detail")}
+             for candidate in result["candidates"]],
+            [
+                {"command": "hexo s", "label": "Hexo 本地服务",
+                 "source": "Hexo 项目结构", "port": 4000,
+                 "kind": "service", "detail": "等同于 hexo server"},
+                {"command": "hexo cl", "label": "Hexo 清除缓存",
+                 "source": "Hexo 项目结构", "port": None,
+                 "kind": "task", "detail": "清除缓存和已生成文件，不启动服务"},
+            ])
+        for candidate in result["candidates"]:
+            self.assertIn("available", candidate)
+            if candidate["available"]:
+                self.assertEqual(candidate["launchSpec"]["mode"], "exec")
+            else:
+                self.assertTrue(candidate["unavailableReason"])
+
+    def test_python_project_candidate_uses_local_virtualenv(self):
+        with tempfile.TemporaryDirectory() as td:
+            scripts = os.path.join(td, "venv", "Scripts")
+            os.makedirs(scripts)
+            python = os.path.join(scripts, "python.exe")
+            write_fake_pe(python)
+            with open(os.path.join(td, "manage.py"), "w", encoding="utf-8") as f:
+                f.write("# django entry point\n")
+
+            result, error = server.detect_project(td)
+
+        self.assertIsNone(error)
+        candidate = result["candidates"][0]
+        self.assertTrue(candidate["available"])
+        self.assertEqual(candidate["launchSpec"]["mode"], "exec")
+        self.assertEqual(os.path.normcase(candidate["launchSpec"]["executable"]),
+                         os.path.normcase(python))
+        self.assertEqual(candidate["launchSpec"]["args"],
+                         ["manage.py", "runserver"])
+
+    def test_missing_uv_runtime_marks_candidate_unavailable(self):
+        with tempfile.TemporaryDirectory() as td:
+            with open(os.path.join(td, "pyproject.toml"), "w", encoding="utf-8") as f:
+                f.write('[project]\nname = "demo"\n')
+            with open(os.path.join(td, "uv.lock"), "w", encoding="utf-8") as f:
+                f.write("")
+            with open(os.path.join(td, "main.py"), "w", encoding="utf-8") as f:
+                f.write("from fastapi import FastAPI\n")
+
+            with mock.patch.object(server.shutil, "which", return_value=None):
+                result, error = server.detect_project(td)
+
+        self.assertIsNone(error)
+        candidate = result["candidates"][0]
+        self.assertFalse(candidate["available"])
+        self.assertNotIn("launchSpec", candidate)
+        self.assertIn("uv", candidate["unavailableReason"].lower())
+
+    def test_missing_poetry_runtime_marks_candidate_unavailable(self):
+        with tempfile.TemporaryDirectory() as td:
+            with open(os.path.join(td, "pyproject.toml"), "w", encoding="utf-8") as f:
+                f.write('[tool.poetry]\nname = "demo"\n')
+            with open(os.path.join(td, "poetry.lock"), "w", encoding="utf-8") as f:
+                f.write("")
+            with open(os.path.join(td, "manage.py"), "w", encoding="utf-8") as f:
+                f.write("# django entry point\n")
+
+            with mock.patch.object(server.shutil, "which", return_value=None):
+                result, error = server.detect_project(td)
+
+        self.assertIsNone(error)
+        candidate = result["candidates"][0]
+        self.assertFalse(candidate["available"])
+        self.assertNotIn("launchSpec", candidate)
+        self.assertIn("poetry", candidate["unavailableReason"].lower())
+
+    def test_uv_lock_resolves_to_absolute_structured_runner(self):
+        with tempfile.TemporaryDirectory() as td:
+            with open(os.path.join(td, "pyproject.toml"), "w", encoding="utf-8") as f:
+                f.write('[project]\nname = "demo"\n')
+            with open(os.path.join(td, "uv.lock"), "w", encoding="utf-8") as f:
+                f.write("")
+            with open(os.path.join(td, "main.py"), "w", encoding="utf-8") as f:
+                f.write("from fastapi import FastAPI\n")
+            uv = os.path.join(td, "uv.exe")
+            write_fake_pe(uv)
+
+            with mock.patch.object(server.shutil, "which", return_value=uv):
+                result, error = server.detect_project(td)
+
+        self.assertIsNone(error)
+        candidate = result["candidates"][0]
+        self.assertTrue(candidate["available"])
+        self.assertEqual(candidate["launchSpec"]["mode"], "exec")
+        self.assertEqual(candidate["launchSpec"]["executable"], uv)
+        self.assertEqual(candidate["launchSpec"]["args"], [
+            "run", "uvicorn", "main:app", "--reload"])
+
+    def test_poetry_lock_resolves_cmd_runner_structurally(self):
+        with tempfile.TemporaryDirectory() as td:
+            with open(os.path.join(td, "pyproject.toml"), "w", encoding="utf-8") as f:
+                f.write('[tool.poetry]\nname = "demo"\n')
+            with open(os.path.join(td, "poetry.lock"), "w", encoding="utf-8") as f:
+                f.write("")
+            with open(os.path.join(td, "manage.py"), "w", encoding="utf-8") as f:
+                f.write("# django entry point\n")
+            poetry = os.path.join(td, "poetry.cmd")
+            with open(poetry, "w", encoding="utf-8") as f:
+                f.write("@echo off\n")
+            cmd_exe = server._resolve_runtime("cmd.exe")
+
+            def resolve(name, path=None):
+                if os.path.basename(name).casefold() == "poetry":
+                    return poetry
+                if os.path.basename(name).casefold() == "cmd.exe":
+                    return cmd_exe
+                return None
+
+            with mock.patch.object(server.shutil, "which", side_effect=resolve):
+                result, error = server.detect_project(td)
+
+        self.assertIsNone(error)
+        candidate = result["candidates"][0]
+        self.assertTrue(candidate["available"])
+        self.assertEqual(candidate["launchSpec"]["mode"], "cmd")
+        self.assertEqual(candidate["launchSpec"]["executable"], poetry)
+        self.assertEqual(candidate["launchSpec"]["args"], [
+            "run", "python", "manage.py", "runserver"])
+
+    def test_windows_batch_candidate_uses_absolute_cmd_launch_spec(self):
+        with tempfile.TemporaryDirectory() as td:
+            script = os.path.join(td, "start.bat")
+            with open(script, "w", encoding="utf-8") as f:
+                f.write("@echo off\n")
+
+            result, error = server.detect_project(td)
+
+        self.assertIsNone(error)
+        candidate = result["candidates"][0]
+        self.assertTrue(candidate["available"])
+        self.assertEqual(candidate["launchSpec"]["mode"], "cmd")
+        self.assertEqual(os.path.normcase(candidate["launchSpec"]["executable"]),
+                         os.path.normcase(script))
+        self.assertEqual(candidate["launchSpec"]["args"], [])
+        self.assertTrue(os.path.isabs(candidate["launchSpec"]["executable"]))
+
+    def test_powershell_candidate_uses_absolute_runtime(self):
+        with tempfile.TemporaryDirectory() as td:
+            script = os.path.join(td, "start.ps1")
+            with open(script, "w", encoding="utf-8") as f:
+                f.write("Write-Output ok\n")
+            powershell = os.path.join(td, "powershell.exe")
+            with mock.patch.object(server, "_powershell_executable",
+                                   return_value=powershell):
+                result, error = server.detect_project(td)
+
+        self.assertIsNone(error)
+        candidate = result["candidates"][0]
+        self.assertEqual(candidate["launchSpec"]["mode"], "powershell")
+        self.assertEqual(candidate["launchSpec"]["executable"], powershell)
+        self.assertEqual(candidate["launchSpec"]["args"], [
+            "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script])
+
+    def test_shell_script_is_hidden_without_bash_or_wsl(self):
+        with tempfile.TemporaryDirectory() as td:
+            with open(os.path.join(td, "start.sh"), "w", encoding="utf-8") as f:
+                f.write("#!/bin/sh\necho ok\n")
+            with mock.patch.object(server, "_bash_runtime",
+                                   return_value=(None, None)):
+                result, error = server.detect_project(td)
+
+        self.assertIsNone(error)
+        self.assertEqual(result["candidates"], [])
+
+    def test_shell_script_uses_wsl_when_available(self):
+        with tempfile.TemporaryDirectory() as td:
+            script = os.path.join(td, "start.sh")
+            with open(script, "w", encoding="utf-8") as f:
+                f.write("#!/bin/sh\necho ok\n")
+            wsl = r"C:\Windows\System32\wsl.exe"
+            with mock.patch.object(server, "_bash_runtime",
+                                   return_value=(wsl, "wsl")):
+                result, error = server.detect_project(td)
+
+        self.assertIsNone(error)
+        candidate = result["candidates"][0]
+        self.assertTrue(candidate["available"])
+        self.assertEqual(candidate["launchSpec"]["mode"], "exec")
+        self.assertEqual(candidate["launchSpec"]["executable"], wsl)
+        self.assertEqual(candidate["launchSpec"]["args"],
+                         ["bash", "--", script])
 
     def test_hexo_server_script_is_not_duplicated(self):
         with tempfile.TemporaryDirectory() as td:
@@ -449,7 +750,7 @@ class ConfigTests(unittest.TestCase):
                 migrated = json.load(f)
             with open(path + ".bak", "r", encoding="utf-8") as f:
                 previous = json.load(f)
-            self.assertEqual(migrated["schemaVersion"], 1)
+            self.assertEqual(migrated["schemaVersion"], 2)
             self.assertNotIn("schemaVersion", previous)
 
             # 第二次读取已是当前 schema，不再改写备份。
@@ -459,6 +760,38 @@ class ConfigTests(unittest.TestCase):
             self.assertIsNone(cfg2.health_info()["migratedFromSchema"])
             with open(path + ".bak", "rb") as f:
                 self.assertEqual(f.read(), previous_bytes)
+
+    def test_v1_migration_preserves_command_and_separates_attached_identity(self):
+        original_command = 'python "folder with spaces\\app.py" --note "a&b%"'
+        raw = {
+            "schemaVersion": 1,
+            "apps": [
+                {"id": "managed01", "command": original_command,
+                 "cwd": r"D:\work\my project", "port": 8765,
+                 "attached": False, "runToken": None, "lastPid": None},
+                {"id": "monitor01", "command": original_command,
+                 "cwd": r"D:\work\my project", "port": 8765,
+                 "attached": True, "lastPid": 4242,
+                 "lastCreateTime": 123.5},
+            ],
+        }
+
+        migrated, source = server.migrate_config(raw)
+        managed, monitor = migrated["apps"]
+
+        self.assertEqual(source, 1)
+        self.assertEqual(migrated["schemaVersion"], 2)
+        self.assertEqual(managed["controlMode"], "managed")
+        self.assertEqual(managed["launchSpec"]["mode"], "legacy-shell")
+        self.assertEqual(managed["launchSpec"]["legacyCommand"], original_command)
+        self.assertEqual(managed["command"], original_command)
+        self.assertTrue(managed["launchConfigured"])
+        self.assertEqual(monitor["controlMode"], "monitor")
+        self.assertIsNone(monitor["launchSpec"])
+        self.assertFalse(monitor["launchConfigured"])
+        self.assertEqual(monitor["observation"]["pid"], 4242)
+        self.assertEqual(monitor["observation"]["createTime"], 123.5)
+        self.assertEqual(monitor["command"], original_command)
 
     def test_future_schema_is_not_silently_overwritten(self):
         with tempfile.TemporaryDirectory() as td:
@@ -631,24 +964,277 @@ class ProcessIdentityTests(unittest.TestCase):
             app = {"id": "deadbeef", "command": command, "cwd": td}
             ok, error, proc, pgid, token = server.start_app(app)
             self.assertTrue(ok, error)
-            tracked = dict(app, lastPid=proc.pid, lastPgid=pgid, runToken=token)
+            tracked = dict(
+                app, lastPid=proc.pid, lastPgid=pgid, runToken=token,
+                controlMode="managed",
+                runInstance={
+                    "runId": proc.run_id,
+                    "jobName": proc.job_name,
+                    "rootPid": proc.pid,
+                    "rootCreateTime": proc.creation_time,
+                    "anchorPid": proc.anchor_pid,
+                    "anchorCreateTime": proc.anchor_create_time,
+                    "processState": "alive",
+                },
+            )
             try:
                 time.sleep(0.3)
                 self.assertIn(proc.pid, server.managed_pids(tracked))
+                stale_instance = dict(tracked["runInstance"], runId="wrong")
                 self.assertEqual(
-                    server.managed_pids(dict(tracked, runToken="wrong")), [])
+                    server.managed_pids(dict(tracked, runInstance=stale_instance)), [])
                 target, error = server.resolve_app_stop_target(tracked)
                 self.assertIsNone(error, error)
                 stopped, error = server.signal_app_stop(target)
                 self.assertTrue(stopped, error)
                 proc.wait(timeout=5)
+                target["job"].close()
             finally:
                 if proc.poll() is None:
                     try:
-                        server.sysops.kill_process(proc.pid, force=True)
+                        proc.terminate(force=True)
                     except Exception:
                         pass
                     proc.wait(timeout=5)
+                proc.close()
+
+
+class StartAppCompensationTests(unittest.TestCase):
+    def _config(self, directory):
+        cfg = server.Config(os.path.join(directory, "config.json"))
+        app = {
+            **server.Config.APP_DEFAULT,
+            "id": "start-test",
+            "name": "start test",
+            "command": "python app.py",
+            "cwd": directory,
+            "kind": "service",
+            "port": None,
+            "controlMode": "managed",
+            "launchSpec": {
+                "mode": "exec",
+                "executable": r"C:\Python\python.exe",
+                "args": ["app.py"],
+                "cwd": directory,
+                "env": {},
+                "readiness": server.default_readiness(None),
+            },
+            "launchConfigured": True,
+        }
+        cfg.update(lambda data: data["apps"].append(app))
+        return cfg
+
+    def _run_failure(self, stage, *, terminate_result=(True, None)):
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._config(td)
+            proc = mock.Mock(pid=4321, run_id="run-test")
+            proc.poll.return_value = None
+            proc.members.return_value = [4321]
+            proc.terminate.return_value = terminate_result
+
+            patches = [
+                mock.patch.object(server, "app_alive_sign", return_value=False),
+                mock.patch.object(server, "inspect_app_health",
+                                  return_value={"blocking": False}),
+                mock.patch.object(server, "scan_listeners", return_value=set()),
+                mock.patch.object(server, "start_app",
+                                  return_value=(True, None, proc, 4321, "run-test")),
+                mock.patch.object(server, "persist_started_app",
+                                  return_value=True),
+                mock.patch.object(server, "mark_app_alive"),
+                mock.patch.object(server, "watch_app_readiness"),
+                mock.patch.object(server.time, "sleep"),
+            ]
+            for patcher in patches:
+                patcher.start()
+            try:
+                if stage == "persist":
+                    patches[4].stop()
+                    patches[4] = mock.patch.object(
+                        server, "persist_started_app",
+                        side_effect=OSError("disk full"))
+                    patches[4].start()
+                elif stage == "alive":
+                    patches[5].stop()
+                    patches[5] = mock.patch.object(
+                        server, "mark_app_alive",
+                        side_effect=OSError("state write failed"))
+                    patches[5].start()
+                elif stage == "readiness":
+                    patches[6].stop()
+                    patches[6] = mock.patch.object(
+                        server, "watch_app_readiness",
+                        side_effect=RuntimeError("watcher failed"))
+                    patches[6].start()
+                elif stage == "poll":
+                    proc.poll.side_effect = OSError("poll failed")
+                elif stage == "members":
+                    proc.members.side_effect = OSError("members failed")
+
+                result = server.start_app_transaction(cfg, "start-test")
+                self.assertFalse(result["ok"])
+                self.assertEqual(result["status"], 500)
+                proc.terminate.assert_called_once_with(force=True)
+                proc.close.assert_called_once_with()
+                return cfg, proc, result
+            finally:
+                for patcher in patches:
+                    try:
+                        patcher.stop()
+                    except RuntimeError:
+                        pass
+
+    def test_post_spawn_failures_terminate_and_close_the_process(self):
+        for stage in ("persist", "alive", "readiness", "poll", "members"):
+            with self.subTest(stage=stage):
+                _cfg, _proc, result = self._run_failure(stage)
+                self.assertIn("已终止", result["error"])
+
+    def test_failed_termination_keeps_persisted_identity_for_recovery(self):
+        cfg, proc, result = self._run_failure(
+            "alive", terminate_result=(False, "access denied"))
+        self.assertIn("无法确认进程已终止", result["error"])
+        proc.close.assert_called_once_with()
+        app = server.find_app(cfg.snapshot(), "start-test")
+        self.assertEqual(app["runToken"], "run-test")
+        self.assertEqual(app["lastPid"], 4321)
+        # The test wrapper has no Job name; real Windows launches always
+        # provide one, while the token/PID remain the legacy recovery anchor.
+
+    def test_failed_persist_and_termination_retains_in_memory_recovery_identity(self):
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._config(td)
+            proc = mock.Mock(pid=4321, run_id="run-test",
+                             job_name="Local\\run-test", creation_time=12.5,
+                             anchor_pid=4322, anchor_create_time=12.6)
+            proc.poll.return_value = None
+            proc.members.return_value = [4321]
+            proc.terminate.return_value = (False, "access denied")
+            with mock.patch.object(server, "app_alive_sign", return_value=False), \
+                    mock.patch.object(server, "inspect_app_health",
+                                      return_value={"blocking": False}), \
+                    mock.patch.object(server, "scan_listeners", return_value=set()), \
+                    mock.patch.object(server, "start_app",
+                                      return_value=(True, None, proc, 4321,
+                                                    "run-test")), \
+                    mock.patch.object(server, "persist_started_app",
+                                      side_effect=OSError("disk full")), \
+                    mock.patch.object(server, "watch_app_exit") as watcher, \
+                    mock.patch.object(cfg, "update",
+                                      side_effect=OSError("read only")):
+                result = server.start_app_transaction(cfg, "start-test")
+
+            self.assertFalse(result["ok"])
+            self.assertIn("无法确认进程已终止", result["error"])
+            watcher.assert_called_once()
+            app = server.find_app(cfg.snapshot(), "start-test")
+            self.assertIsNone(app.get("runToken"))
+            self.assertEqual(server.app_identity_state(app), "alive")
+            recovery = server.UNPERSISTED_RUNS["start-test"]
+            self.assertEqual(recovery["identity"]["runToken"], "run-test")
+            self.assertEqual(
+                recovery["identity"]["runInstance"]["jobName"],
+                "Local\\run-test")
+            self.assertFalse(proc.close.called)
+            server._forget_unpersisted_run("start-test", "run-test", proc)
+
+    def test_failed_compensation_after_card_deletion_keeps_recovery_watcher(self):
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._config(td)
+            proc = mock.Mock(pid=4321, run_id="run-test",
+                             job_name="Local\\run-test", creation_time=12.5,
+                             anchor_pid=4322, anchor_create_time=12.6)
+            proc.poll.return_value = None
+            proc.members.return_value = [4321]
+            proc.terminate.return_value = (False, "access denied")
+
+            def delete_card_before_persist(_app):
+                cfg.update(lambda data: data["apps"].clear())
+                return True, None, proc, 4321, "run-test"
+
+            try:
+                with mock.patch.object(server, "app_alive_sign",
+                                       return_value=False), \
+                        mock.patch.object(server, "inspect_app_health",
+                                          return_value={"blocking": False}), \
+                        mock.patch.object(server, "scan_listeners",
+                                          return_value=set()), \
+                        mock.patch.object(server, "start_app",
+                                          side_effect=delete_card_before_persist), \
+                        mock.patch.object(server, "watch_app_exit") as watcher:
+                    result = server.start_app_transaction(cfg, "start-test")
+
+                self.assertFalse(result["ok"])
+                self.assertEqual(result["status"], 409)
+                watcher.assert_called_once()
+                recovery = server.UNPERSISTED_RUNS["start-test"]
+                self.assertEqual(recovery["token"], "run-test")
+                self.assertEqual(
+                    recovery["identity"]["runInstance"]["jobName"],
+                    "Local\\run-test")
+                self.assertFalse(proc.close.called)
+            finally:
+                server._forget_unpersisted_run("start-test", "run-test", proc)
+
+    def test_compensation_leaves_handles_to_active_exit_watcher(self):
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._config(td)
+            proc = mock.Mock(pid=4321, run_id="run-test")
+            proc.poll.return_value = None
+            proc.members.return_value = [4321]
+            proc.terminate.return_value = (False, "access denied")
+            watcher_key = ("start-test", "run-test")
+            with server.WATCHER_LOCK:
+                server.ACTIVE_EXIT_WATCHERS.add(watcher_key)
+            try:
+                with mock.patch.object(server.time, "monotonic",
+                                       side_effect=[0.0, 0.0, 10.0]), \
+                        mock.patch.object(server.time, "sleep"):
+                    result = server.abort_started_app(
+                        cfg, "start-test", proc, "run-test", "watcher failure")
+            finally:
+                with server.WATCHER_LOCK:
+                    server.ACTIVE_EXIT_WATCHERS.discard(watcher_key)
+
+        self.assertFalse(result["ok"])
+        self.assertIn("无法确认进程已终止", result["error"])
+        proc.terminate.assert_called_once_with(force=True)
+        proc.close.assert_not_called()
+
+
+class JobStopFailureTests(unittest.TestCase):
+    def test_job_members_failure_closes_handle_and_refuses_stop(self):
+        app = {"id": "broken-job", "controlMode": "managed",
+               "runInstance": {"runId": "run", "jobName": "Local\\job",
+                               "processState": "alive"}}
+        job = mock.Mock()
+        job.members.side_effect = OSError("query failed")
+        with mock.patch.object(server, "_open_run_job", return_value=job):
+            target, error = server.resolve_app_stop_target(app)
+
+        self.assertIsNone(target)
+        self.assertIn("未执行停止", error)
+        job.close.assert_called_once_with()
+
+    def test_job_stop_timeout_is_passed_to_terminate(self):
+        target = {"kind": "job", "id": "run", "members": [123],
+                  "job": mock.Mock()}
+        target["job"].terminate.return_value = (True, None)
+        with mock.patch.object(server, "resolve_app_stop_target",
+                               return_value=(target, None)), \
+                mock.patch.object(server, "stop_target_alive", return_value=False):
+            stopped, error = server.stop_app_and_wait(
+                {"id": "x"}, timeout=0.0)
+
+        self.assertTrue(stopped, error)
+        target["job"].terminate.assert_called_once_with(
+            force=False, timeout=0.0)
+        target["job"].close.assert_called_once_with()
+
+    def test_job_members_probe_error_is_conservatively_treated_as_alive(self):
+        target = {"kind": "job", "job": mock.Mock()}
+        target["job"].members.side_effect = OSError("query failed")
+        self.assertTrue(server.stop_target_alive(target))
 
 
     def test_verified_legacy_process_can_be_stopped_without_port_kill(self):
@@ -729,7 +1315,145 @@ class ProcessIdentityTests(unittest.TestCase):
         self.assertIsNone(target["runToken"])
         self.assertTrue(target["attached"])
         self.assertEqual(target["cwd"], "/new")
+        self.assertEqual(target["observation"]["cwd"], "/new")
         self.assertTrue(info["cwdUpdated"])
+        self.assertEqual(info["cwd"], "/new")
+
+
+class RetainedRunJobTests(unittest.TestCase):
+    def test_anchor_repair_reuses_keeper_and_sweeps_it_after_job_exit(self):
+        app_id = "retained-%s" % os.urandom(4).hex()
+        run_id = "run-%s" % os.urandom(4).hex()
+        app = {
+            "id": app_id,
+            "runToken": run_id,
+            "controlMode": "managed",
+            "runInstance": {
+                "runId": run_id,
+                "jobName": "Local\\retained-job",
+                "anchorPid": 111,
+                "anchorCreateTime": 1.0,
+                "processState": "alive",
+            },
+        }
+        proc = mock.Mock()
+        proc.anchor_pid = 222
+        proc.anchor_create_time = 2.0
+        proc._anchor_handle = object()
+        proc._api = mock.Mock()
+        proc._api.poll_process.return_value = None
+        proc._closed = False
+        proc.members.return_value = [987]
+
+        cfg = mock.Mock()
+        cfg.update.side_effect = OSError("read only")
+        cfg.snapshot.return_value = {"apps": [app]}
+        key = (app_id, run_id)
+        retained_app = {"id": app_id, "runInstance": {"runId": run_id}}
+        self.addCleanup(server._forget_run_job, retained_app, proc)
+
+        with mock.patch.object(server.windows_runtime, "reopen",
+                               return_value=proc) as reopen, \
+                mock.patch.object(server, "ps_snapshot",
+                                  return_value={987: {
+                                      "uid": server.SELF_UID}}):
+            for _ in range(3):
+                repairs = []
+                server.managed_process_index(
+                    [app], groups={}, anchor_repairs=repairs)
+                self.assertEqual(len(repairs), 1)
+                server.repair_run_instance_anchors(cfg, repairs)
+
+            self.assertEqual(reopen.call_count, 1)
+            self.assertIs(server.RETAINED_RUN_JOBS[key][1], proc)
+
+            # Even if the card is no longer part of the current config, the
+            # retained keeper is cleaned up once the Job Object drains.
+            proc.members.side_effect = OSError("keeper cleanup pending")
+            server.managed_process_index([], groups={})
+            self.assertIn(key, server.RETAINED_RUN_JOBS)
+            self.assertFalse(
+                server._cleanup_retained_run_job_after_exit(app_id, run_id))
+            self.assertEqual(server.RETAINED_RUN_JOBS[key][0], "empty-cleanup")
+
+            proc.members.side_effect = None
+            proc.members.return_value = []
+            server.managed_process_index([], groups={})
+
+        self.assertNotIn(key, server.RETAINED_RUN_JOBS)
+        proc.close.assert_called_once_with()
+
+
+class ProcessLifecycleAndLaunchCanonicalizationTests(unittest.TestCase):
+    def test_launch_spec_is_canonicalized_to_card_cwd_and_http_port(self):
+        requested = {
+            "mode": "exec",
+            "executable": r"C:\runtime\python.exe",
+            "args": ["-m", "http.server"],
+            "cwd": r"C:\stale-project",
+            "env": {},
+            "readiness": {
+                "type": "http", "host": "127.0.0.1", "port": 1234,
+                "url": "/health", "timeoutSec": 9,
+            },
+        }
+        spec, command = server.canonicalize_app_launch_spec(
+            requested, command="ignored display text", cwd=r"D:\project",
+            port=9876, kind="service")
+
+        self.assertEqual(spec["cwd"], r"D:\project")
+        self.assertEqual(spec["readiness"]["port"], 9876)
+        self.assertEqual(command, server.command_from_launch_spec(spec))
+
+    def test_canonicalizes_default_tcp_readiness_port_when_type_is_omitted(self):
+        requested = {
+            "mode": "exec",
+            "executable": r"C:\runtime\python.exe",
+            "args": ["-m", "http.server"],
+            "readiness": {"port": 1234},
+        }
+        spec, _ = server.canonicalize_app_launch_spec(
+            requested, command="ignored", cwd=r"D:\project", port=9876,
+            kind="service")
+
+        self.assertEqual(spec["readiness"]["type"], "tcp")
+        self.assertEqual(spec["readiness"]["port"], 9876)
+
+    def test_task_canonicalization_removes_port_readiness(self):
+        requested = {
+            "mode": "exec", "executable": r"C:\runtime\worker.exe",
+            "args": [], "readiness": {
+                "type": "tcp", "host": "localhost", "port": 3000,
+                "timeoutSec": 20,
+            },
+        }
+        spec, _ = server.canonicalize_app_launch_spec(
+            requested, command="worker", cwd=None, port=3000,
+            kind="task")
+
+        self.assertEqual(spec["readiness"], server.default_readiness(None))
+
+    def test_new_card_cannot_use_legacy_shell_compatibility(self):
+        with self.assertRaises(server.LaunchSpecError):
+            server.canonicalize_app_launch_spec(
+                {"mode": "legacy-shell", "legacyCommand": "evil & whoami"},
+                command="evil & whoami", cwd=None, port=8765,
+                kind="service")
+
+    def test_existing_legacy_card_keeps_compatibility_without_downgrading(self):
+        legacy_app = {
+            "launchSpec": {
+                "mode": "legacy-shell", "legacyCommand": "old command",
+                "cwd": None, "env": {},
+                "readiness": server.default_readiness(8765),
+            },
+        }
+        spec, command = server.canonicalize_app_launch_spec(
+            None, command="new legacy command", cwd=None, port=8765,
+            kind="service", existing=legacy_app)
+
+        self.assertEqual(spec["mode"], "legacy-shell")
+        self.assertEqual(command, "new legacy command")
 
     def test_attached_listener_survives_child_pid_rotation_by_unique_cwd(self):
         app = {"id": "a", "port": 3000, "cwd": "/project",
@@ -808,6 +1532,27 @@ class ProcessIdentityTests(unittest.TestCase):
                                      "ctime": 1000.0}}
             self.assertEqual(server.legacy_managed_pid(app, **common), 4242)
         # POSIX 语义：不校验 ctime（无该字段语义），正常命中
+        self.assertEqual(server.legacy_managed_pid(app, **common), 4242)
+
+    def test_confirmed_attached_card_keeps_observation_boundary_when_spec_changes(self):
+        # Confirming a restart definition must not make an already-running
+        # externally claimed process disappear merely because the user chose a
+        # new project cwd or port for future managed launches.
+        app = {
+            "id": "a", "port": 9000, "cwd": "/new-project",
+            "kind": "service", "lastPid": 4242, "attached": True,
+            "controlMode": "managed", "runToken": None,
+            "observation": {
+                "pid": 4242, "createTime": 12.5, "sid": server.SELF_UID,
+                "cwd": "/old-project", "ports": [3000],
+            },
+            "launchConfigured": True,
+        }
+        common = {
+            "listeners": {(4242, 3000)},
+            "snap": {4242: {"uid": server.SELF_UID, "ctime": 12.5}},
+            "cwds": {4242: "/old-project"},
+        }
         self.assertEqual(server.legacy_managed_pid(app, **common), 4242)
 
     def test_attached_replacement_pid_uses_unique_sid_cwd_match(self):
@@ -893,6 +1638,25 @@ class ProcessIdentityTests(unittest.TestCase):
         self.assertEqual(server.classify_task_exit(1), "failed")
         self.assertEqual(server.classify_task_exit(-15), "failed")
 
+    def test_task_exit_with_unavailable_root_code_is_unknown(self):
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.object(server, "LOGS_DIR", td):
+            path = os.path.join(td, "config.json")
+            app = {**server.Config.APP_DEFAULT, "id": "deadbeef",
+                   "name": "任务", "kind": "task", "lastPid": 4321,
+                   "lastPgid": 4321, "runToken": "token"}
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({**server.Config.DEFAULT, "apps": [app]}, f)
+            cfg = server.Config(path)
+            proc = mock.Mock(pid=4321)
+            proc.wait.return_value = None
+            thread = server.watch_app_exit(cfg, "deadbeef", proc, "token")
+            thread.join(timeout=2)
+            result = cfg.snapshot()["apps"][0]["lastExit"]
+
+        self.assertEqual(result["status"], "unknown")
+        self.assertIsNone(result["code"])
+
     def test_old_task_exit_status_is_normalized_only_for_api_output(self):
         legacy = {"code": 0, "at": 123}
         app = {"kind": "task", "lastExit": legacy}
@@ -904,6 +1668,11 @@ class ProcessIdentityTests(unittest.TestCase):
             "lastExit": {"status": "canceled", "code": None, "at": 456},
         })
         self.assertEqual(stopped["status"], "stopped")
+        unknown = server.public_last_exit({
+            "kind": "task",
+            "lastExit": {"status": "unknown", "code": None, "at": 456},
+        })
+        self.assertEqual(unknown["status"], "unknown")
 
     def test_task_start_preserves_previous_completed_result(self):
         with tempfile.TemporaryDirectory() as td:
@@ -928,6 +1697,357 @@ class ProcessIdentityTests(unittest.TestCase):
 
         self.assertEqual(apps["deadbeef"]["lastExit"], previous)
         self.assertIsNone(apps["feedface"]["lastExit"])
+
+
+class StaleRecoveryIdentityTests(unittest.TestCase):
+    def _config(self, directory):
+        path = os.path.join(directory, "config.json")
+        app = {
+            **server.Config.APP_DEFAULT,
+            "id": "stale-test",
+            "name": "stale recovery",
+            "command": "python -m http.server 8765",
+            "cwd": directory,
+            "port": 8765,
+            "controlMode": "managed",
+            "launchSpec": None,
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({**server.Config.DEFAULT, "apps": [app]}, f)
+        return server.Config(path)
+
+    def test_stale_recovery_token_cannot_clear_a_newer_persisted_run(self):
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._config(td)
+            def save_new_run(data):
+                app = server.find_app(data, "stale-test")
+                app["runToken"] = "run-new"
+                app["lastPid"] = 9876
+                app["runInstance"] = {
+                    "runId": "run-new", "jobName": "Local\\run-new",
+                    "processState": "alive",
+                }
+                return True
+            cfg.update(save_new_run)
+            old_proc = mock.Mock()
+            with server.RETAINED_RUN_JOBS_LOCK:
+                server.UNPERSISTED_RUNS["stale-test"] = {
+                    "token": "run-old", "proc": old_proc,
+                    "identity": {"runToken": "run-old"},
+                }
+            try:
+                self.assertFalse(server.clear_app_runtime(
+                    cfg, "stale-test", expected_token="run-old"))
+                current = server.find_app(cfg.snapshot(), "stale-test")
+                self.assertEqual(current["runToken"], "run-new")
+                self.assertEqual(current["lastPid"], 9876)
+            finally:
+                with server.RETAINED_RUN_JOBS_LOCK:
+                    server.UNPERSISTED_RUNS.pop("stale-test", None)
+
+    def test_stale_recovery_token_cannot_clear_tokenless_newer_instance(self):
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._config(td)
+
+            def save_partial_new_run(data):
+                app = server.find_app(data, "stale-test")
+                app["runToken"] = None
+                app["lastPid"] = 9876
+                app["runInstance"] = {
+                    "runId": "run-new",
+                    "jobName": "Local\\run-new",
+                    "processState": "alive",
+                }
+                return True
+
+            cfg.update(save_partial_new_run)
+            old_proc = mock.Mock()
+            with server.RETAINED_RUN_JOBS_LOCK:
+                server.UNPERSISTED_RUNS["stale-test"] = {
+                    "token": "run-old", "proc": old_proc,
+                    "identity": {"runToken": "run-old"},
+                }
+            try:
+                self.assertFalse(server.clear_app_runtime(
+                    cfg, "stale-test", expected_token="run-old"))
+                current = server.find_app(cfg.snapshot(), "stale-test")
+                self.assertIsNone(current["runToken"])
+                self.assertEqual(current["runInstance"]["runId"], "run-new")
+                self.assertEqual(current["lastPid"], 9876)
+            finally:
+                with server.RETAINED_RUN_JOBS_LOCK:
+                    server.UNPERSISTED_RUNS.pop("stale-test", None)
+
+    def test_stale_recovery_token_cannot_hydrate_tokenless_newer_instance(self):
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._config(td)
+
+            def save_partial_new_run(data):
+                app = server.find_app(data, "stale-test")
+                app["runToken"] = None
+                app["runInstance"] = {
+                    "runId": "run-new",
+                    "jobName": "Local\\run-new",
+                    "processState": "alive",
+                }
+                return True
+
+            cfg.update(save_partial_new_run)
+            old_proc = mock.Mock()
+            old_identity = {
+                "runToken": "run-old",
+                "lastPid": 1111,
+                "runInstance": {
+                    "runId": "run-old", "jobName": "Local\\run-old",
+                },
+            }
+            with server.RETAINED_RUN_JOBS_LOCK:
+                server.UNPERSISTED_RUNS["stale-test"] = {
+                    "token": "run-old", "proc": old_proc,
+                    "identity": old_identity,
+                }
+            try:
+                current = server.find_app(cfg.snapshot(), "stale-test")
+                self.assertIsNone(server._hydrate_unpersisted_run(current))
+                self.assertIsNone(current["runToken"])
+                self.assertEqual(current["runInstance"]["runId"], "run-new")
+            finally:
+                with server.RETAINED_RUN_JOBS_LOCK:
+                    server.UNPERSISTED_RUNS.pop("stale-test", None)
+
+    def test_persisted_new_run_retires_empty_old_recovery_record(self):
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._config(td)
+            old_proc = mock.Mock()
+            old_proc.members.return_value = []
+            old_proc.run_id = "run-old"
+            old_proc.job_name = "Local\\run-old"
+            old_proc.pid = 4321
+            old_proc.creation_time = 1.0
+            old_proc.anchor_pid = 4321
+            old_proc.anchor_create_time = 1.0
+            server._remember_unpersisted_run(
+                "stale-test", "run-old", old_proc,
+                {"runToken": "run-old",
+                 "runInstance": {"runId": "run-old",
+                                 "jobName": "Local\\run-old"}})
+            new_proc = mock.Mock(pid=9876, run_id="run-new",
+                                 job_name="Local\\run-new",
+                                 creation_time=2.0, anchor_pid=9876,
+                                 anchor_create_time=2.0)
+            try:
+                with mock.patch.object(server, "watch_app_exit"):
+                    self.assertTrue(server.persist_started_app(
+                        cfg, "stale-test", new_proc, 9876, "run-new"))
+                with server.RETAINED_RUN_JOBS_LOCK:
+                    self.assertNotIn("stale-test", server.UNPERSISTED_RUNS)
+                self.assertTrue(old_proc.close.called)
+                current = server.find_app(cfg.snapshot(), "stale-test")
+                self.assertEqual(current["runToken"], "run-new")
+            finally:
+                server._forget_unpersisted_run("stale-test", "run-old",
+                                               old_proc)
+
+
+class RunWatcherRecoveryTests(unittest.TestCase):
+    class ReopenedProcess:
+        def __init__(self, pid, result=0, gate=None):
+            self.pid = pid
+            self.result = result
+            self.gate = gate
+            self.wait_calls = 0
+            self.closed = False
+
+        def wait(self):
+            self.wait_calls += 1
+            if self.gate is not None:
+                self.gate.wait(3)
+            return self.result
+
+        def wait_for_empty(self):
+            return None
+
+        def members(self):
+            return []
+
+        def close(self):
+            self.closed = True
+
+    @staticmethod
+    def _config(kind="service", readiness_state="checking"):
+        td = tempfile.TemporaryDirectory()
+        path = os.path.join(td.name, "config.json")
+        started_ms = int(time.time() * 1000) - 700
+        app = {
+            **server.Config.APP_DEFAULT,
+            "id": "recovery",
+            "name": "recovery test",
+            "command": "python -m http.server 8765",
+            "cwd": td.name,
+            "port": 8765 if kind == "service" else None,
+            "kind": kind,
+            "controlMode": "managed",
+            "launchSpec": None,
+            "lastPid": 4321,
+            "lastPgid": 4321,
+            "runToken": "restore-run",
+            "runInstance": {
+                "runId": "restore-run",
+                "jobName": "Local\\LocalOps-test",
+                "rootPid": 4321,
+                "rootCreateTime": 10.0,
+                "anchorPid": None,
+                "anchorCreateTime": None,
+                "startedAt": started_ms,
+                "processState": "alive",
+                "exitResult": None,
+            },
+            "readinessState": readiness_state,
+        }
+        cfg = server.Config(path)
+        cfg.update(lambda data: data["apps"].append(app))
+        return td, cfg, started_ms
+
+    def _wait_for(self, predicate, timeout=2):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return True
+            time.sleep(0.01)
+        return bool(predicate())
+
+    def test_restart_reconnects_exit_and_readiness_watchers_once(self):
+        td, cfg, started_ms = self._config()
+        gate = threading.Event()
+        first = self.ReopenedProcess(4321, gate=gate)
+        duplicate = self.ReopenedProcess(4321, gate=gate)
+        try:
+            with mock.patch.object(server, "_open_run_job",
+                                  side_effect=[first, duplicate]), \
+                    mock.patch.object(server, "_probe_readiness",
+                                      return_value=True):
+                server.restore_run_watchers(cfg)
+                server.restore_run_watchers(cfg)
+                self.assertTrue(self._wait_for(lambda:
+                    cfg.snapshot()["apps"][0]["readinessState"] == "ready"))
+                self.assertTrue(self._wait_for(lambda:
+                    ("recovery", "restore-run")
+                    not in server.ACTIVE_READINESS_WATCHERS))
+                self.assertEqual(first.wait_calls, 1)
+                self.assertEqual(duplicate.wait_calls, 0)
+                self.assertTrue(duplicate.closed)
+                gate.set()
+                self.assertTrue(self._wait_for(lambda:
+                    cfg.snapshot()["apps"][0]["runInstance"]["processState"] == "exited"))
+            result = cfg.snapshot()["apps"][0]["lastExit"]
+            self.assertEqual(result["startedAt"], started_ms)
+            self.assertEqual(cfg.snapshot()["apps"][0]["readinessState"], "ready")
+        finally:
+            gate.set()
+            td.cleanup()
+
+    def test_duplicate_exit_watcher_keeps_retained_replacement_open(self):
+        """A rejected watcher must not close a replacement keeper it owns."""
+        td, cfg, _ = self._config()
+        old = self.ReopenedProcess(4321)
+        replacement = self.ReopenedProcess(4321)
+        app = server.find_app(cfg.snapshot(), "recovery")
+        key = ("recovery", "restore-run")
+        try:
+            with server.WATCHER_LOCK:
+                server.ACTIVE_EXIT_WATCHERS.add(key)
+                server.ACTIVE_EXIT_PROCS[key] = old
+            server._remember_run_job(app, replacement, "repair")
+
+            self.assertIsNone(server.watch_app_exit(
+                cfg, "recovery", replacement, "restore-run"))
+            self.assertFalse(replacement.closed)
+            self.assertIs(server.RETAINED_RUN_JOBS[key][1], replacement)
+        finally:
+            server._forget_run_job(app, replacement)
+            with server.WATCHER_LOCK:
+                server.ACTIVE_EXIT_WATCHERS.discard(key)
+                server.ACTIVE_EXIT_PROCS.pop(key, None)
+            td.cleanup()
+
+    def test_retained_owner_is_returned_for_future_watcher_registration(self):
+        td, cfg, _ = self._config()
+        gate = threading.Event()
+        canonical = self.ReopenedProcess(4321, gate=gate)
+        incoming = self.ReopenedProcess(4321, gate=gate)
+        app = server.find_app(cfg.snapshot(), "recovery")
+        try:
+            server._remember_run_job(app, canonical, "repair")
+            owner = server._remember_run_job(app, incoming, "repair")
+            self.assertIs(owner, canonical)
+            self.assertTrue(incoming.closed)
+
+            thread = server.watch_app_exit(
+                cfg, "recovery", owner, "restore-run")
+            self.assertTrue(self._wait_for(lambda: canonical.wait_calls == 1))
+            self.assertEqual(incoming.wait_calls, 0)
+            gate.set()
+            thread.join(timeout=2)
+            self.assertFalse(thread.is_alive())
+            self.assertTrue(canonical.closed)
+        finally:
+            gate.set()
+            server._forget_run_job(app, canonical)
+            server._forget_run_job(app, incoming)
+            td.cleanup()
+
+    def test_restarted_task_exit_is_recorded_with_persisted_start_time(self):
+        td, cfg, started_ms = self._config("task", "unknown")
+        proc = self.ReopenedProcess(4321, result=0)
+        try:
+            with mock.patch.object(server, "_open_run_job", return_value=proc):
+                server.restore_run_watchers(cfg)
+                self.assertTrue(self._wait_for(lambda:
+                    cfg.snapshot()["apps"][0]["lastExit"] is not None
+                    and proc.closed))
+            result = cfg.snapshot()["apps"][0]["lastExit"]
+            self.assertEqual(result["status"], "succeeded")
+            self.assertEqual(result["code"], 0)
+            self.assertEqual(result["startedAt"], started_ms)
+            self.assertTrue(proc.closed)
+        finally:
+            td.cleanup()
+
+    def test_empty_job_records_unknown_task_result_instead_of_stale_history(self):
+        td, cfg, _ = self._config("task", "unknown")
+        try:
+            with mock.patch.object(server, "_open_run_job", return_value=None):
+                server.restore_run_watchers(cfg)
+            app = cfg.snapshot()["apps"][0]
+            self.assertEqual(app["runInstance"]["processState"], "exited")
+            self.assertEqual(app["lastExit"]["status"], "unknown")
+            self.assertIsNone(app["lastExit"]["code"])
+        finally:
+            td.cleanup()
+
+    def test_reopen_failure_preserves_identity_and_blocks_duplicate_start(self):
+        td, cfg, _ = self._config("service", "checking")
+        try:
+            with mock.patch.object(server, "_open_run_job",
+                                   return_value=server.RUN_JOB_REOPEN_FAILED), \
+                    mock.patch.object(server, "_probe_readiness",
+                                      return_value=True):
+                server.restore_run_watchers(cfg)
+                self.assertTrue(self._wait_for(lambda:
+                    cfg.snapshot()["apps"][0]["readinessState"] == "ready"))
+            app = cfg.snapshot()["apps"][0]
+            self.assertNotEqual(app["runInstance"]["processState"], "exited")
+            self.assertEqual(app["readinessState"], "ready")
+            app["kind"] = "task"
+            app["port"] = None
+            cfg.update(lambda data: data["apps"].__setitem__(0, app))
+            with mock.patch.object(server, "_open_run_job",
+                                   return_value=server.RUN_JOB_REOPEN_FAILED):
+                result = server.start_app_transaction(cfg, "recovery")
+            self.assertEqual(result["status"], 409)
+            self.assertIn("无法验证", result["error"])
+        finally:
+            td.cleanup()
 
 
 class LaunchEnvironmentTests(unittest.TestCase):
@@ -983,6 +2103,31 @@ class StateTests(unittest.TestCase):
 
         self.assertEqual(service["openHost"], "localhost")
         self.assertEqual(built_app["openHosts"], {"5173": "localhost"})
+
+    def test_unavailable_job_is_not_reported_exited_or_startable(self):
+        app = {**server.Config.APP_DEFAULT, "id": "a", "name": "受管服务",
+               "command": "python app.py", "port": 8765,
+               "lastPid": 4242, "runToken": "run-1",
+               "controlMode": "managed",
+               "runInstance": {"runId": "run-1", "jobName": "job",
+                               "rootPid": 4242, "processState": "alive"}}
+
+        def unavailable_index(apps, groups=None, anchor_repairs=None,
+                              unavailable_jobs=None):
+            unavailable_jobs.add("a")
+            return {"a": []}, {}, {}
+
+        with mock.patch.object(server, "managed_process_index",
+                               side_effect=unavailable_index), \
+                mock.patch.object(server, "listener_app_owners", return_value={}), \
+                mock.patch.object(server, "lsof_cwds", return_value={}), \
+                mock.patch.object(server, "inspect_app_health", return_value={
+                    "status": "unknown", "blocking": False, "issues": []}):
+            row = server.build_apps({"apps": [app]}, set())[0]
+
+        self.assertFalse(row["running"])
+        self.assertTrue(row["identityUnavailable"])
+        self.assertEqual(row["processState"], "alive")
 
     def test_service_listener_is_linked_by_managed_identity_not_configured_port(self):
         app = {**server.Config.APP_DEFAULT, "id": "old-card",
@@ -1067,6 +2212,50 @@ class StateTests(unittest.TestCase):
         self.assertEqual(row["portOwner"]["cwd"], "/tmp/other")
         self.assertTrue(row["portOwner"]["currentUser"])
 
+    def test_monitor_observation_tracks_listener_pid_rotation(self):
+        with tempfile.TemporaryDirectory() as td:
+            app = {**server.Config.APP_DEFAULT, "id": "monitor01",
+                   "name": "外部服务", "command": "npm run dev",
+                   "cwd": td, "port": 3000, "attached": True,
+                   "controlMode": "monitor", "launchSpec": None,
+                   "launchConfigured": False, "lastPid": 111,
+                   "lastCreateTime": 1.0,
+                   "observation": {
+                       "pid": 111, "createTime": 1.0,
+                       "sid": server.SELF_UID, "cwd": td,
+                       "ports": [3000], "observedAt": 10,
+                   }}
+            listener_info = {
+                222: {"uid": server.SELF_UID, "ctime": 2.0,
+                      "comm": "node.exe", "args": "node server.js",
+                      "etime": 15},
+            }
+            repairs = []
+            with mock.patch.object(
+                    server, "managed_process_index",
+                    return_value=({"monitor01": []}, {}, {})), \
+                    mock.patch.object(server, "ps_snapshot",
+                                      return_value=listener_info), \
+                    mock.patch.object(server, "lsof_cwds",
+                                      return_value={222: td}):
+                row = server.build_apps(
+                    {"apps": [app]}, {(222, 3000)},
+                    observation_repairs=repairs)[0]
+
+            self.assertTrue(row["running"])
+            self.assertEqual(row["pid"], 222)
+            self.assertEqual(row["observation"]["pid"], 222)
+            self.assertEqual(row["observation"]["createTime"], 2.0)
+            self.assertTrue(repairs)
+
+            cfg_path = os.path.join(td, "config.json")
+            with open(cfg_path, "w", encoding="utf-8") as handle:
+                json.dump({**server.Config.DEFAULT, "apps": [app]}, handle)
+            cfg = server.Config(cfg_path)
+            self.assertTrue(server.repair_observation_identities(cfg, repairs))
+            saved = cfg.snapshot()["apps"][0]
+            self.assertEqual(saved["lastPid"], 222)
+            self.assertEqual(saved["observation"]["createTime"], 2.0)
     def test_duplicate_configured_ports_are_allowed_until_runtime(self):
         a = {**server.Config.APP_DEFAULT, "id": "a", "name": "A",
              "command": "x", "port": 8080}
@@ -1163,6 +2352,85 @@ class IconTests(unittest.TestCase):
         self.assertIsNone(server.sniff_icon_bytes(
             b'<svg xmlns="http://www.w3.org/2000/svg"></svg>',
             "image/svg+xml"))
+
+
+class ReadinessProbeTests(unittest.TestCase):
+    def test_tcp_probe_accepts_ipv6_loopback_host(self):
+        class Connection:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        with mock.patch.object(server.socket, "create_connection",
+                               return_value=Connection()) as connect:
+            self.assertTrue(server._probe_readiness({
+                "type": "tcp", "host": "::1", "port": 43210}))
+        connect.assert_called_once_with(("::1", 43210), timeout=0.5)
+
+    def test_http_probe_reaches_ipv6_loopback(self):
+        class IPv6Server(ThreadingHTTPServer):
+            address_family = socket.AF_INET6
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(204)
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        try:
+            httpd = IPv6Server(("::1", 0), Handler)
+        except OSError as exc:
+            self.skipTest("IPv6 loopback is unavailable: %s" % exc)
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        try:
+            self.assertTrue(server._probe_readiness({
+                "type": "http", "host": "::1",
+                "port": httpd.server_port, "url": "/health"}))
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join(timeout=2)
+
+    def test_http_probe_blocks_external_redirect_and_accepts_local_response(self):
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path == "/external":
+                    self.send_response(302)
+                    self.send_header(
+                        "Location", "http://example.com:%d/track" %
+                        self.server.server_port)
+                    self.end_headers()
+                    return
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"ok")
+
+            def log_message(self, *args):
+                pass
+
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        port = httpd.server_address[1]
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        try:
+            self.assertTrue(server._probe_readiness({
+                "type": "http", "host": "127.0.0.1", "port": port,
+                "url": "/ok"}))
+            self.assertFalse(server._probe_readiness({
+                "type": "http", "host": "127.0.0.1", "port": port,
+                "url": "/external"}))
+            self.assertFalse(server._probe_readiness({
+                "type": "http", "host": "127.0.0.1", "port": port,
+                "url": "http://example.com:%d/track" % port}))
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join(timeout=2)
 
 
 class ConsoleRestartTests(unittest.TestCase):
