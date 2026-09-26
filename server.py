@@ -6865,8 +6865,11 @@ class Handler(BaseHTTPRequestHandler):
                 promoted_observation = (dict(app.get("observation"))
                                         if isinstance(app.get("observation"), dict)
                                         else None)
+                # ``attached`` records the external process identity claimed
+                # from the service monitor. It remains useful after a
+                # LaunchSpec is confirmed (the card is then managed for future
+                # launches, while the existing listener is still external).
                 promoted_attached = bool(
-                    app.get("controlMode") == "monitor" and
                     app.get("attached") and promoted_observation)
                 fields["attached"] = promoted_attached
                 fields["observation"] = (promoted_observation

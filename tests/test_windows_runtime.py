@@ -104,6 +104,47 @@ class WindowsRuntimePureTests(unittest.TestCase):
         self.assertIn(mock.call(20), api.close_handle.call_args_list)
         self.assertIn(mock.call(10), api.close_handle.call_args_list)
 
+    def test_close_waits_for_in_progress_process_poll(self):
+        api = mock.Mock()
+        entered = threading.Event()
+        release = threading.Event()
+
+        def poll_process(_handle):
+            entered.set()
+            if not release.wait(2):
+                raise TimeoutError("test poll was not released")
+            return None
+
+        api.poll_process.side_effect = poll_process
+        instance = windows_runtime.ManagedProcess(
+            api, 10, "run-01", "Local\\job", 123,
+            process_handle=20, thread_handle=21)
+        poll_errors = []
+
+        def poll():
+            try:
+                instance.poll()
+            except Exception as exc:  # surfaced in the assertion thread
+                poll_errors.append(exc)
+
+        poll_thread = threading.Thread(target=poll)
+        poll_thread.start()
+        self.assertTrue(entered.wait(1))
+
+        close_thread = threading.Thread(target=instance.close)
+        close_thread.start()
+        time.sleep(0.05)
+        api.close_handle.assert_not_called()
+
+        release.set()
+        poll_thread.join(1)
+        close_thread.join(1)
+        self.assertFalse(poll_thread.is_alive())
+        self.assertFalse(close_thread.is_alive())
+        self.assertEqual(poll_errors, [])
+        self.assertEqual(api.close_handle.call_args_list,
+                         [mock.call(21), mock.call(20), mock.call(10)])
+
     def test_job_name_is_sid_scoped_and_validated(self):
         left = windows_runtime.job_name_for("run-01", "S-1-5-21-10")
         right = windows_runtime.job_name_for("run-01", "S-1-5-21-11")
@@ -190,6 +231,19 @@ class WindowsRuntimePureTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"PATH": "C:\\Windows"}, clear=True):
             with self.assertRaisesRegex(ValueError, "environment block"):
                 windows_runtime._environment_block({"LARGE": "x" * 32760})
+
+    def test_create_suspended_process_validates_environment_before_stdio_setup(self):
+        api = object.__new__(windows_runtime._NativeApi)
+        api._prepare_stdio = mock.Mock()
+
+        with mock.patch.dict(os.environ, {"PATH": "C:\\Windows"}, clear=True):
+            with self.assertRaisesRegex(ValueError, "environment block"):
+                api.create_suspended_process(
+                    "python.exe", '"python.exe"', None,
+                    {"LARGE": "x" * 32760}, subprocess.DEVNULL,
+                    subprocess.DEVNULL)
+
+        api._prepare_stdio.assert_not_called()
 
     def test_oversized_final_command_line_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "command line"):

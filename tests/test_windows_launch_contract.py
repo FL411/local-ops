@@ -255,6 +255,43 @@ class WindowsLaunchContractTests(unittest.TestCase):
                              "ctime": old_observation["createTime"]}},
                 cwds={4242: old_observation["cwd"]}), 4242)
 
+    def test_saving_confirmed_atomic_claim_keeps_attached_identity(self):
+        # Atomic create with LaunchSpec is already managed for future launches,
+        # but its currently observed process still needs attached identity for
+        # listener PID rotation. A routine save must preserve both.
+        spec = structured_spec()
+        app = {
+            **monitor_app(),
+            "controlMode": "managed",
+            "launchSpec": spec,
+            "launchConfigured": True,
+            "command": command_from_launch_spec(spec),
+        }
+        old_observation = dict(app["observation"])
+        self._store(app)
+
+        status, body = self.h.request("PUT", "/api/apps/a1b2c3d4", {
+            "name": "已认领服务",
+            "command": app["command"],
+            "cwd": app["cwd"],
+            "port": app["port"],
+            "kind": app["kind"],
+            "launchSpec": spec,
+        })
+
+        self.assertEqual(status, 200, body)
+        saved = server.find_app(self.h.cfg.snapshot(), "a1b2c3d4")
+        self.assertEqual(saved["controlMode"], "managed")
+        self.assertTrue(saved["attached"])
+        self.assertEqual(saved["observation"], old_observation)
+        self.assertEqual(saved["lastPid"], old_observation["pid"])
+        self.assertEqual(server.legacy_managed_pid(
+            saved,
+            listeners={(5252, 8765)},
+            snap={5252: {"uid": server.SELF_UID,
+                         "ctime": 200.0}},
+            cwds={5252: old_observation["cwd"]}), 5252)
+
     def test_health_checks_structured_executable_not_compatibility_text(self):
         with tempfile.TemporaryDirectory() as cwd:
             missing = os.path.join(cwd, "missing", "python.exe")

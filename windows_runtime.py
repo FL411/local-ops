@@ -441,6 +441,10 @@ class _NativeApi:
 
     def create_suspended_process(self, executable, command_line, cwd, env,
                                  stdout, stderr, inherited_handles=()):
+        # Validate and materialize the environment before allocating inheritable
+        # stdio handles.  In particular, an oversized/invalid overlay must not
+        # leave prepared handles behind if validation raises.
+        environment = self._environment_buffer(_environment_block(env))
         stdin_h, stdout_h, stderr_h, handles = self._prepare_stdio(stdout, stderr)
         all_handles = []
         seen = set()
@@ -471,7 +475,6 @@ class _NativeApi:
         attributes_initialized = False
         info = _PROCESS_INFORMATION()
         mutable_command = ctypes.create_unicode_buffer(command_line)
-        environment = self._environment_buffer(_environment_block(env))
         try:
             self._check(self.kernel32.InitializeProcThreadAttributeList(
                 startup.lpAttributeList, 1, 0, ctypes.byref(attribute_bytes)),
@@ -667,12 +670,16 @@ class ManagedProcess:
         self._active_waits = 0
 
     def poll(self):
-        if self._process_handle:
-            code = self._api.poll_process(self._process_handle)
-            if code is not None:
-                self._root_exit_code = code
-            return code
-        return self._root_exit_code
+        # Polling is a native operation on the process HANDLE.  Serialize it
+        # with close() so another thread cannot CloseHandle while the API call
+        # is in progress.
+        with self._lock:
+            if self._process_handle:
+                code = self._api.poll_process(self._process_handle)
+                if code is not None:
+                    self._root_exit_code = code
+                return code
+            return self._root_exit_code
 
     def wait(self, timeout=None):
         """Wait for the root process; after a console restart, wait for job drain.
