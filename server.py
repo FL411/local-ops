@@ -2009,7 +2009,16 @@ def build_apps(cfg, listeners, groups=None, attached_repairs=None,
     for pid, port in listeners:
         listen_by_pid.setdefault(pid, []).append(port)
     configured_ports = {
-        app["port"] for app in apps_cfg if app.get("port")}
+        app["port"] for app in apps_cfg
+        if type(app.get("port")) is int and app.get("port") > 0}
+    # A promoted attached card can have a new LaunchSpec port while its
+    # currently observed external process still listens on the old port.
+    # Include both so identity and cwd checks receive details for that
+    # listener during the same state scan.
+    for app in apps_cfg:
+        observed_port = observation_port(app.get("observation"))
+        if observed_port is not None:
+            configured_ports.add(observed_port)
 
     # 端口诊断需要展示占用者的真实身份，一次批量取详情，避免逐卡 ps。
     configured_listener_pids = {
@@ -6920,6 +6929,17 @@ class Handler(BaseHTTPRequestHandler):
                 if not ok:
                     self.send_err(409, stop_error)
                     return
+                # ``fields`` was prepared from the pre-stop snapshot. A
+                # successful stop invalidates any external process identity
+                # carried by a promoted attached card; do not write that stale
+                # observation back with the new launch definition.
+                fields["attached"] = False
+                fields["observation"] = None
+                fields["lastPid"] = None
+                fields["lastPgid"] = None
+                fields["runToken"] = None
+                fields["lastCreateTime"] = None
+                fields["runInstance"] = None
 
             def op(c):
                 target = find_app(c, m.group(1))

@@ -667,19 +667,32 @@ class ManagedProcess:
         self._closed = False
         self._lock = threading.RLock()
         self._wait_done = threading.Condition(self._lock)
-        self._active_waits = 0
+        # Native operations that use one of the owned handles must finish
+        # before close() releases it.  Keep this count separate from the
+        # instance lock so terminate() can still run while a wait or poll is
+        # blocked in the OS API.
+        self._active_handle_ops = 0
 
     def poll(self):
-        # Polling is a native operation on the process HANDLE.  Serialize it
-        # with close() so another thread cannot CloseHandle while the API call
-        # is in progress.
+        # Capture the process HANDLE and register the native operation while
+        # holding the lock, then release it so terminate() remains available.
+        # close() waits for the operation count before releasing the handle.
         with self._lock:
-            if self._process_handle:
-                code = self._api.poll_process(self._process_handle)
-                if code is not None:
+            process_handle = self._process_handle
+            if not process_handle:
+                return self._root_exit_code
+            self._active_handle_ops += 1
+        try:
+            code = self._api.poll_process(process_handle)
+            if code is not None:
+                with self._lock:
                     self._root_exit_code = code
-                return code
-            return self._root_exit_code
+            return code
+        finally:
+            with self._lock:
+                self._active_handle_ops -= 1
+                if not self._active_handle_ops:
+                    self._wait_done.notify_all()
 
     def wait(self, timeout=None):
         """Wait for the root process; after a console restart, wait for job drain.
@@ -696,7 +709,7 @@ class ManagedProcess:
         with self._lock:
             if self._closed:
                 raise OSError("Managed process handle is closed")
-            self._active_waits += 1
+            self._active_handle_ops += 1
             process_handle = self._process_handle
         try:
             if process_handle:
@@ -715,8 +728,8 @@ class ManagedProcess:
                 return self._root_exit_code
         finally:
             with self._lock:
-                self._active_waits -= 1
-                if not self._active_waits:
+                self._active_handle_ops -= 1
+                if not self._active_handle_ops:
                     self._wait_done.notify_all()
 
     def members(self):
@@ -813,7 +826,7 @@ class ManagedProcess:
         with self._lock:
             if self._closed:
                 return
-            while self._active_waits:
+            while self._active_handle_ops:
                 self._wait_done.wait()
             self._closed = True
             if self._thread_handle:

@@ -145,6 +145,36 @@ class WindowsRuntimePureTests(unittest.TestCase):
         self.assertEqual(api.close_handle.call_args_list,
                          [mock.call(21), mock.call(20), mock.call(10)])
 
+    def test_process_poll_does_not_block_termination(self):
+        api = mock.Mock()
+        entered = threading.Event()
+        release = threading.Event()
+
+        def poll_process(_handle):
+            entered.set()
+            if not release.wait(2):
+                raise TimeoutError("test poll was not released")
+            return None
+
+        api.poll_process.side_effect = poll_process
+        instance = windows_runtime.ManagedProcess(
+            api, 10, "run-01", "Local\\job", 123, process_handle=20)
+        poll_thread = threading.Thread(target=instance.poll)
+        poll_thread.start()
+        self.assertTrue(entered.wait(1))
+
+        # A blocked status probe must not prevent the job boundary from being
+        # stopped.  The process handle remains protected until poll returns.
+        api.terminate_job.return_value = None
+        ok, error = instance.terminate(force=True)
+        self.assertTrue(ok, error)
+        api.terminate_job.assert_called_once_with(10, 1)
+
+        release.set()
+        poll_thread.join(1)
+        self.assertFalse(poll_thread.is_alive())
+        instance.close()
+
     def test_job_name_is_sid_scoped_and_validated(self):
         left = windows_runtime.job_name_for("run-01", "S-1-5-21-10")
         right = windows_runtime.job_name_for("run-01", "S-1-5-21-11")

@@ -292,6 +292,77 @@ class WindowsLaunchContractTests(unittest.TestCase):
                          "ctime": 200.0}},
             cwds={5252: old_observation["cwd"]}), 5252)
 
+    def test_stop_before_update_does_not_restore_claimed_identity(self):
+        spec = structured_spec(port=8765)
+        app = {
+            **monitor_app(),
+            "controlMode": "managed",
+            "launchSpec": spec,
+            "launchConfigured": True,
+            "command": command_from_launch_spec(spec),
+        }
+        self._store(app)
+        replacement = structured_spec(port=9000)
+        with mock.patch.object(server, "lifecycle_identity_state",
+                               return_value="alive"), \
+                mock.patch.object(server, "stop_app_for_update",
+                                  return_value=(True, None, True)) as stop:
+            status, body = self.h.request("PUT", "/api/apps/a1b2c3d4", {
+                "name": "停止后更新",
+                "command": command_from_launch_spec(replacement),
+                "cwd": replacement["cwd"],
+                "port": 9000,
+                "kind": "service",
+                "launchSpec": replacement,
+                "stopBeforeUpdate": True,
+            })
+
+        self.assertEqual(status, 200, body)
+        stop.assert_called_once()
+        saved = server.find_app(self.h.cfg.snapshot(), "a1b2c3d4")
+        self.assertFalse(saved["attached"])
+        self.assertIsNone(saved["observation"])
+        self.assertIsNone(saved["lastPid"])
+        self.assertIsNone(saved["runToken"])
+        self.assertIsNone(saved["runInstance"])
+
+    def test_state_scan_includes_promoted_observation_port(self):
+        with tempfile.TemporaryDirectory() as cwd:
+            spec = structured_spec(cwd=cwd, port=9000)
+            app = {
+                **server.Config.APP_DEFAULT,
+                "id": "a1b2c3d4",
+                "name": "旧端口服务",
+                "command": command_from_launch_spec(spec),
+                "cwd": cwd,
+                "port": 9000,
+                "kind": "service",
+                "controlMode": "managed",
+                "attached": True,
+                "launchSpec": spec,
+                "launchConfigured": True,
+                "observation": {
+                    "pid": 4242, "createTime": 100.0,
+                    "sid": server.SELF_UID, "cwd": cwd,
+                    "ports": [8765], "observedAt": 1,
+                },
+                "lastPid": 4242,
+                "lastCreateTime": 100.0,
+            }
+            listeners = {(4242, 8765)}
+            with mock.patch.object(server, "managed_process_index",
+                                   return_value=({"a1b2c3d4": []}, {}, {})), \
+                    mock.patch.object(server, "ps_snapshot", return_value={
+                        4242: {"uid": server.SELF_UID, "ctime": 100.0}}) as snap, \
+                    mock.patch.object(server, "lsof_cwds",
+                                      return_value={4242: cwd}) as cwds:
+                rows = server.build_apps({"apps": [app]}, listeners)
+
+        self.assertTrue(rows[0]["running"])
+        self.assertEqual(rows[0]["pid"], 4242)
+        self.assertIn(mock.call({4242}, with_uid=True), snap.call_args_list)
+        self.assertIn(mock.call({4242}), cwds.call_args_list)
+
     def test_health_checks_structured_executable_not_compatibility_text(self):
         with tempfile.TemporaryDirectory() as cwd:
             missing = os.path.join(cwd, "missing", "python.exe")
