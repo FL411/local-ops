@@ -190,6 +190,32 @@ class WindowsRuntimePureTests(unittest.TestCase):
             manager.reopen("run-01", sid="S-1-5-21-10", anchor_pid=123)
         manager._api.open_job.assert_not_called()
 
+    def test_reopen_replaces_inaccessible_keeper_and_keeps_job_members(self):
+        manager = object.__new__(windows_runtime.WindowsRuntimeManager)
+        api = mock.Mock()
+        manager._api = api
+        api.open_job.return_value = 10
+        api.query_job_members.return_value = [123, 124]
+        api.open_process.side_effect = OSError(5, "access denied")
+        with mock.patch.object(manager, "_create_keeper",
+                               return_value=(20, 789, 456.0)) as create_keeper:
+            process = manager.reopen(
+                "run-01", root_pid=123, root_create_time=12.0,
+                sid="S-1-5-21-10", anchor_pid=456,
+                anchor_create_time=45.0)
+
+        create_keeper.assert_called_once_with(10)
+        self.assertEqual(api.open_process.call_count, 2)
+        self.assertEqual(process._job_handle, 10)
+        self.assertIsNone(process._process_handle)
+        self.assertEqual(process._anchor_handle, 20)
+        self.assertEqual(process.anchor_pid, 789)
+        api.close_handle.assert_not_called()
+
+        process.close()
+        self.assertEqual(api.close_handle.call_args_list,
+                         [mock.call(20), mock.call(10)])
+
     def test_members_reports_and_retains_failed_anchor_cleanup(self):
         api = mock.Mock()
         api.query_job_members.return_value = []

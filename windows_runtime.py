@@ -1002,7 +1002,15 @@ class WindowsRuntimeManager:
         try:
             members = self._api.query_job_members(job)
             if anchor_pid is not None:
-                anchor_handle = self._api.open_process(int(anchor_pid))
+                try:
+                    anchor_handle = self._api.open_process(int(anchor_pid))
+                except OSError:
+                    # The saved keeper may no longer be openable from this
+                    # console (for example, access denied after a runtime or
+                    # token change). The named Job and its members are the
+                    # ownership boundary; if it is still populated, replace
+                    # the keeper below instead of losing the Job connection.
+                    anchor_handle = None
                 if anchor_handle:
                     try:
                         valid_anchor = (
@@ -1039,7 +1047,13 @@ class WindowsRuntimeManager:
                 anchor_handle, anchor_pid, anchor_create_time = \
                     self._create_keeper(job)
             if root_pid is not None:
-                process = self._api.open_process(int(root_pid))
+                try:
+                    process = self._api.open_process(int(root_pid))
+                except OSError:
+                    # A process HANDLE is only needed for the root's exit
+                    # code. Job membership remains sufficient for control and
+                    # for wait() to observe the complete process tree draining.
+                    process = None
                 if process:
                     actual_create_time = self._api.process_creation_time(process)
                     if (root_create_time is not None and
